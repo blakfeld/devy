@@ -30,11 +30,20 @@ impl Module for OpenSearchModule {
         dep: &Dependency,
         data_dir: &std::path::Path,
     ) -> Result<Option<super::LaunchSpec>> {
-        Ok(Some(super::search_server_launch(
+        let mut spec = super::search_server_launch(
             "opensearch",
+            super::nix_install_attr(self, dep, "opensearch"),
+            "OPENSEARCH_PATH_CONF",
             port(dep)?,
             data_dir,
-        )))
+        )?;
+        // The security plugin turns on TLS; the health check speaks plain HTTP. The
+        // setting aborts startup when the plugin isn't bundled, so it's conditional.
+        spec.conditional_args.push(super::ConditionalArgs {
+            package_path: "plugins/opensearch-security".into(),
+            args: vec!["-E".into(), "plugins.security.disabled=true".into()],
+        });
+        Ok(Some(spec))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -105,6 +114,7 @@ mod tests {
             extra,
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         }
     }
 

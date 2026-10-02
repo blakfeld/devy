@@ -242,6 +242,7 @@ pub(super) fn pm_dep(dep: &Dependency, name: &str) -> Dependency {
         extra: HashMap::new(),
         version_from_lock: dep.version_from_lock,
         allow_unfree: false,
+        allow_insecure: false,
     }
 }
 

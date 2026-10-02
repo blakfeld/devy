@@ -184,6 +184,7 @@ mod tests {
             extra,
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         }
     }
 

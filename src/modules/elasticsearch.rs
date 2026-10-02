@@ -31,11 +31,20 @@ impl Module for ElasticsearchModule {
         dep: &Dependency,
         data_dir: &std::path::Path,
     ) -> Result<Option<super::LaunchSpec>> {
-        Ok(Some(super::search_server_launch(
+        let mut spec = super::search_server_launch(
             "elasticsearch",
+            super::nix_install_attr(self, dep, "elasticsearch"),
+            "ES_PATH_CONF",
             port(dep)?,
             data_dir,
-        )))
+        )?;
+        // The machine-learning native controller doesn't run on every platform nixpkgs
+        // builds for (e.g. Apple silicon), and local development doesn't need it.
+        spec.args
+            .extend(["-E".to_string(), "xpack.ml.enabled=false".to_string()]);
+        // nixpkgs' start script requires ES_HOME instead of deriving it.
+        spec.package_env.push(("ES_HOME".into(), String::new()));
+        Ok(Some(spec))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -43,6 +52,11 @@ impl Module for ElasticsearchModule {
     }
 
     fn nix_unfree(&self) -> bool {
+        true
+    }
+
+    // nixpkgs marks 7.x insecure because it's end-of-life.
+    fn nix_insecure(&self) -> bool {
         true
     }
 
@@ -138,6 +152,7 @@ mod tests {
             extra,
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         }
     }
 
