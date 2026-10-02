@@ -50,6 +50,19 @@ impl Module for OpenSearchModule {
         Some("opensearch".to_string())
     }
 
+    fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        Ok(Some(
+            super::DockerSpec::new("opensearchproject/opensearch", "2", 9200)
+                .data("/usr/share/opensearch/data")
+                .env(&[
+                    ("discovery.type", "single-node"),
+                    ("DISABLE_SECURITY_PLUGIN", "true"),
+                    // 2.12+ otherwise demands an initial admin password.
+                    ("DISABLE_INSTALL_DEMO_CONFIG", "true"),
+                ]),
+        ))
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(9200)
     }
@@ -115,6 +128,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         }
     }
 

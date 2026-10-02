@@ -127,6 +127,19 @@ impl Module for MariadbModule {
         Some("mariadb".to_string())
     }
 
+    fn docker_spec(&self, dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        Ok(Some(super::DockerSpec {
+            args: super::helpers::mysql_server_args(cli_args(dep).as_deref()),
+            ..super::DockerSpec::new("mariadb", "11", 3306)
+                .data("/var/lib/mysql")
+                .env(&[("MARIADB_ALLOW_EMPTY_ROOT_PASSWORD", "1")])
+        }))
+    }
+
+    fn post_setup_writes_service_config(&self) -> bool {
+        true
+    }
+
     fn is_running(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         pm.is_service_running(&self.service_name(dep))
     }

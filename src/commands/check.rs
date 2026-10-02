@@ -9,13 +9,32 @@ use crate::modules;
 use crate::output;
 use crate::package_manager;
 use crate::package_manager::PackageManager;
+use crate::service_runner::docker::ContainerRuntime;
+use crate::service_runner::{self, Runners};
 
 use super::ports::{self, PortMode};
 use super::shared;
 
+/// `check_with_runtime` with the real container CLI selected by `container_cli`.
 pub(crate) fn check_impl(
     config: &DevyConfig,
     pm: &dyn PackageManager,
+    env_mgr: &dyn EnvManager,
+    project_root: &Path,
+) -> Result<()> {
+    check_with_runtime(
+        config,
+        pm,
+        ContainerRuntime::system(config.container_cli),
+        env_mgr,
+        project_root,
+    )
+}
+
+pub(crate) fn check_with_runtime(
+    config: &DevyConfig,
+    pm: &dyn PackageManager,
+    runtime: ContainerRuntime<'_>,
     env_mgr: &dyn EnvManager,
     project_root: &Path,
 ) -> Result<()> {
@@ -29,11 +48,14 @@ pub(crate) fn check_impl(
     let lock = ports::load_lock(project_root)?;
     let mut resolved_deps = deps.clone();
     ports::resolve_and_check(&mut resolved_deps, lock.as_ref(), pm, PortMode::ReadOnly)?;
+    let runners = Runners::new(pm, runtime, config, project_root, lock.as_ref(), false);
 
     if !deps.is_empty() {
         for dep in &deps {
-            pm.validate_config(dep)
-                .with_context(|| format!("{}: config validation failed", dep.name))?;
+            if !dep.docker {
+                pm.validate_config(dep)
+                    .with_context(|| format!("{}: config validation failed", dep.name))?;
+            }
             let module = modules::get(&dep.name);
             if let Some(known) = module.known_extra_keys() {
                 for key in dep.extra.keys() {
@@ -55,7 +77,8 @@ pub(crate) fn check_impl(
                 .config_warnings(dep)
                 .into_iter()
                 .chain(ports::unapplied_port_warning(dep, pm))
-                .chain(modules::nix_version_warning(dep, pm));
+                .chain(modules::nix_version_warning(dep, pm))
+                .chain(service_runner::docker_warnings(dep));
             for warning in warnings {
                 output::warn(&format!("{}: {}", dep.name, warning));
             }
@@ -67,7 +90,7 @@ pub(crate) fn check_impl(
             }
         }
         output::header("Dependencies");
-        issues += shared::print_dep_table(&resolved_deps, pm, true)?;
+        issues += shared::print_dep_table(&resolved_deps, &runners, true)?;
     }
 
     // Collect PATH prepends from all modules.
@@ -106,7 +129,7 @@ fn issue_noun(count: usize) -> &'static str {
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper
 pub fn run() -> Result<()> {
     let (config, project_root) = DevyConfig::load_with_root()?;
-    let pm = package_manager::detect(config.package_manager, &project_root)?;
+    let pm = package_manager::detect(&config, &project_root)?;
     let env_mgr = Shadowenv;
     check_impl(&config, pm.as_ref(), &env_mgr, &project_root)
 }
@@ -298,6 +321,8 @@ mod tests {
             commands: HashMap::new(),
             hooks: Default::default(),
             package_manager: Default::default(),
+            service_manager: Default::default(),
+            container_cli: Default::default(),
         };
         let pm = MockPackageManager {
             installed: true,
@@ -334,6 +359,121 @@ mod tests {
             result.unwrap().is_ok(),
             "the warning must not count as an issue"
         );
+    }
+
+    #[test]
+    fn check_impl_does_not_flag_service_manager_or_image_as_module_keys() {
+        let yaml = "dependencies:\n  - redis: { service_manager: package, image: mirror/redis }\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let pm = MockPackageManager {
+            installed: true,
+            service_running: true,
+            ..Default::default()
+        };
+        let warnings = crate::output::with_warn_messages(|| {
+            let _ = check_impl(&config, &pm, &MockEnvManager::default(), Path::new("."));
+        });
+        assert!(
+            !warnings.iter().any(|w| w.contains("unrecognized")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn check_impl_rejects_service_manager_on_non_service() {
+        let yaml = "dependencies:\n  - node: { service_manager: docker }\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let err = check_impl(
+            &config,
+            &MockPackageManager::default(),
+            &MockEnvManager::default(),
+            Path::new("."),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "node: service_manager and image apply only to built-in services"
+        );
+    }
+
+    use crate::service_runner::docker::{FakeRunner, fail, ok};
+
+    fn docker_check(yaml: &str, cli: &FakeRunner) -> (Result<()>, Vec<String>) {
+        let dir = crate::test_support::tmp_dir();
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let pm = MockPackageManager {
+            installed: true,
+            ..Default::default()
+        };
+        let mut result = None;
+        let warnings = crate::output::with_warn_messages(|| {
+            result = Some(check_with_runtime(
+                &config,
+                &pm,
+                ContainerRuntime::new(config.container_cli, cli),
+                &MockEnvManager::default(),
+                &dir,
+            ));
+        });
+        (result.unwrap(), warnings)
+    }
+
+    #[test]
+    fn check_counts_missing_image_as_not_installed() {
+        let cli = FakeRunner::new(|_| fail("No such image"));
+        let (result, _) = docker_check("service_manager: docker\ndependencies:\n  - redis\n", &cli);
+        assert!(result.is_err(), "a missing image is an issue");
+        assert_eq!(cli.lines(), vec!["docker image inspect redis:7"]);
+    }
+
+    #[test]
+    fn check_counts_missing_container_as_stopped() {
+        let cli = FakeRunner::new(|call| match call[1].as_str() {
+            "image" => ok("[{}]"),
+            _ => fail("No such container"),
+        });
+        let (result, _) = docker_check("service_manager: docker\ndependencies:\n  - redis\n", &cli);
+        assert!(result.is_err(), "a missing container is a stopped service");
+    }
+
+    #[test]
+    fn check_passes_for_running_container() {
+        let cli = FakeRunner::new(|call| match call[1].as_str() {
+            "image" => ok("[{}]"),
+            _ => ok(r#"{"State":{"Running":true},"Config":{"Labels":{}}}"#),
+        });
+        let (result, _) = docker_check("service_manager: docker\ndependencies:\n  - redis\n", &cli);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn check_warns_kafka_runs_kraft_under_docker() {
+        let cli = FakeRunner::new(|call| match call[1].as_str() {
+            "image" => ok("[{}]"),
+            _ => ok(r#"{"State":{"Running":true},"Config":{"Labels":{}}}"#),
+        });
+        let (_, warnings) =
+            docker_check("service_manager: docker\ndependencies:\n  - kafka\n", &cli);
+        assert!(
+            warnings.contains(
+                &"kafka: zookeeper mode is not supported with docker — running Kafka in KRaft mode"
+                    .to_string()
+            ),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn check_no_port_conflict_for_docker_mysql_and_mariadb() {
+        let cli = FakeRunner::new(|call| match call[1].as_str() {
+            "image" => ok("[{}]"),
+            _ => ok(r#"{"State":{"Running":true},"Config":{"Labels":{}}}"#),
+        });
+        let (result, _) = docker_check(
+            "package_manager: brew\nservice_manager: docker\ndependencies:\n  - mysql\n  - mariadb\n",
+            &cli,
+        );
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

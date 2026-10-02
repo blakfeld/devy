@@ -133,6 +133,14 @@ pub(super) fn sanitized_mysql_args(cli_args: Option<&str>) -> Vec<(String, Strin
     out
 }
 
+/// Sanitized MySQL-compatible `cli_args` as `--key=value` server arguments.
+pub(super) fn mysql_server_args(cli_args: Option<&str>) -> Vec<String> {
+    sanitized_mysql_args(cli_args)
+        .into_iter()
+        .map(|(k, v)| format!("--{k}={v}"))
+        .collect()
+}
+
 /// Launch spec shared by MySQL and MariaDB under nix: listens on 127.0.0.1:`port` with
 /// its datadir (and, when the path is short enough, socket) under `data_dir`, then
 /// `extra_args`, then each sanitized `cli_args` token. `--no-defaults` keeps system
@@ -155,11 +163,7 @@ pub(super) fn mysql_family_launch(
         format!("--socket={}", super::path_arg(&socket)),
     ];
     args.extend(extra_args.iter().map(|a| a.to_string()));
-    args.extend(
-        sanitized_mysql_args(cli_args)
-            .into_iter()
-            .map(|(k, v)| format!("--{k}={v}")),
-    );
+    args.extend(mysql_server_args(cli_args));
     Ok(super::LaunchSpec {
         init: Some(super::InitStep {
             // The `mysql` system schema directory exists once the datadir is initialized.
@@ -183,6 +187,34 @@ pub(super) fn run_cmd(prog: &str, args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// 64-bit FNV-1a: a stable hash for short, per-project names (unlike `DefaultHasher`,
+/// it doesn't change between Rust releases).
+pub(crate) fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// A name for the project that is unique per checkout: the project `name` lower-cased
+/// with everything outside `[a-z0-9-]` replaced by `-`, then `-` and the first 8 hex
+/// characters of the FNV-1a hash of the project root path. Two checkouts of the same
+/// project therefore never share containers or volumes.
+pub(crate) fn project_slug(name: &str, project_root: &std::path::Path) -> String {
+    let sanitized: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let hash = fnv1a(&project_root.to_string_lossy());
+    format!("{sanitized}-{:08x}", hash >> 32)
 }
 
 /// Binds an ephemeral socket to let the OS pick a free port and returns that port number.
@@ -251,6 +283,8 @@ pub(super) fn pm_dep(dep: &Dependency, name: &str) -> Dependency {
         version_from_lock: dep.version_from_lock,
         allow_unfree: false,
         allow_insecure: false,
+        image: None,
+        docker: false,
     }
 }
 
@@ -302,5 +336,47 @@ pub(super) fn node_pkg(pm: &dyn PackageManager) -> &'static str {
         "winget" => "OpenJS.NodeJS",
         "nix" => "nodejs",
         _ => "node",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn fnv1a_known_values() {
+        // Reference values for 64-bit FNV-1a.
+        assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a("foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn project_slug_uses_first_8_hex_of_root_hash() {
+        let root = "/src/app";
+        let expected = format!("app-{}", &format!("{:016x}", fnv1a(root))[..8]);
+        assert_eq!(project_slug("app", Path::new(root)), expected);
+    }
+
+    #[test]
+    fn project_slug_sanitizes_name() {
+        let slug = project_slug("My App_v2.0!", Path::new("/x"));
+        let (name, hash) = slug.rsplit_once('-').unwrap();
+        assert_eq!(name, "my-app-v2-0-");
+        assert_eq!(hash.len(), 8);
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(
+            slug.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        );
+    }
+
+    #[test]
+    fn project_slug_differs_per_root() {
+        let a = project_slug("app", Path::new("/src/a"));
+        let b = project_slug("app", Path::new("/src/b"));
+        assert_ne!(a, b);
+        assert!(a.starts_with("app-") && b.starts_with("app-"));
     }
 }

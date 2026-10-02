@@ -43,6 +43,14 @@ impl Module for MailhogModule {
         Some("mailhog".to_string())
     }
 
+    fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        Ok(Some(super::DockerSpec::new(
+            "mailhog/mailhog",
+            "latest",
+            1025,
+        )))
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(1025)
     }

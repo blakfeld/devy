@@ -11,11 +11,13 @@ use crate::lock::{LockFile, LockedDep};
 use crate::modules;
 use crate::output;
 use crate::package_manager;
+use crate::service_runner::docker::ContainerRuntime;
+use crate::service_runner::{self, Runners, ServiceRunner};
 
 #[cfg_attr(test, mutants::skip)] // thin delegation — reads process env and disk; not unit-testable
 pub fn run(update: bool, bootstrap: bool) -> Result<()> {
     let (config, project_root) = DevyConfig::load_with_root()?;
-    let pm = package_manager::detect(config.package_manager, &project_root)?;
+    let pm = package_manager::detect(&config, &project_root)?;
 
     // Acquire an exclusive advisory lock so concurrent `devy up` invocations
     // (e.g. two devs on the same machine, parallel CI jobs) queue rather than race.
@@ -48,9 +50,30 @@ pub(crate) struct UpOptions {
     pub bootstrap: bool,
 }
 
+/// `up_with_runtime` with the real container CLI selected by `container_cli`.
 pub(crate) fn up_impl(
     config: &DevyConfig,
     pm: &dyn package_manager::PackageManager,
+    env_mgr: &dyn EnvManager,
+    opts: UpOptions,
+    project_root: &Path,
+    lock_path: &Path,
+) -> Result<()> {
+    up_with_runtime(
+        config,
+        pm,
+        ContainerRuntime::system(config.container_cli),
+        env_mgr,
+        opts,
+        project_root,
+        lock_path,
+    )
+}
+
+pub(crate) fn up_with_runtime(
+    config: &DevyConfig,
+    pm: &dyn package_manager::PackageManager,
+    runtime: ContainerRuntime<'_>,
     env_mgr: &dyn EnvManager,
     opts: UpOptions,
     project_root: &Path,
@@ -64,13 +87,35 @@ pub(crate) fn up_impl(
         run_hook("before_up", hook)?;
     }
 
-    output::step(&format!("Checking for {}", pm.name()));
-    pm.ensure_available(opts.bootstrap)
-        .with_context(|| format!("Failed to ensure {} is available", pm.name()))?;
-    output::success(&format!("{} available", pm.name()));
+    let deps = config.normalized_dependencies()?;
+
+    // The package manager is needed only to install a dependency or shadowenv, so a
+    // project of docker-managed services runs without Nix, brew or apt.
+    if deps.iter().any(|d| !d.docker) || !env_mgr.is_available() {
+        output::step(&format!("Checking for {}", pm.name()));
+        pm.ensure_available(opts.bootstrap)
+            .with_context(|| format!("Failed to ensure {} is available", pm.name()))?;
+        output::success(&format!("{} available", pm.name()));
+    }
 
     // Load the existing lock for orphan comparison regardless of --update.
     let existing_lock = LockFile::load(lock_path).context("Failed to read devy.lock")?;
+
+    // Docker-managed services pin images by the locked digest; --update re-resolves tags.
+    let runners = Runners::new(
+        pm,
+        runtime,
+        config,
+        project_root,
+        existing_lock.as_ref(),
+        opts.update,
+    );
+    if deps.iter().any(|d| d.docker) {
+        let cli = runners.docker.runtime().cli_name();
+        output::step(&format!("Checking for {cli}"));
+        runners.ensure_docker_available(&deps)?;
+        output::success(&format!("{cli} available"));
+    }
 
     // For version pinning, ignore the lock when --update is passed.
     let lock = if opts.update {
@@ -82,9 +127,7 @@ pub(crate) fn up_impl(
         existing_lock.clone()
     };
 
-    let deps = config.normalized_dependencies()?;
-
-    for dep in &deps {
+    for dep in deps.iter().filter(|d| !d.docker) {
         pm.validate_config(dep)
             .with_context(|| format!("{}: config validation failed", dep.name))?;
     }
@@ -98,7 +141,8 @@ pub(crate) fn up_impl(
     for dep in &deps {
         let warnings = ports::unapplied_port_warning(dep, pm)
             .into_iter()
-            .chain(modules::nix_version_warning(dep, pm));
+            .chain(modules::nix_version_warning(dep, pm))
+            .chain(service_runner::docker_warnings(dep));
         for warning in warnings {
             output::warn(&format!("{}: {}", dep.name, warning));
         }
@@ -124,7 +168,7 @@ pub(crate) fn up_impl(
     if !effective_deps.is_empty() {
         output::header("Dependencies");
         for effective in &effective_deps {
-            install_binary(pm, effective, project_root)?;
+            install_binary(&runners, effective, project_root)?;
             let m = modules::get(&effective.name);
             module_env.extend(m.env_vars(effective, project_root));
             module_path_prepends.extend(m.path_prepends(effective, project_root));
@@ -160,7 +204,7 @@ pub(crate) fn up_impl(
     // Write the lock immediately after all binaries are confirmed installed.
     // Doing this before service start means a service failure doesn't leave the
     // lock stale for the already-installed packages.
-    write_lock(&effective_deps, pm, lock_path)?;
+    write_lock(&effective_deps, &runners, lock_path)?;
 
     let merged_env = merge_env(module_env, &config.environment);
 
@@ -231,7 +275,7 @@ pub(crate) fn up_impl(
 
     // Phase 2: start services (after lock is written).
     for effective in &effective_deps {
-        start_service_if_needed(pm, effective, project_root)?;
+        start_service_if_needed(runners.runner_for(effective), effective)?;
     }
 
     if let Some(ref hook) = config.hooks.after_up {
@@ -273,6 +317,10 @@ pub(crate) fn apply_lock_from_source(
     lock: Option<&LockFile>,
     pm: &dyn package_manager::PackageManager,
 ) -> Dependency {
+    // Docker-managed services pin their image by digest instead (see `DockerRunner`).
+    if dep.docker {
+        return dep.clone();
+    }
     let source = modules::get(&dep.name).source().unwrap_or(pm.name());
     let same_source = lock
         .and_then(|l| l.get(modules::canonical_name(&dep.name)))
@@ -286,70 +334,86 @@ pub(crate) fn apply_lock_from_source(
 
 /// Installs the binary for a dependency and runs post_setup. Does not start services.
 /// Call this in Phase 1 so the lock can be written before any service is started.
+/// Docker-managed services are "installed" by pulling their image.
 pub(crate) fn install_binary(
-    pm: &dyn package_manager::PackageManager,
+    runners: &Runners,
     dep: &Dependency,
     project_root: &std::path::Path,
 ) -> Result<()> {
     let module = modules::get(&dep.name);
+    let runner = runners.runner_for(dep);
+    let pm = runners.package.pm();
     let display = dep.versioned_name();
 
-    if module.is_installed(pm, dep)? {
+    let fresh = if dep.docker {
+        let reference = runners.docker.reference(dep)?;
+        if runner.is_installed(dep)? {
+            output::skip(&format!("{} image present (docker)", dep.name));
+            false
+        } else {
+            output::step(&format!("Pulling {reference}"));
+            runner.install(dep)?;
+            output::success(&format!("Pulled {reference}"));
+            true
+        }
+    } else if runner.is_installed(dep)? {
         output::skip(&format!(
             "{} already installed (via {})",
             display,
             pm.name()
         ));
+        false
     } else {
         output::step(&format!("Installing {}", display));
-        module
-            .install(pm, dep)
+        runner
+            .install(dep)
             .with_context(|| format!("Failed to install {}", display))?;
         output::success(&format!("Installed {}", display));
+        true
+    };
 
-        if let Some(cmd) = &dep.after_install {
-            output::warn(&format!("{}: running after_install: {}", dep.name, cmd));
-            let shell = dep
-                .shell
-                .clone()
-                .unwrap_or_else(crate::config::default_shell);
-            spawn_cmd(
-                &DevyCommand {
-                    cmd: cmd.clone(),
-                    cwd: Some(project_root.to_string_lossy().into_owned()),
-                    shell,
-                },
-                "after_install",
-            )?;
-        }
+    if fresh && let Some(cmd) = &dep.after_install {
+        output::warn(&format!("{}: running after_install: {}", dep.name, cmd));
+        let shell = dep
+            .shell
+            .clone()
+            .unwrap_or_else(crate::config::default_shell);
+        spawn_cmd(
+            &DevyCommand {
+                cmd: cmd.clone(),
+                cwd: Some(project_root.to_string_lossy().into_owned()),
+                shell,
+            },
+            "after_install",
+        )?;
     }
 
     // post_setup runs even when already installed — it is idempotent by contract and
     // handles things like bundle install that must run regardless of install state.
-    module
-        .post_setup(dep, pm, project_root)
-        .with_context(|| format!("post_setup failed for {}", dep.name))?;
+    // Containers don't read the package manager's service config, so docker-managed
+    // services skip post-setups that only write it.
+    if !(dep.docker && module.post_setup_writes_service_config()) {
+        module
+            .post_setup(dep, pm, project_root)
+            .with_context(|| format!("post_setup failed for {}", dep.name))?;
+    }
 
     Ok(())
 }
 
 /// Starts a service dependency if it isn't already running. No-op for non-service deps.
 /// Call this in Phase 2, after the lock has been written.
-pub(crate) fn start_service_if_needed(
-    pm: &dyn package_manager::PackageManager,
-    dep: &Dependency,
-    project_root: &Path,
-) -> Result<()> {
+pub(crate) fn start_service_if_needed(runner: &dyn ServiceRunner, dep: &Dependency) -> Result<()> {
     let module = modules::get(&dep.name);
     if !module.is_service() {
         return Ok(());
     }
-    if module.is_running(pm, dep)? {
+    if runner.is_running(dep)? {
         output::skip(&format!("{} service already running", dep.name));
     } else {
         output::step(&format!("Starting {} service", dep.name));
-        module
-            .start(pm, dep, project_root)
+        runner
+            .start(dep)
             .with_context(|| format!("Failed to start {} service", dep.name))?;
         output::success(&format!("{} service started", dep.name));
     }
@@ -365,25 +429,30 @@ pub(crate) fn start_service_if_needed(
     Ok(())
 }
 
-pub(crate) fn write_lock(
-    deps: &[Dependency],
-    pm: &dyn package_manager::PackageManager,
-    path: &Path,
-) -> Result<()> {
+/// Records each dependency's resolved version, source and port. A docker-managed service
+/// records `source: docker`, its image tag as the version and the pulled image's digest.
+pub(crate) fn write_lock(deps: &[Dependency], runners: &Runners, path: &Path) -> Result<()> {
+    let pm = runners.package.pm();
     let mut locked = BTreeMap::new();
     for dep in deps {
         let module = modules::get(&dep.name);
         // Nix installs attributes, not exact versions: keep a version pinned from the lock so
         // teammates on different nixpkgs revisions don't rewrite each other's patch versions.
-        let resolved = if pm.name() == "nix" && dep.version_from_lock {
-            dep.version.clone()
+        let (resolved, image_digest) = if !dep.docker && pm.name() == "nix" && dep.version_from_lock
+        {
+            (dep.version.clone(), None)
         } else {
-            module.resolved_version(pm, dep)?
+            runners.runner_for(dep).resolved(dep)?
+        };
+        let source = if dep.docker {
+            service_runner::DOCKER_SOURCE
+        } else {
+            module.source().unwrap_or(pm.name())
         };
         // Only record ports the backend actually applies; others always use the default.
         let assigned_port = module
             .port_key()
-            .filter(|_| module.port_applicable(pm))
+            .filter(|_| ports::port_applicable(dep, pm))
             .and_then(|key| {
                 dep.extra
                     .get(key)
@@ -394,8 +463,9 @@ pub(crate) fn write_lock(
             modules::canonical_name(&dep.name).to_string(),
             LockedDep {
                 resolved_version: resolved,
-                source: module.source().unwrap_or(pm.name()).to_string(),
+                source: source.to_string(),
                 assigned_port,
+                image_digest,
             },
         );
     }
@@ -432,6 +502,7 @@ mod tests {
     use crate::config::Dependency;
     use crate::lock::{LockFile, LockedDep};
     use crate::package_manager::MockPackageManager;
+    use crate::service_runner::{PackageRunner, package_runners};
     use std::collections::{BTreeMap, HashMap};
 
     fn tmp_path() -> crate::test_support::TempFile {
@@ -450,6 +521,7 @@ mod tests {
                 resolved_version: Some("20.11.0".into()),
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let lock = LockFile {
@@ -475,6 +547,7 @@ mod tests {
                 resolved_version: Some("20.11.0".into()),
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let lock = LockFile {
@@ -494,6 +567,7 @@ mod tests {
                 resolved_version: Some("22.11.0".into()),
                 source: "nix".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let lock = LockFile {
@@ -525,6 +599,7 @@ mod tests {
                 resolved_version: Some("22.11.0".into()),
                 source: "brew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let lock = LockFile {
@@ -575,7 +650,12 @@ mod tests {
         };
         let dep = Dependency::simple("node");
         assert!(
-            install_binary(&pm, &dep, std::path::Path::new("/tmp")).is_err(),
+            install_binary(
+                &package_runners(&pm, Path::new("/tmp")),
+                &dep,
+                std::path::Path::new("/tmp")
+            )
+            .is_err(),
             "install failure must propagate as Err"
         );
     }
@@ -587,7 +667,14 @@ mod tests {
             ..Default::default()
         };
         let dep = Dependency::simple("node");
-        assert!(install_binary(&pm, &dep, std::path::Path::new("/tmp")).is_ok());
+        assert!(
+            install_binary(
+                &package_runners(&pm, Path::new("/tmp")),
+                &dep,
+                std::path::Path::new("/tmp")
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -605,8 +692,10 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
-        let result = install_binary(&pm, &dep, &dir);
+        let result = install_binary(&package_runners(&pm, Path::new("/tmp")), &dep, &dir);
         assert!(
             result.is_err(),
             "install_binary must fail when dep.shell is not in the allowed shell list"
@@ -628,8 +717,10 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
-        install_binary(&pm, &dep, &dir).unwrap();
+        install_binary(&package_runners(&pm, Path::new("/tmp")), &dep, &dir).unwrap();
         assert!(
             dir.join("marker").exists(),
             "after_install must run in project_root — marker file must be created there"
@@ -642,7 +733,7 @@ mod tests {
     fn start_service_if_needed_is_noop_for_non_service() {
         let pm = MockPackageManager::default();
         let dep = Dependency::simple("node"); // not a service
-        assert!(start_service_if_needed(&pm, &dep, Path::new("/tmp")).is_ok());
+        assert!(start_service_if_needed(&PackageRunner::new(&pm, Path::new("/tmp")), &dep).is_ok());
         assert!(pm.started_services.borrow().is_empty());
     }
 
@@ -656,7 +747,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         assert!(
-            start_service_if_needed(&pm, &dep, Path::new("/tmp")).is_ok(),
+            start_service_if_needed(&PackageRunner::new(&pm, Path::new("/tmp")), &dep).is_ok(),
             "must return Ok even though health check times out in test environment"
         );
         assert!(
@@ -673,7 +764,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         assert!(
-            start_service_if_needed(&pm, &dep, Path::new("/tmp")).is_err(),
+            start_service_if_needed(&PackageRunner::new(&pm, Path::new("/tmp")), &dep).is_err(),
             "start failure must propagate as Err"
         );
     }
@@ -690,6 +781,7 @@ mod tests {
                 resolved_version: Some("16.0".into()),
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let lock = LockFile {
@@ -711,7 +803,7 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("node")];
-        write_lock(&deps, &pm, &path).unwrap();
+        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
         assert!(path.exists(), "write_lock must create the lock file");
     }
 
@@ -720,7 +812,7 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("redis")];
-        write_lock(&deps, &pm, &path).unwrap();
+        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("redis"), "lock file must contain dep name");
     }
@@ -730,9 +822,9 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("node")];
-        write_lock(&deps, &pm, &path).unwrap();
+        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
         let content_after_first = std::fs::read_to_string(&path).unwrap();
-        write_lock(&deps, &pm, &path).unwrap();
+        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
         let content_after_second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             content_after_first, content_after_second,
@@ -746,7 +838,7 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("postgres")];
-        write_lock(&deps, &pm, &path).unwrap();
+        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(
             content.contains("postgresql"),
@@ -778,6 +870,7 @@ mod tests {
                 resolved_version: Some(version.into()),
                 source: source.into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         LockFile {
@@ -814,7 +907,12 @@ mod tests {
             version: Some("24.21.0".into()),
             ..Default::default()
         };
-        write_lock(&[lock_pinned_node("24.20.0")], &pm, &path).unwrap();
+        write_lock(
+            &[lock_pinned_node("24.20.0")],
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+        )
+        .unwrap();
         assert_eq!(locked_version(&path, "node").as_deref(), Some("24.20.0"));
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
@@ -831,7 +929,12 @@ mod tests {
             version: Some("24.21.0".into()),
             ..Default::default()
         };
-        write_lock(&[lock_pinned_node("24.20.0")], &pm, &path).unwrap();
+        write_lock(
+            &[lock_pinned_node("24.20.0")],
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+        )
+        .unwrap();
         assert_eq!(locked_version(&path, "node").as_deref(), Some("24.21.0"));
     }
 
@@ -845,7 +948,12 @@ mod tests {
             version: Some("24.21.0".into()),
             ..Default::default()
         };
-        write_lock(&[Dependency::simple("node")], &pm, &path).unwrap();
+        write_lock(
+            &[Dependency::simple("node")],
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+        )
+        .unwrap();
         assert_eq!(locked_version(&path, "node").as_deref(), Some("24.21.0"));
     }
 
@@ -1109,6 +1217,7 @@ mod tests {
                 resolved_version: None,
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         LockFile {
@@ -1211,6 +1320,7 @@ mod tests {
                 resolved_version: Some("20.0.0".into()),
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         LockFile {
@@ -1525,7 +1635,7 @@ mod tests {
             crate::config::ExtraValue::Number(16379u64.into()),
         );
         let deps = vec![Dependency::with_extra("redis", extra)];
-        write_lock(&deps, &pm, &path).unwrap();
+        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
         let lock = crate::lock::LockFile::load(&path).unwrap().unwrap();
         let locked_dep = lock.get("redis").unwrap();
         assert_eq!(
@@ -1540,7 +1650,7 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("node")];
-        write_lock(&deps, &pm, &path).unwrap();
+        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
         let lock = crate::lock::LockFile::load(&path).unwrap().unwrap();
         let locked_dep = lock.get("node").unwrap();
         assert!(
@@ -1561,7 +1671,7 @@ mod tests {
         let mut deps = vec![Dependency::simple("redis")];
         ports::resolve_ports(&mut deps, None, &pm, ports::PortMode::Assign).unwrap();
         let injected = deps[0].extra.get("port").and_then(|v| v.as_u64()).unwrap() as u16;
-        write_lock(&deps, &pm, &path).unwrap();
+        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
         let lock = crate::lock::LockFile::load(&path).unwrap().unwrap();
         assert_eq!(
             lock.get("redis").unwrap().assigned_port,
@@ -1587,6 +1697,7 @@ mod tests {
                         resolved_version: Some(version.to_string()),
                         source: "nix".into(),
                         assigned_port: None,
+                        image_digest: None,
                     },
                 );
             }
@@ -1663,7 +1774,7 @@ mod tests {
             crate::config::ExtraValue::Number(6380u64.into()),
         );
         let deps = vec![Dependency::with_extra("redis", extra)];
-        write_lock(&deps, &pm, &path).unwrap();
+        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
         let lock = crate::lock::LockFile::load(&path).unwrap().unwrap();
         assert_eq!(lock.get("redis").unwrap().assigned_port, None);
     }
@@ -1731,6 +1842,7 @@ mod tests {
                 resolved_version: None,
                 source: "homebrew".into(),
                 assigned_port: Some(51000),
+                image_digest: None,
             },
         );
         LockFile {
@@ -1758,5 +1870,476 @@ mod tests {
         );
         let lock = LockFile::load(&lock).unwrap().unwrap();
         assert_eq!(lock.get("redis").unwrap().assigned_port, None);
+    }
+
+    // ── docker-managed services ──────────────────────────────────────────────
+
+    use crate::service_runner::docker::{FakeRunner, fail, ok};
+
+    /// A container CLI where the daemon answers, images are missing until pulled (then
+    /// report `<repo>@sha256:<digest>`), and no containers exist yet.
+    fn docker_cli(digest: &'static str) -> FakeRunner {
+        FakeRunner::new(move |call| match call[1].as_str() {
+            "image" if call[2] == "inspect" && call.len() == 4 => fail("No such image"),
+            "image" => {
+                let reference = call.last().unwrap();
+                let repo = reference.split([':', '@']).next().unwrap();
+                ok(&format!(r#"["{repo}@sha256:{digest}"]"#))
+            }
+            "container" => fail("Error: No such container"),
+            _ => ok(""),
+        })
+    }
+
+    struct DockerUp {
+        result: Result<()>,
+        lines: Vec<String>,
+        env: HashMap<String, String>,
+        lock: Option<LockFile>,
+        warnings: Vec<String>,
+    }
+
+    fn docker_up(
+        yaml: &str,
+        pm: &MockPackageManager,
+        cli: &FakeRunner,
+        lock: Option<LockFile>,
+        update: bool,
+    ) -> DockerUp {
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let env_mgr = MockEnvManager {
+            is_available: true,
+            ..Default::default()
+        };
+        let dir = crate::test_support::tmp_dir();
+        let lock_path = dir.join(crate::lock::PATH);
+        if let Some(l) = lock {
+            l.write(&lock_path).unwrap();
+        }
+        let mut result = None;
+        let warnings = crate::output::with_warn_messages(|| {
+            result = Some(up_with_runtime(
+                &config,
+                pm,
+                ContainerRuntime::new(config.container_cli, cli),
+                &env_mgr,
+                UpOptions {
+                    update,
+                    bootstrap: false,
+                },
+                &dir,
+                &lock_path,
+            ));
+        });
+        DockerUp {
+            result: result.unwrap(),
+            lines: cli.lines(),
+            env: env_mgr.last_vars.borrow().clone(),
+            lock: LockFile::load(&lock_path).unwrap(),
+            warnings,
+        }
+    }
+
+    fn unavailable_pm() -> MockPackageManager {
+        MockPackageManager {
+            unavailable: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn docker_only_project_needs_no_package_manager() {
+        let pm = unavailable_pm();
+        let cli = docker_cli("abc");
+        let up = docker_up(
+            "name: app\nservice_manager: docker\ndependencies:\n  - redis\n  - postgresql\n",
+            &pm,
+            &cli,
+            None,
+            false,
+        );
+        up.result.unwrap();
+        assert!(pm.installed_packages.borrow().is_empty());
+        assert!(pm.started_services.borrow().is_empty());
+        assert_eq!(up.lines[0], "docker info --format {{json .ServerVersion}}");
+        assert!(
+            up.lines.contains(&"docker pull redis:7".to_string()),
+            "{:?}",
+            up.lines
+        );
+        assert!(up.lines.contains(&"docker pull postgres:16".to_string()));
+
+        let lock = up.lock.unwrap();
+        let redis = lock.get("redis").unwrap();
+        assert_eq!(redis.source, "docker");
+        assert_eq!(redis.resolved_version.as_deref(), Some("7"));
+        assert_eq!(redis.image_digest.as_deref(), Some("redis@sha256:abc"));
+        let port = redis
+            .assigned_port
+            .expect("docker ports are always assigned");
+        assert_eq!(
+            lock.get("postgresql").unwrap().image_digest.as_deref(),
+            Some("postgres@sha256:abc")
+        );
+
+        // The container runs the digest just recorded, on the exported host port.
+        let run = up
+            .lines
+            .iter()
+            .find(|l| l.starts_with("docker run") && l.contains("redis@sha256:abc"))
+            .expect("redis container created from the locked digest");
+        assert!(run.contains(&format!("-p 127.0.0.1:{port}:6379")), "{run}");
+        assert_eq!(up.env["REDIS_PORT"], port.to_string());
+        assert_eq!(up.env["REDIS_URL"], format!("redis://127.0.0.1:{port}"));
+    }
+
+    #[test]
+    fn mixed_project_checks_the_package_manager() {
+        let pm = unavailable_pm();
+        let cli = docker_cli("abc");
+        let up = docker_up(
+            "service_manager: docker\ndependencies:\n  - node\n  - redis\n",
+            &pm,
+            &cli,
+            None,
+            false,
+        );
+        let err = up.result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Failed to ensure mock is available"),
+            "{err:#}"
+        );
+        assert!(up.lines.is_empty(), "the package manager is checked first");
+    }
+
+    #[test]
+    fn mixed_project_installs_packages_and_pulls_images() {
+        let pm = MockPackageManager::default();
+        let cli = docker_cli("abc");
+        let up = docker_up(
+            "dependencies:\n  - node\n  - postgres: { service_manager: docker }\n",
+            &pm,
+            &cli,
+            None,
+            false,
+        );
+        up.result.unwrap();
+        assert_eq!(*pm.installed_packages.borrow(), vec!["node".to_string()]);
+        assert!(up.lines.contains(&"docker pull postgres:16".to_string()));
+        let lock = up.lock.unwrap();
+        assert_eq!(lock.get("node").unwrap().source, "mock");
+        assert_eq!(lock.get("node").unwrap().image_digest, None);
+        assert_eq!(lock.get("postgresql").unwrap().source, "docker");
+    }
+
+    #[test]
+    fn docker_unavailable_fails_before_pulling() {
+        let pm = MockPackageManager::default();
+        let cli = FakeRunner::new(|_| fail("Cannot connect to the Docker daemon"));
+        let up = docker_up(
+            "service_manager: docker\ndependencies:\n  - redis\n",
+            &pm,
+            &cli,
+            None,
+            false,
+        );
+        assert_eq!(
+            up.result.unwrap_err().to_string(),
+            "docker is not available — install it or start its daemon, or set service_manager: package"
+        );
+        assert_eq!(up.lines.len(), 1, "{:?}", up.lines);
+        assert!(up.lock.is_none());
+    }
+
+    #[test]
+    fn podman_runs_every_container_operation() {
+        let pm = unavailable_pm();
+        let cli = docker_cli("abc");
+        let up = docker_up(
+            "service_manager: docker\ncontainer_cli: podman\ndependencies:\n  - redis\n",
+            &pm,
+            &cli,
+            None,
+            false,
+        );
+        up.result.unwrap();
+        assert!(
+            up.lines.iter().all(|l| l.starts_with("podman ")),
+            "{:?}",
+            up.lines
+        );
+    }
+
+    fn locked_redis(digest: &str) -> LockFile {
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            "redis".into(),
+            LockedDep {
+                resolved_version: Some("7".into()),
+                source: "docker".into(),
+                assigned_port: Some(51000),
+                image_digest: Some(digest.into()),
+            },
+        );
+        LockFile {
+            dependencies: deps,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn teammate_runs_the_locked_digest() {
+        let pm = unavailable_pm();
+        let cli = docker_cli("moved");
+        let lock = locked_redis("redis@sha256:locked");
+        let up = docker_up(
+            "service_manager: docker\ndependencies:\n  - redis\n",
+            &pm,
+            &cli,
+            Some(lock.clone()),
+            false,
+        );
+        up.result.unwrap();
+        assert!(
+            up.lines
+                .contains(&"docker pull redis@sha256:locked".to_string()),
+            "{:?}",
+            up.lines
+        );
+        assert!(
+            !up.lines.iter().any(|l| l.contains("redis:7")),
+            "{:?}",
+            up.lines
+        );
+        assert_eq!(up.lock.unwrap(), lock, "lock unchanged");
+        assert_eq!(up.env["REDIS_PORT"], "51000");
+    }
+
+    #[test]
+    fn update_pulls_the_tag_and_records_its_digest() {
+        let pm = unavailable_pm();
+        let cli = docker_cli("new");
+        let up = docker_up(
+            "service_manager: docker\ndependencies:\n  - redis\n",
+            &pm,
+            &cli,
+            Some(locked_redis("redis@sha256:old")),
+            true,
+        );
+        up.result.unwrap();
+        assert!(up.lines.contains(&"docker pull redis:7".to_string()));
+        let lock = up.lock.unwrap();
+        let redis = lock.get("redis").unwrap();
+        assert_eq!(redis.image_digest.as_deref(), Some("redis@sha256:new"));
+        assert_eq!(redis.assigned_port, Some(51000), "--update keeps ports");
+    }
+
+    #[test]
+    fn changed_tag_resolves_again() {
+        let pm = unavailable_pm();
+        let cli = docker_cli("v72");
+        let up = docker_up(
+            "service_manager: docker\ndependencies:\n  - redis: { version: \"7.2\" }\n",
+            &pm,
+            &cli,
+            Some(locked_redis("redis@sha256:old")),
+            false,
+        );
+        up.result.unwrap();
+        assert!(up.lines.contains(&"docker pull redis:7.2".to_string()));
+        let lock = up.lock.unwrap();
+        let redis = lock.get("redis").unwrap();
+        assert_eq!(redis.resolved_version.as_deref(), Some("7.2"));
+        assert_eq!(redis.image_digest.as_deref(), Some("redis@sha256:v72"));
+    }
+
+    #[test]
+    fn docker_redis_under_brew_gets_an_assigned_port() {
+        let pm = MockPackageManager {
+            name: "brew",
+            ..Default::default()
+        };
+        let cli = docker_cli("abc");
+        let up = docker_up(
+            "package_manager: brew\nservice_manager: docker\ndependencies:\n  - redis\n",
+            &pm,
+            &cli,
+            None,
+            false,
+        );
+        up.result.unwrap();
+        let port = up
+            .lock
+            .unwrap()
+            .get("redis")
+            .unwrap()
+            .assigned_port
+            .unwrap();
+        assert_eq!(up.env["REDIS_URL"], format!("redis://127.0.0.1:{port}"));
+        assert!(
+            !up.warnings
+                .iter()
+                .any(|w| w.contains("cannot make redis listen")),
+            "{:?}",
+            up.warnings
+        );
+    }
+
+    #[test]
+    fn docker_mysql_and_mariadb_get_distinct_ports() {
+        let pm = unavailable_pm();
+        let cli = docker_cli("abc");
+        let up = docker_up(
+            "service_manager: docker\ndependencies:\n  - mysql\n  - mariadb\n",
+            &pm,
+            &cli,
+            None,
+            false,
+        );
+        up.result.unwrap();
+        let lock = up.lock.unwrap();
+        let mysql = lock.get("mysql").unwrap().assigned_port.unwrap();
+        let mariadb = lock.get("mariadb").unwrap().assigned_port.unwrap();
+        assert_ne!(mysql, mariadb);
+        assert!(
+            up.lines
+                .iter()
+                .any(|l| l.contains(&format!("127.0.0.1:{mysql}:3306")))
+        );
+        assert!(
+            up.lines
+                .iter()
+                .any(|l| l.contains(&format!("127.0.0.1:{mariadb}:3306")))
+        );
+    }
+
+    #[test]
+    fn docker_version_is_an_image_tag_not_a_nix_version() {
+        let pm = MockPackageManager {
+            name: "nix",
+            unavailable: true,
+            ..Default::default()
+        };
+        let cli = docker_cli("abc");
+        let up = docker_up(
+            "service_manager: docker\ndependencies:\n  - redis: { version: \"7.2\", image: \"mirror/redis:7\" }\n",
+            &pm,
+            &cli,
+            None,
+            false,
+        );
+        up.result.unwrap();
+        assert!(
+            !up.warnings.iter().any(|w| w.contains("nix backend")),
+            "{:?}",
+            up.warnings
+        );
+        assert!(up.warnings.contains(
+            &"redis: image tag 7 overrides version 7.2 — remove one of them".to_string()
+        ));
+        assert!(up.lines.contains(&"docker pull mirror/redis:7".to_string()));
+    }
+
+    #[test]
+    fn up_rejects_service_manager_on_non_service() {
+        let pm = MockPackageManager::default();
+        let cli = FakeRunner::ok();
+        let up = docker_up(
+            "dependencies:\n  - foo: { service_manager: docker }\n",
+            &pm,
+            &cli,
+            None,
+            false,
+        );
+        assert_eq!(
+            up.result.unwrap_err().to_string(),
+            "foo: service_manager and image apply only to built-in services"
+        );
+    }
+
+    #[test]
+    fn present_image_is_not_pulled() {
+        let cli = FakeRunner::new(|call| match call[1].as_str() {
+            "image" if call.len() == 4 => ok("[{}]"),
+            "image" => ok(r#"["redis@sha256:abc"]"#),
+            _ => ok(""),
+        });
+        let pm = MockPackageManager::default();
+        let config: DevyConfig =
+            serde_yml::from_str("service_manager: docker\ndependencies:\n  - redis\n").unwrap();
+        let dep = config.normalized_dependencies().unwrap().remove(0);
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &cli),
+            &config,
+            Path::new("/tmp"),
+            None,
+            false,
+        );
+        install_binary(&runners, &dep, Path::new("/tmp")).unwrap();
+        assert_eq!(cli.lines(), vec!["docker image inspect redis:7"]);
+    }
+
+    #[test]
+    fn docker_postgres_skips_package_manager_conf_d() {
+        let conf_dir = crate::test_support::tmp_dir();
+        let pm = MockPackageManager {
+            name: "brew",
+            config_dir: Some(conf_dir.join("postgresql")),
+            ..Default::default()
+        };
+        let cli = docker_cli("abc");
+        let config: DevyConfig = serde_yml::from_str(
+            "service_manager: docker\ndependencies:\n  - postgres: { port: 6543 }\n",
+        )
+        .unwrap();
+        let dep = config.normalized_dependencies().unwrap().remove(0);
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &cli),
+            &config,
+            Path::new("/tmp"),
+            None,
+            false,
+        );
+        install_binary(&runners, &dep, Path::new("/tmp")).unwrap();
+        assert!(
+            !conf_dir.join("postgresql").exists(),
+            "no conf.d write for a docker-managed postgres"
+        );
+        // The same dependency on the package manager does write it.
+        let package = Dependency {
+            docker: false,
+            ..dep
+        };
+        install_binary(&runners, &package, Path::new("/tmp")).unwrap();
+        assert!(conf_dir.join("postgresql").join("devy.conf").exists());
+    }
+
+    #[test]
+    fn docker_services_keep_non_config_post_setup_warnings() {
+        let pm = MockPackageManager::default();
+        let cli = FakeRunner::new(|_| ok("[]"));
+        let config: DevyConfig = serde_yml::from_str(
+            "service_manager: docker\ndependencies:\n  - vault: { dev_mode: true }\n",
+        )
+        .unwrap();
+        let dep = config.normalized_dependencies().unwrap().remove(0);
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &cli),
+            &config,
+            Path::new("/tmp"),
+            None,
+            false,
+        );
+        let warnings = crate::output::with_warn_messages(|| {
+            install_binary(&runners, &dep, Path::new("/tmp")).unwrap();
+        });
+        assert!(
+            warnings.iter().any(|w| w.contains("VAULT_TOKEN")),
+            "{warnings:?}"
+        );
     }
 }

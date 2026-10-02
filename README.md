@@ -73,10 +73,28 @@ name: my-project
 # Options: nix, brew (macOS only), apt (Linux only)
 package_manager: nix
 
+# What runs service dependencies (redis, postgresql, …). Defaults to "package":
+# the package manager's own service backend. "docker" runs each service as a
+# per-project container instead. See "Running services with Docker or Podman".
+# Options: package, docker
+service_manager: package
+
+# The Docker-compatible CLI used for docker-managed services. Defaults to "docker".
+# Options: docker, podman
+container_cli: docker
+
 dependencies:
   # Simple form — installs the latest version
   - redis
   - jq
+
+  # Run just this service in a container, from a registry mirror.
+  # service_manager (package or docker) overrides the top-level setting for one
+  # service; image replaces the default image repository. Both apply only to
+  # built-in services.
+  - postgres:
+      service_manager: docker
+      image: registry.corp.example/mirror/postgres
 
   # Pinned version (under Nix, see "Versions under Nix" below)
   - node:
@@ -150,6 +168,24 @@ package_manager: apt    # Linux only — uses apt-get (requires sudo)
 
 When `package_manager` is omitted or set to `auto`, devy prints a warning and falls back to Nix.
 
+### Without Nix
+
+If Nix isn't allowed where you work, combine your system package manager with docker-managed services. Tools come from Homebrew or apt, and every service runs in a container, so nothing goes through Nix:
+
+```yaml
+name: my-project
+package_manager: brew      # or apt on Linux
+service_manager: docker    # services run as containers
+container_cli: docker      # or podman
+
+dependencies:
+  - node
+  - postgresql
+  - redis
+```
+
+A project whose only dependencies are docker-managed services needs no package manager at all, as long as shadowenv is already installed. See [Running services with Docker or Podman](#running-services-with-docker-or-podman).
+
 ### Versions under Nix
 
 Nix installs one nixpkgs attribute per dependency. A `version:` is honored when it maps to a versioned attribute that nixpkgs carries. devy matches on the major version (major.minor for Python, MySQL and Go), so `22` and `22.11.0` both install `nodejs_22`:
@@ -172,6 +208,53 @@ Every other module, and any version outside these lists, installs the unversione
 
 **Insecure packages.** nixpkgs marks `elasticsearch` (7.x, end-of-life) as insecure. devy allows insecure packages for that install only, with `NIXPKGS_ALLOW_INSECURE=1` and `--impure`, and warns `elasticsearch: nixpkgs#elasticsearch is marked insecure by nixpkgs — allowing insecure packages for this install`. The service only listens on `127.0.0.1`, but don't expose it beyond your machine. `devy export` adds a matching `allowInsecurePredicate`.
 
+## Running services with Docker or Podman
+
+Set `service_manager: docker` to run every service dependency as a per-project container instead of through the package manager. Languages and tools (`node`, `jq`, …) still come from the package manager. To containerize only some services, set `service_manager: docker` on those dependencies instead; to keep one service on the package manager while the rest run in containers, set `service_manager: package` on it.
+
+```yaml
+package_manager: brew
+service_manager: docker
+container_cli: docker      # or podman
+
+dependencies:
+  - node                   # installed with brew
+  - postgresql             # runs in a container
+  - redis:
+      service_manager: package   # stays on brew services
+```
+
+devy drives any Docker-compatible CLI: Docker Desktop, OrbStack, Colima, Linux `dockerd`, or Podman (rootful or rootless) with `container_cli: podman`. `devy up` checks the CLI is on `PATH` and its daemon answers before it pulls or starts anything, and fails with `docker is not available — install it or start its daemon, or set service_manager: package` otherwise. devy never installs Docker or Podman, even with `--bootstrap`.
+
+**Names and data.** Each service runs in a container named `devy-<project>-<service>`, where `<project>` is the project `name` plus a short hash of the project directory, so two checkouts of the same project never collide. Data lives in a named volume of the same name. Containers are labeled `sh.devy.project` and `sh.devy.service`.
+
+**Ports.** devy assigns and locks a port for every docker-managed service, exactly as under Nix, and publishes it on `127.0.0.1` only. `REDIS_PORT`, `DATABASE_URL` and the other exported variables use that host port. Changing a port, image or setting recreates the container on the next `devy up`; the data volume is kept.
+
+**Credentials.** Containers are set up for passwordless local use, matching the URLs devy exports: PostgreSQL trusts local connections (your OS user is the superuser) and MySQL/MariaDB allow an empty root password.
+
+**Stopping and cleaning up.** `devy down` and `devy stop` stop containers and keep their data. `devy down --volumes` also removes each docker-managed service's container and volume, printing `✓ <service> container and volume removed`; package-managed services are unaffected.
+
+**Pinned images.** Each service has a default image and tag (e.g. `redis:7`, `postgres:16`); `version:` selects a different tag. After pulling, `devy.lock` records `source: docker`, the tag as `resolved_version`, and the image's `image_digest` (`redis@sha256:…`). Teammates then pull and run exactly that digest, even if the tag has moved since. Changing `version` or `image` resolves the tag again; `devy up --update` re-pulls every tag and records the new digests.
+
+**Registry mirrors.** `image:` replaces a service's image repository, e.g. for a corporate mirror. A tag in `image` overrides `version` (with a warning):
+
+```yaml
+dependencies:
+  - redis:
+      service_manager: docker
+      image: registry.corp.example/mirror/redis   # runs registry.corp.example/mirror/redis:7
+```
+
+`service_manager` and `image` apply only to built-in services; on anything else devy fails with `<dep>: service_manager and image apply only to built-in services`.
+
+**Kafka.** Kafka always runs as a single KRaft node in its container. Without `kraft: true`, `devy up` and `devy check` warn that zookeeper mode is not supported with docker; no ZooKeeper container is started.
+
+**Apple Silicon.** The default `mailhog/mailhog` image is amd64-only, so it runs under emulation: slow, but it works. Point `image:` at a multi-arch build if you prefer.
+
+**Rootless Podman** can't publish ports below 1024. devy's assigned ports are always above that; if you set an explicit low port (e.g. nginx `port: 80`), devy warns.
+
+**Switching an existing project.** Moving a service from the package manager to docker starts it with a fresh, empty volume. Its old data stays with the package-managed service; dump and restore it if you need it.
+
 ## Commands
 
 ### `devy up`
@@ -190,7 +273,8 @@ devy up --dry-run     # Check status without making any changes
 Stops all managed services.
 
 ```sh
-devy down
+devy down             # Stop services; docker-managed services keep their containers and data
+devy down --volumes   # Also remove docker-managed containers and data volumes
 ```
 
 ### `devy services`, `devy start`, `devy stop`, `devy restart`
@@ -278,6 +362,8 @@ The snippet does two things:
 `devy up` writes `devy.lock` recording the exact version of every dependency that was installed, and the port assigned to every service whose port devy applies (see [Service environment variables](#service-environment-variables)). On subsequent runs without `--update`, devy pins each versionless dependency to its locked version and reuses its locked port, so the environment is reproducible across machines.
 
 Commit `devy.lock` to version control. Run `devy up --update` when you want to upgrade.
+
+Docker-managed services record `source: docker`, their image tag and `image_digest`, the digest of the pulled image, so every machine runs the same image (see [Running services with Docker or Podman](#running-services-with-docker-or-podman)).
 
 ## Supported dependency modules
 

@@ -51,6 +51,22 @@ impl Module for ElasticsearchModule {
         Some("elasticsearch".to_string())
     }
 
+    fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        Ok(Some(
+            super::DockerSpec::new(
+                "docker.elastic.co/elasticsearch/elasticsearch",
+                "8.13.4",
+                9200,
+            )
+            .data("/usr/share/elasticsearch/data")
+            .env(&[
+                ("discovery.type", "single-node"),
+                ("xpack.security.enabled", "false"),
+                ("ES_JAVA_OPTS", "-Xms512m -Xmx512m"),
+            ]),
+        ))
+    }
+
     fn nix_unfree(&self) -> bool {
         true
     }
@@ -153,6 +169,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         }
     }
 

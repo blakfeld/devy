@@ -25,6 +25,15 @@ fn port(dep: &Dependency) -> anyhow::Result<u16> {
     super::extra_port(dep, "port", 5432)
 }
 
+/// The OS user name, which libpq uses when a connection string names no user.
+fn local_user() -> String {
+    ["USER", "USERNAME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|u| !u.is_empty())
+        .unwrap_or_else(|| "postgres".to_string())
+}
+
 fn write_config(config_dir: &Path, port: u16) -> Result<()> {
     fs::create_dir_all(config_dir).context("Failed to create postgresql config dir")?;
     let conf = format!("# devy-managed\nport = {port}\n");
@@ -138,6 +147,23 @@ impl Module for PostgresModule {
 
     fn nix_attr(&self, dep: &crate::config::Dependency) -> Option<String> {
         Some(super::nix_install_attr(self, dep, "postgresql"))
+    }
+
+    fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        // DATABASE_URL names no user, so clients connect as the OS user, as under nix
+        // where initdb makes the OS user the superuser.
+        Ok(Some(
+            super::DockerSpec::new("postgres", "16", 5432)
+                .data("/var/lib/postgresql/data")
+                .env(&[
+                    ("POSTGRES_HOST_AUTH_METHOD", "trust"),
+                    ("POSTGRES_USER", &local_user()),
+                ]),
+        ))
+    }
+
+    fn post_setup_writes_service_config(&self) -> bool {
+        true
     }
 
     fn is_running(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {

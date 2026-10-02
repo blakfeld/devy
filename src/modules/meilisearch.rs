@@ -50,6 +50,15 @@ impl Module for MeilisearchModule {
         Some("meilisearch".to_string())
     }
 
+    fn docker_spec(&self, dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        let mut spec =
+            super::DockerSpec::new("getmeili/meilisearch", "v1.8", 7700).data("/meili_data");
+        if let Some(key) = dep.extra.get("master_key").and_then(|v| v.as_str()) {
+            spec = spec.env(&[("MEILI_MASTER_KEY", key)]);
+        }
+        Ok(Some(spec))
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(7700)
     }

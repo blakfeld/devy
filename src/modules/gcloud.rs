@@ -166,6 +166,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
         let components = extra_strs(&dep, "components");
         assert_eq!(components, vec!["gke-gcloud-auth-plugin", "kubectl"]);
@@ -367,6 +369,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
         let pm = crate::package_manager::MockPackageManager {
             name: "brew",
@@ -471,6 +475,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
         let pm = crate::package_manager::MockPackageManager::default();
         // If the stamp check is bypassed, `gcloud components install` is invoked and fails.
@@ -512,6 +518,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
         let pm = crate::package_manager::MockPackageManager::default();
         let result = GcloudModule.post_setup(&dep, &pm, &dir);

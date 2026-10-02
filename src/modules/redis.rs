@@ -47,6 +47,12 @@ impl Module for RedisModule {
         Some("redis".to_string())
     }
 
+    fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        Ok(Some(
+            super::DockerSpec::new("redis", "7", 6379).data("/data"),
+        ))
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(6379)
     }

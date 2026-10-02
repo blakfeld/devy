@@ -1,22 +1,34 @@
 use anyhow::{Result, bail};
 use colored::Colorize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::commands::ports::{self, PortMode};
 use crate::config::{Dependency, DevyConfig};
 use crate::modules;
 use crate::output;
 use crate::package_manager::{self, PackageManager};
+use crate::service_runner::docker::ContainerRuntime;
+use crate::service_runner::{self, Runners, ServiceRunner};
 
 /// Print all services from devy.yml with their current running status.
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn list() -> Result<()> {
     let (config, project_root) = DevyConfig::load_with_root()?;
-    let pm = package_manager::detect(config.package_manager, &project_root)?;
-    list_impl(&config, pm.as_ref())
+    let pm = package_manager::detect(&config, &project_root)?;
+    let runners = Runners::new(
+        pm.as_ref(),
+        ContainerRuntime::system(config.container_cli),
+        &config,
+        &project_root,
+        None,
+        false,
+    );
+    list_impl(&config, &runners)
 }
 
-pub(crate) fn list_impl(config: &DevyConfig, pm: &dyn PackageManager) -> Result<()> {
+/// One line per service: `● redis` when running, `○ redis` when stopped, with
+/// docker-managed services suffixed `(docker)`.
+pub(crate) fn list_impl(config: &DevyConfig, runners: &Runners) -> Result<()> {
     let services: Vec<_> = config
         .normalized_dependencies()?
         .into_iter()
@@ -31,11 +43,12 @@ pub(crate) fn list_impl(config: &DevyConfig, pm: &dyn PackageManager) -> Result<
     output::header("Services");
 
     for dep in &services {
-        let running = modules::get(&dep.name).is_running(pm, dep)?;
-        if running {
-            println!("  {}  {}", "●".green().bold(), dep.name);
+        let runner = runners.runner_for(dep);
+        let name = service_runner::display_name(&dep.name, runner);
+        if runner.is_running(dep)? {
+            println!("  {}  {}", "●".green().bold(), name);
         } else {
-            println!("  {}  {}", "○".dimmed(), dep.name.dimmed());
+            println!("  {}  {}", "○".dimmed(), name.dimmed());
         }
     }
 
@@ -45,24 +58,19 @@ pub(crate) fn list_impl(config: &DevyConfig, pm: &dyn PackageManager) -> Result<
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn start(name: &str) -> Result<()> {
-    let (dep, pm, project_root) = resolve(name, true)?;
-    start_impl(&dep, pm.as_ref(), &project_root)
+    with_service(name, true, start_impl)
 }
 
-pub(crate) fn start_impl(
-    dep: &Dependency,
-    pm: &dyn PackageManager,
-    project_root: &Path,
-) -> Result<()> {
+pub(crate) fn start_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<()> {
     let module = modules::get(&dep.name);
 
-    if module.is_running(pm, dep)? {
+    if runner.is_running(dep)? {
         output::skip(&format!("{} is already running", dep.name));
         return Ok(());
     }
 
     output::step(&format!("Starting {}…", dep.name));
-    module.start(pm, dep, project_root)?;
+    runner.start(dep)?;
     if let Err(e) = module.wait_for_ready(dep) {
         output::warn(&format!(
             "{} started but health check timed out — verify manually: {}",
@@ -75,49 +83,41 @@ pub(crate) fn start_impl(
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn stop(name: &str) -> Result<()> {
-    let (dep, pm, _) = resolve(name, false)?;
-    stop_impl(&dep, pm.as_ref())
+    with_service(name, false, stop_impl)
 }
 
-pub(crate) fn stop_impl(dep: &Dependency, pm: &dyn PackageManager) -> Result<()> {
-    let module = modules::get(&dep.name);
-
-    if !module.is_running(pm, dep)? {
+pub(crate) fn stop_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<()> {
+    if !runner.is_running(dep)? {
         output::skip(&format!("{} is already stopped", dep.name));
         return Ok(());
     }
 
     output::step(&format!("Stopping {}…", dep.name));
-    module.stop(pm, dep)?;
-    module.wait_for_stopped(pm, dep)?;
+    runner.stop(dep)?;
+    runner.wait_for_stopped(dep)?;
     output::success(&format!("{} stopped", dep.name));
     Ok(())
 }
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn restart(name: &str) -> Result<()> {
-    let (dep, pm, project_root) = resolve(name, true)?;
-    restart_impl(&dep, pm.as_ref(), &project_root)
+    with_service(name, true, restart_impl)
 }
 
-pub(crate) fn restart_impl(
-    dep: &Dependency,
-    pm: &dyn PackageManager,
-    project_root: &Path,
-) -> Result<()> {
+pub(crate) fn restart_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<()> {
     let module = modules::get(&dep.name);
 
-    if module.is_running(pm, dep)? {
+    if runner.is_running(dep)? {
         output::step(&format!("Stopping {}…", dep.name));
-        module.stop(pm, dep)?;
-        module.wait_for_stopped(pm, dep)?;
+        runner.stop(dep)?;
+        runner.wait_for_stopped(dep)?;
         output::success(&format!("{} stopped", dep.name));
     } else {
         output::skip(&format!("{} was already stopped", dep.name));
     }
 
     output::step(&format!("Starting {}…", dep.name));
-    module.start(pm, dep, project_root)?;
+    runner.start(dep)?;
     if let Err(e) = module.wait_for_ready(dep) {
         output::warn(&format!(
             "{} started but health check timed out — verify manually: {}",
@@ -176,14 +176,28 @@ pub(crate) fn resolve_service(
     Ok(dep)
 }
 
-fn resolve(
+/// Resolves service `name` and runs `f` with it and its runner, after checking the
+/// container runtime when the service is docker-managed.
+#[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
+fn with_service(
     name: &str,
     require_port: bool,
-) -> Result<(Dependency, Box<dyn PackageManager>, PathBuf)> {
+    f: impl FnOnce(&Dependency, &dyn ServiceRunner) -> Result<()>,
+) -> Result<()> {
     let (config, project_root) = DevyConfig::load_with_root()?;
-    let pm = package_manager::detect(config.package_manager, &project_root)?;
+    let pm = package_manager::detect(&config, &project_root)?;
     let dep = resolve_service(&config, name, pm.as_ref(), &project_root, require_port)?;
-    Ok((dep, pm, project_root))
+    let lock = ports::load_lock(&project_root)?;
+    let runners = Runners::new(
+        pm.as_ref(),
+        ContainerRuntime::system(config.container_cli),
+        &config,
+        &project_root,
+        lock.as_ref(),
+        false,
+    );
+    runners.ensure_docker_available([&dep])?;
+    f(&dep, runners.runner_for(&dep))
 }
 
 #[cfg(test)]
@@ -191,6 +205,7 @@ mod tests {
     use super::*;
     use crate::config::DevyConfig;
     use crate::package_manager::MockPackageManager;
+    use crate::service_runner::{PackageRunner, package_runners};
     use std::collections::HashMap;
 
     fn make_config(dep_names: &[&str]) -> DevyConfig {
@@ -266,7 +281,7 @@ mod tests {
             ..Default::default()
         };
         let dep = Dependency::simple("mysql");
-        stop_impl(&dep, &pm).unwrap();
+        stop_impl(&dep, &PackageRunner::new(&pm, Path::new("/tmp"))).unwrap();
         assert!(
             !pm.stopped_services.borrow().is_empty(),
             "stop must be called when service is running"
@@ -282,7 +297,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         assert!(
-            stop_impl(&dep, &pm).is_err(),
+            stop_impl(&dep, &PackageRunner::new(&pm, Path::new("/tmp"))).is_err(),
             "stop error must be propagated"
         );
     }
@@ -294,7 +309,7 @@ mod tests {
             ..Default::default()
         };
         let dep = Dependency::simple("mysql");
-        stop_impl(&dep, &pm).unwrap();
+        stop_impl(&dep, &PackageRunner::new(&pm, Path::new("/tmp"))).unwrap();
         assert!(
             pm.stopped_services.borrow().is_empty(),
             "stop must not be called when service is already stopped"
@@ -312,7 +327,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         assert!(
-            start_impl(&dep, &pm, Path::new("/tmp")).is_err(),
+            start_impl(&dep, &PackageRunner::new(&pm, Path::new("/tmp"))).is_err(),
             "start error must be propagated"
         );
     }
@@ -325,7 +340,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         // Returns Ok without calling start_service.
-        start_impl(&dep, &pm, Path::new("/tmp")).unwrap();
+        start_impl(&dep, &PackageRunner::new(&pm, Path::new("/tmp"))).unwrap();
         assert!(pm.started_services.borrow().is_empty());
     }
 
@@ -340,7 +355,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         assert!(
-            start_impl(&dep, &pm, Path::new("/tmp")).is_ok(),
+            start_impl(&dep, &PackageRunner::new(&pm, Path::new("/tmp"))).is_ok(),
             "start_impl must return Ok when start succeeds, even if health check times out"
         );
     }
@@ -356,7 +371,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         assert!(
-            restart_impl(&dep, &pm, Path::new("/tmp")).is_err(),
+            restart_impl(&dep, &PackageRunner::new(&pm, Path::new("/tmp"))).is_err(),
             "restart must propagate start error"
         );
     }
@@ -367,7 +382,7 @@ mod tests {
     fn list_impl_returns_ok_with_no_services() {
         let config = make_config(&["node"]); // node is not a service
         let pm = MockPackageManager::default();
-        assert!(list_impl(&config, &pm).is_ok());
+        assert!(list_impl(&config, &package_runners(&pm, Path::new("/tmp"))).is_ok());
     }
 
     #[test]
@@ -377,7 +392,7 @@ mod tests {
             service_running: true,
             ..Default::default()
         };
-        assert!(list_impl(&config, &pm).is_ok());
+        assert!(list_impl(&config, &package_runners(&pm, Path::new("/tmp"))).is_ok());
     }
 
     #[test]
@@ -389,7 +404,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            list_impl(&config, &pm).is_err(),
+            list_impl(&config, &package_runners(&pm, Path::new("/tmp"))).is_err(),
             "list_impl must propagate is_running errors"
         );
     }
@@ -404,6 +419,7 @@ mod tests {
                 resolved_version: None,
                 source: "nix".into(),
                 assigned_port: Some(port),
+                image_digest: None,
             },
         );
         crate::lock::LockFile {
@@ -462,5 +478,138 @@ mod tests {
             ..Default::default()
         };
         assert!(resolve_service(&config, "redis", &brew, &dir, true).is_ok());
+    }
+
+    // ── docker-managed services ──────────────────────────────────────────────
+
+    use crate::service_runner::docker::{FakeRunner, ok};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn docker_config() -> DevyConfig {
+        serde_yml::from_str(
+            "name: app\nservice_manager: docker\ndependencies:\n  - redis\n  - jq\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn docker_services_are_labeled() {
+        let config = docker_config();
+        let pm = MockPackageManager::default();
+        let cli = FakeRunner::ok();
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &cli),
+            &config,
+            Path::new("/src/app"),
+            None,
+            false,
+        );
+        let deps = config.normalized_dependencies().unwrap();
+        assert_eq!(
+            service_runner::display_name(&deps[0].name, runners.runner_for(&deps[0])),
+            "redis (docker)"
+        );
+        assert_eq!(
+            service_runner::display_name("redis", &PackageRunner::new(&pm, Path::new("/tmp"))),
+            "redis"
+        );
+    }
+
+    #[test]
+    fn list_impl_reads_docker_container_state() {
+        let config = docker_config();
+        let pm = MockPackageManager::default();
+        let cli = FakeRunner::new(|_| ok(r#"{"State":{"Running":true},"Config":{"Labels":{}}}"#));
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &cli),
+            &config,
+            Path::new("/src/app"),
+            None,
+            false,
+        );
+        list_impl(&config, &runners).unwrap();
+        let lines = cli.lines();
+        assert_eq!(lines.len(), 1, "only redis is a service: {lines:?}");
+        assert!(lines[0].starts_with("docker container inspect"));
+    }
+
+    #[test]
+    fn restart_keeps_the_port_and_reuses_the_container() {
+        let config = docker_config();
+        let pm = MockPackageManager::default();
+        let root = Path::new("/src/app");
+        let mut dep = config.normalized_dependencies().unwrap().remove(0);
+        dep.extra.insert(
+            "port".into(),
+            crate::config::ExtraValue::Number(51000u64.into()),
+        );
+        // Labels of a container created for this exact configuration.
+        let spec_cli = FakeRunner::ok();
+        let labels: serde_json::Map<String, serde_json::Value> = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &spec_cli),
+            &config,
+            root,
+            None,
+            false,
+        )
+        .docker
+        .run_spec(&dep)
+        .unwrap()
+        .labels
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect();
+        let running = Rc::new(Cell::new(true));
+        let state = Rc::clone(&running);
+        let cli = FakeRunner::new(move |call| match call[1].as_str() {
+            "stop" => {
+                state.set(false);
+                ok("")
+            }
+            "start" => {
+                state.set(true);
+                ok("")
+            }
+            _ => ok(&serde_json::json!({
+                "State": {"Running": state.get()},
+                "Config": {"Labels": labels.clone()},
+            })
+            .to_string()),
+        });
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &cli),
+            &config,
+            root,
+            None,
+            false,
+        );
+        restart_impl(&dep, runners.runner_for(&dep)).unwrap();
+        let name = runners.docker.container_name(&dep);
+        let lines = cli.lines();
+        assert!(lines.contains(&format!("docker stop {name}")), "{lines:?}");
+        assert!(lines.contains(&format!("docker start {name}")), "{lines:?}");
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains(" run ") || l.contains(" rm ")),
+            "same config must reuse the container: {lines:?}"
+        );
+        assert!(pm.stopped_services.borrow().is_empty());
+    }
+
+    #[test]
+    fn docker_start_requires_a_port_from_up() {
+        let dir = crate::test_support::tmp_dir();
+        let pm = MockPackageManager {
+            name: "brew",
+            ..Default::default()
+        };
+        let err = resolve_service(&docker_config(), "redis", &pm, &dir, true).unwrap_err();
+        assert!(err.to_string().contains("run `devy up` first"), "{err}");
     }
 }

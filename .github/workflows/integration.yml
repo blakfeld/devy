@@ -256,3 +256,89 @@ jobs:
 
           which jq
           jq --version
+
+  # ── Docker services (Linux) ─────────────────────────────────────────────────
+  docker-linux:
+    name: Smoke test · Docker services (Linux)
+    runs-on: ubuntu-latest  # Docker is preinstalled
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-linux
+
+      - name: Build devy
+        run: cargo build --release
+
+      # With shadowenv already on PATH, a docker-only project needs nothing from apt.
+      - name: Install shadowenv and host clients
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          cargo install --locked shadowenv
+          sudo apt-get update -q
+          sudo apt-get install -y -q redis-tools postgresql-client
+
+      - name: Services — redis and postgresql as containers on their assigned ports
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+          cd "$WORK"
+          git init -q
+
+          cat > devy.yml <<'EOF'
+          name: smoke-docker
+          package_manager: apt
+          service_manager: docker
+          dependencies:
+            - redis
+            - postgresql
+          EOF
+
+          DEVY="$GITHUB_WORKSPACE/target/release/devy"
+          cleanup() {
+            docker ps -a --filter "label=sh.devy.project=$WORK" || true
+            for c in $(docker ps -aq --filter "label=sh.devy.project=$WORK"); do
+              echo "== logs $c"; docker logs --tail 50 "$c" || true
+            done
+            "$DEVY" down --volumes || true
+            rm -rf "$WORK"
+          }
+          trap cleanup EXIT
+
+          "$DEVY" up
+          cat devy.lock
+          grep -q "source: docker" devy.lock
+          grep -q "image_digest: redis@sha256:" devy.lock
+          grep -q "image_digest: postgres@sha256:" devy.lock
+
+          # Ports come from devy.lock (the shadowenv environment isn't active here).
+          lock_port() {
+            awk -v dep="  $1:" '$0 == dep {f=1; next} /^  [^ ]/ {f=0} f && /assigned_port:/ {print $2}' devy.lock
+          }
+          REDIS_PORT=$(lock_port redis)
+          POSTGRESQL_PORT=$(lock_port postgresql)
+          echo "redis=$REDIS_PORT postgresql=$POSTGRESQL_PORT"
+          test -n "$REDIS_PORT" && test -n "$POSTGRESQL_PORT"
+
+          redis-cli -h 127.0.0.1 -p "$REDIS_PORT" ping | grep -q PONG
+          for _ in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -p "$POSTGRESQL_PORT" && break
+            sleep 1
+          done
+          pg_isready -h 127.0.0.1 -p "$POSTGRESQL_PORT"
+          # DATABASE_URL names no user: the OS user must exist and need no password.
+          psql "postgres://localhost:$POSTGRESQL_PORT/postgres" -c 'select 1'
+
+          "$DEVY" check
+
+          # A second run reuses the locked digests and leaves devy.lock untouched.
+          cp devy.lock devy.lock.before
+          "$DEVY" up
+          cmp devy.lock devy.lock.before
+
+          "$DEVY" down --volumes
+          test -z "$(docker ps -aq --filter "label=sh.devy.project=$WORK")"
+          test -z "$(docker volume ls -q --filter name=devy-smoke-docker-)"

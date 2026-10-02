@@ -25,11 +25,11 @@ When any dependency is docker-managed, `devy up` SHALL also check container runt
 - **THEN** `devy up` completes without checking for or installing Nix
 
 ### Requirement: Dependency installation phase
-For each dependency, in declaration order, `devy up` SHALL do the following:
-- If the dependency is already installed, print `○ <dep> already installed (via <pm>)`. For docker-managed services it SHALL print `○ <dep> image present (docker)`.
+For each dependency, in declaration order, `devy up` SHALL do the following. In these messages, `<dep>` is shown as `<name>@<version>` when a version is set in `devy.yml` or pinned from `devy.lock`, and as `<name>` otherwise.
+- If the dependency is already installed, print `○ <dep> already installed (via <pm>)`. For docker-managed services it SHALL print `○ <name> image present (docker)`.
 - Otherwise, install it, printing `→ Installing <dep>` and then `✓ Installed <dep>`. Docker-managed services are installed by pulling their image, printing `→ Pulling <reference>` and then `✓ Pulled <reference>`.
-- Only when the dependency was freshly installed, run its `after_install` command (if any) in the project root, using the dependency's `shell` or the default shell. A non-zero exit SHALL abort the run.
-- Run the module's post-setup step on every run, whether or not anything was installed. Post-setup steps that write package-manager service config SHALL be skipped for docker-managed services.
+- Only when the dependency was freshly installed, run its `after_install` command (if any) in the project root, using the dependency's `shell` or the default shell. Before running it, print the warning `<name>: running after_install: <cmd>`. A non-zero exit SHALL abort the run.
+- Run the module's post-setup step on every run, whether or not anything was installed. A failure SHALL abort with `post_setup failed for <name>`. Post-setup steps that write package-manager service config SHALL be skipped for docker-managed services.
 
 #### Scenario: Already installed
 - **WHEN** a dependency is already installed
@@ -41,7 +41,7 @@ For each dependency, in declaration order, `devy up` SHALL do the following:
 
 #### Scenario: Install failure
 - **WHEN** the package manager fails to install a dependency
-- **THEN** devy fails with `Failed to install <dep>` and no services are started
+- **THEN** devy fails with `Failed to install <dep>` (e.g. `Failed to install node@20.11.0` when the version is pinned from the lock) and no services are started
 
 #### Scenario: Docker service is pulled, not installed
 - **WHEN** `redis` is docker-managed and its image is not present locally
