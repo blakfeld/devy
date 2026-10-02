@@ -276,8 +276,16 @@ jobs:
       - name: Install shadowenv and host clients
         env:
           DEBIAN_FRONTEND: noninteractive
+          SHADOWENV_VERSION: 3.5.1
+          SHADOWENV_SHA256: 612e10af532b2469715a32d706fd65b03bcc59d6f69724a45a1d292e27df04b8
         run: |
-          cargo install --locked shadowenv
+          # shadowenv isn't on crates.io; use the pinned prebuilt release binary.
+          curl -fsSL -o shadowenv \
+            "https://github.com/Shopify/shadowenv/releases/download/${SHADOWENV_VERSION}/shadowenv-x86_64-unknown-linux-gnu"
+          echo "${SHADOWENV_SHA256}  shadowenv" | sha256sum -c -
+          sudo install -m 0755 shadowenv /usr/local/bin/shadowenv
+          rm shadowenv
+          shadowenv --version
           sudo apt-get update -q
           sudo apt-get install -y -q redis-tools postgresql-client
 
