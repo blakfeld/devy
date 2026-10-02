@@ -688,18 +688,19 @@ mod tests {
         assert!(parse(yaml).unwrap().normalized_dependencies().is_ok());
     }
 
-    /// The first ```yaml block after `heading` in README.md.
-    fn readme_yaml(heading: &str) -> &'static str {
-        let readme = include_str!("../README.md");
+    /// The first ```yaml block after `heading` in README.md. Line endings are normalized,
+    /// since Windows checkouts may convert the README to CRLF.
+    fn readme_yaml(heading: &str) -> String {
+        let readme = include_str!("../README.md").replace("\r\n", "\n");
         let section = &readme[readme.find(heading).expect("heading in README")..];
         let start = section.find("```yaml\n").expect("yaml block") + "```yaml\n".len();
         let len = section[start..].find("```").expect("closed block");
-        &section[start..start + len]
+        section[start..start + len].to_string()
     }
 
     #[test]
     fn readme_reference_example_parses() {
-        let config = parse(readme_yaml("## devy.yml reference")).unwrap();
+        let config = parse(&readme_yaml("## devy.yml reference")).unwrap();
         let deps = config.normalized_dependencies().unwrap();
         let postgres = deps.iter().find(|d| d.name == "postgres").unwrap();
         assert!(postgres.docker);
@@ -712,7 +713,7 @@ mod tests {
 
     #[test]
     fn readme_docker_section_example_parses() {
-        let config = parse(readme_yaml("## Running services with Docker or Podman")).unwrap();
+        let config = parse(&readme_yaml("## Running services with Docker or Podman")).unwrap();
         let docker: Vec<(String, bool)> = config
             .normalized_dependencies()
             .unwrap()
@@ -731,7 +732,7 @@ mod tests {
 
     #[test]
     fn readme_nix_free_example_parses() {
-        let config = parse(readme_yaml("### Without Nix")).unwrap();
+        let config = parse(&readme_yaml("### Without Nix")).unwrap();
         assert_eq!(config.package_manager, PackageManagerChoice::Brew);
         assert_eq!(config.service_manager, ServiceManagerChoice::Docker);
         let docker: Vec<(String, bool)> = config
