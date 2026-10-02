@@ -1,9 +1,5 @@
-# ai-assist Specification
+## MODIFIED Requirements
 
-## Purpose
-Defines devy's opt-in AI layer shared by every AI-powered command (`init`, `doctor`, `ask`): how it reaches a model through the user's `claude` CLI, what it may send, how users preview that, and how failures are reported.
-
-## Requirements
 ### Requirement: AI is explicit opt-in
 devy SHALL use AI only while running a command or flag that is documented as AI-powered and that the user invoked explicitly. No other command, including `up`, `check`, `status` and `init --detect`, SHALL look for or run the `claude` CLI, or fail because it is missing.
 

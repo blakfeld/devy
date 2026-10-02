@@ -30,19 +30,16 @@ enum Commands {
         #[arg(long)]
         bootstrap: bool,
     },
-    /// Create a devy.yml in the current directory
+    /// Draft a devy.yml for the current directory with Claude (needs the claude CLI)
     Init {
         /// Overwrite an existing devy.yml
         #[arg(long)]
         force: bool,
-        /// Draft devy.yml from project files (version files, compose, package.json, .env.example) without network access
-        #[arg(long, conflicts_with = "ai")]
+        /// Skip Claude: draft devy.yml from project files (version files, compose, package.json, .env.example) only, without network access
+        #[arg(long, conflicts_with = "show_context")]
         detect: bool,
-        /// Draft devy.yml with Claude from a redacted summary of project files (needs the claude CLI)
+        /// Print exactly what would be sent to Claude, then exit without sending it
         #[arg(long)]
-        ai: bool,
-        /// With --ai: print exactly what would be sent to the model, then exit without sending it
-        #[arg(long, requires = "ai")]
         show_context: bool,
     },
     /// List services from devy.yml and their current running status
@@ -127,15 +124,14 @@ impl Cli {
             Commands::Init {
                 force,
                 detect,
-                ai,
                 show_context,
             } => {
-                let mode = match (detect, ai) {
-                    (_, true) => commands::init::Mode::Ai {
+                let mode = if *detect {
+                    commands::init::Mode::Detect
+                } else {
+                    commands::init::Mode::Ai {
                         show_context: *show_context,
-                    },
-                    (true, false) => commands::init::Mode::Detect,
-                    (false, false) => commands::init::Mode::Plain,
+                    }
                 };
                 commands::init::run(mode, *force, std::path::Path::new("devy.yml"))
             }
