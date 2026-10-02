@@ -1,5 +1,5 @@
-//! The request behind `devy init --ai`: devy's schema, module catalog and rules as the
-//! system prompt; the detected draft and redacted project files as the user content.
+//! The request behind `devy init`: devy's schema, module catalog and rules as the
+//! prompt's preamble, then the detected draft and redacted project files.
 
 use std::path::Path;
 
