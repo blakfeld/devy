@@ -27,7 +27,8 @@
   - Comparing out paths. It reinstalls after every channel update.
 
 ### D2. Learning the derivation name at install time
-- **Mechanism:** before installing, run `nix-env -f '<nixpkgs>' -qaA <attr> --json` to get the derivation `name` the install will produce. After a successful install, record it with an atomic write (temp file then rename).
+- **Mechanism:** before installing, run `nix-env -qaA nixpkgs.<attr> --json` to get the derivation `name` the install will produce. After a successful install, record it with an atomic write (temp file then rename).
+- **Same source as the install:** the query resolves `nixpkgs.<attr>` against the default expression (`~/.nix-defexpr`), exactly as `nix-env -iA nixpkgs.<attr>` does. Querying `<nixpkgs>` from `NIX_PATH` instead could evaluate a different nixpkgs revision. The recorded name would then never appear in the profile, and devy would reinstall on every run.
 - **Cost:** one evaluation per *install*, not per check.
 - **Alternative rejected:** diffing `nix-env -q` before and after the install. A no-op reinstall shows no diff.
 
@@ -42,7 +43,7 @@ The version comes from the entry matched in D3, so the lock gets the version of 
 ## Risks / Trade-offs
 
 - **The manifest drifts from the profile after a manual `nix-env -u`** → the recorded name no longer matches, so devy reinstalls the attribute and re-records it. That's self-healing.
-- **`<nixpkgs>` missing from `NIX_PATH` breaks the pre-install query** → the install itself uses `nixpkgs.<attr>` and fails the same way, so record only on success and surface the install's error.
+- **A missing `nixpkgs` channel breaks the pre-install query** → the install resolves the same `nixpkgs.<attr>` and fails the same way, so record only on success and surface the install's error. If the query alone fails, devy drops any existing record for the attribute, so lookups fall back to name matching instead of looping.
 - **Concurrent `devy up`** → already serialized by the `.devy-lock` guard.
 
 ## Migration Plan
