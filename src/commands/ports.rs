@@ -86,7 +86,7 @@ fn resolve_one(
             Ok(p) => Ok(ResolvedPort::Explicit(p)),
         };
     }
-    if module.port_applicable(pm) {
+    if port_applicable(dep, pm) {
         let canonical = modules::canonical_name(&dep.name);
         if let Some(p) = lock
             .and_then(|l| l.get(canonical))
@@ -107,6 +107,12 @@ fn resolve_one(
         Some(p) => Ok(ResolvedPort::Default(p)),
         None => Ok(ResolvedPort::Unassigned),
     }
+}
+
+/// Whether `dep`'s service can be made to listen on a port devy chooses. Always true for
+/// docker-managed services, which publish any host port to a fixed container port.
+pub(crate) fn port_applicable(dep: &Dependency, pm: &dyn PackageManager) -> bool {
+    dep.docker || modules::get(&dep.name).port_applicable(pm)
 }
 
 /// Fails if two service deps resolve to the same effective port. Unassigned ports are
@@ -154,7 +160,7 @@ pub(crate) fn unapplied_port_warning(dep: &Dependency, pm: &dyn PackageManager) 
     let key = module.port_key()?;
     let raw = dep.extra.get(key)?.as_u64()?;
     let port = u16::try_from(raw).ok()?;
-    if Some(port) == module.default_port() || module.port_applicable(pm) {
+    if Some(port) == module.default_port() || port_applicable(dep, pm) {
         return None;
     }
     Some(format!(
@@ -198,6 +204,7 @@ mod tests {
                     resolved_version: None,
                     source: "nix".into(),
                     assigned_port: Some(*port),
+                    image_digest: None,
                 },
             );
         }

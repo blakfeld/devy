@@ -21,7 +21,7 @@ pub use nix::NixPackageManager;
 use anyhow::Result;
 use std::path::PathBuf;
 
-use crate::config::{Dependency, PackageManagerChoice};
+use crate::config::{Dependency, DevyConfig, PackageManagerChoice};
 use crate::modules::LaunchSpec;
 
 pub trait PackageManager {
@@ -84,16 +84,18 @@ pub trait PackageManager {
 
 /// Detect or select the active package manager.
 ///
-/// `pm` comes from `package_manager:` in `devy.yml`. Unknown values are rejected
-/// by serde at parse time; this function only handles the valid enum variants.
+/// The choice comes from `package_manager:` in `devy.yml`. Unknown values are rejected
+/// by serde at parse time; this function only handles the valid enum variants. The
+/// warning about defaulting to nix is skipped when no dependency uses the package
+/// manager (every dependency is a docker-managed service).
 ///
 /// `project_root` is used by the Nix backend to scope the profile to the
 /// project directory rather than the shell's current working directory.
 pub fn detect(
-    pm: PackageManagerChoice,
+    config: &DevyConfig,
     project_root: &std::path::Path,
 ) -> Result<Box<dyn PackageManager>> {
-    match pm {
+    match config.package_manager {
         PackageManagerChoice::Nix => {
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             anyhow::bail!("package_manager: nix is not supported on Windows");
@@ -112,13 +114,16 @@ pub fn detect(
             #[cfg(target_os = "linux")]
             return Ok(Box::new(Apt::new()));
         }
-        PackageManagerChoice::Auto => {
+        PackageManagerChoice::Auto =>
+        {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            crate::output::warn(
-                "No package_manager set in devy.yml — defaulting to nix. \
+            if !config.docker_only() {
+                crate::output::warn(
+                    "No package_manager set in devy.yml — defaulting to nix. \
                  Add `package_manager: brew` (macOS) or `package_manager: apt` (Linux) \
                  to keep using your system package manager.",
-            );
+                );
+            }
         }
     }
 
@@ -172,6 +177,9 @@ pub struct MockPackageManager {
     pub validate_config_fails: bool,
     /// Paths returned by `path_prepends`. Defaults to empty.
     pub path_prepends_result: Vec<String>,
+    /// When true, `is_available` returns false, so `ensure_available` fails without
+    /// `--bootstrap`.
+    pub unavailable: bool,
 }
 
 #[cfg(test)]
@@ -197,6 +205,7 @@ impl Default for MockPackageManager {
             version_queries: std::cell::RefCell::new(Vec::new()),
             validate_config_fails: false,
             path_prepends_result: Vec::new(),
+            unavailable: false,
         }
     }
 }
@@ -207,7 +216,7 @@ impl PackageManager for MockPackageManager {
         self.name
     }
     fn is_available(&self) -> bool {
-        true
+        !self.unavailable
     }
     fn bootstrap(&self) -> Result<()> {
         Ok(())
@@ -362,10 +371,32 @@ mod tests {
     #[test]
     fn detect_auto_is_ok() {
         let root = std::path::Path::new("/tmp");
+        let config = crate::test_support::make_config(&[], Default::default());
         assert!(
-            detect(PackageManagerChoice::Auto, root).is_ok(),
+            detect(&config, root).is_ok(),
             "PackageManagerChoice::Auto must succeed on the current platform"
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn detect_auto_warns_only_when_a_dependency_uses_the_package_manager() {
+        let root = std::path::Path::new("/tmp");
+        let warnings = |yaml: &str| {
+            let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+            crate::output::with_warn_messages(|| {
+                detect(&config, root).unwrap();
+            })
+        };
+        assert!(
+            warnings("service_manager: docker\ndependencies:\n  - redis\n").is_empty(),
+            "a docker-only project never uses nix"
+        );
+        assert_eq!(
+            warnings("service_manager: docker\ndependencies:\n  - redis\n  - jq\n").len(),
+            1
+        );
+        assert_eq!(warnings("dependencies:\n  - redis\n").len(), 1);
     }
 
     #[test]

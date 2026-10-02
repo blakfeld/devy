@@ -35,6 +35,12 @@ impl Module for MongodbModule {
         Some("mongodb-ce".to_string())
     }
 
+    fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        Ok(Some(
+            super::DockerSpec::new("mongo", "7", 27017).data("/data/db"),
+        ))
+    }
+
     fn nix_unfree(&self) -> bool {
         true
     }

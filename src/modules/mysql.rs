@@ -70,6 +70,19 @@ impl Module for MysqlModule {
         Some(super::nix_install_attr(self, dep, "mysql84"))
     }
 
+    fn docker_spec(&self, dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        Ok(Some(super::DockerSpec {
+            args: super::helpers::mysql_server_args(cli_args(dep).as_deref()),
+            ..super::DockerSpec::new("mysql", "8.0", 3306)
+                .data("/var/lib/mysql")
+                .env(&[("MYSQL_ALLOW_EMPTY_PASSWORD", "yes")])
+        }))
+    }
+
+    fn post_setup_writes_service_config(&self) -> bool {
+        true
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(3306)
     }
@@ -193,6 +206,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         }
     }
 

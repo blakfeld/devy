@@ -111,7 +111,7 @@ A docker-managed Kafka SHALL always run in KRaft mode. When `kraft` is not `true
 - **THEN** devy warns that KRaft is used and starts a single Kafka container
 
 ### Requirement: Docker services are not supported for generic dependencies
-A dependency handled by the generic module (no built-in image definition) that sets `service_manager: docker` MUST be rejected during config validation with `<dep>: service_manager: docker is only supported for built-in services`.
+A dependency handled by the generic module (no built-in image definition) that sets `service_manager: docker` MUST be rejected during config validation with `<dep>: service_manager and image apply only to built-in services`, the same message as for any other non-service dependency.
 
 #### Scenario: Unknown dependency
 - **WHEN** `devy.yml` declares `- foo: { service_manager: docker }`

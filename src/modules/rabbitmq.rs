@@ -78,6 +78,12 @@ impl Module for RabbitmqModule {
         Some("rabbitmq-server".to_string())
     }
 
+    fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        Ok(Some(
+            super::DockerSpec::new("rabbitmq", "3", 5672).data("/var/lib/rabbitmq"),
+        ))
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(5672)
     }
@@ -140,6 +146,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         }
     }
 

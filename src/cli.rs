@@ -54,7 +54,11 @@ enum Commands {
         name: String,
     },
     /// Stop all services defined in devy.yml
-    Down,
+    Down {
+        /// Also remove docker-managed services' containers and data volumes
+        #[arg(long)]
+        volumes: bool,
+    },
     /// Show install, service, and environment status
     Status,
     /// Validate the environment matches devy.yml without making changes
@@ -108,7 +112,7 @@ impl Cli {
             Commands::Start { name } => commands::service::start(name),
             Commands::Stop { name } => commands::service::stop(name),
             Commands::Restart { name } => commands::service::restart(name),
-            Commands::Down => commands::down::run(),
+            Commands::Down { volumes } => commands::down::run(*volumes),
             Commands::Status => commands::status::run(),
             Commands::Check => commands::check::run(),
             Commands::Pr => commands::pr::run(),

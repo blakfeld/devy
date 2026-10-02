@@ -42,6 +42,10 @@ impl Module for MemcachedModule {
         Some("memcached".to_string())
     }
 
+    fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        Ok(Some(super::DockerSpec::new("memcached", "1", 11211)))
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(11211)
     }
@@ -104,6 +108,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         }
     }
 

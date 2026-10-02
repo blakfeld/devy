@@ -17,6 +17,35 @@ pub enum PackageManagerChoice {
     Apt,
 }
 
+/// What runs service dependencies: the package manager's own service backend, or
+/// per-project containers. Set at the top level and optionally per dependency.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceManagerChoice {
+    #[default]
+    Package,
+    Docker,
+}
+
+/// The Docker-compatible CLI used for docker-managed services.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerCli {
+    #[default]
+    Docker,
+    Podman,
+}
+
+impl ContainerCli {
+    /// The executable name.
+    pub fn binary(self) -> &'static str {
+        match self {
+            ContainerCli::Docker => "docker",
+            ContainerCli::Podman => "podman",
+        }
+    }
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +143,12 @@ pub struct DevyConfig {
     /// the platform default. Unknown values are rejected at parse time.
     #[serde(default)]
     pub package_manager: PackageManagerChoice,
+    /// Default backend for service dependencies; each dependency may override it.
+    #[serde(default)]
+    pub service_manager: ServiceManagerChoice,
+    /// CLI used for docker-managed services. Unused when none are docker-managed.
+    #[serde(default)]
+    pub container_cli: ContainerCli,
 }
 
 /// Supports two forms in YAML:
@@ -141,6 +176,11 @@ pub struct DepConfig {
     /// Must be a bare shell name from the allowed list: sh, bash, zsh, fish, cmd, powershell.
     /// Paths (e.g. `/usr/bin/bash`) are not accepted.
     pub shell: Option<String>,
+    /// Overrides the top-level `service_manager` for this (service) dependency.
+    pub service_manager: Option<ServiceManagerChoice>,
+    /// Container image repository (optionally with a tag) for a docker-managed service,
+    /// replacing the module's default image, e.g. for a registry mirror.
+    pub image: Option<String>,
     /// Module-specific keys (e.g. port, cli_args) are captured here.
     #[serde(flatten)]
     pub extra: HashMap<String, ExtraValue>,
@@ -155,6 +195,8 @@ pub struct Dependency {
     pub after_install: Option<String>,
     /// Shell interpreter for `after_install`. `None` means use the platform default.
     pub shell: Option<String>,
+    /// Per-dependency image override for docker-managed services.
+    pub image: Option<String>,
     pub extra: HashMap<String, ExtraValue>,
     /// True when `version` was pinned from devy.lock rather than written in devy.yml.
     /// Never read from or written to any file.
@@ -165,6 +207,9 @@ pub struct Dependency {
     /// True when the nix backend must allow insecure packages for this install. Set by
     /// `pkg_dep` from `Module::nix_insecure`; never read from or written to any file.
     pub allow_insecure: bool,
+    /// True when this service runs as a container rather than through the package
+    /// manager. Set by `normalized_dependencies`; never read from or written to any file.
+    pub docker: bool,
 }
 
 impl Dependency {
@@ -175,10 +220,12 @@ impl Dependency {
             tap: None,
             after_install: None,
             shell: None,
+            image: None,
             extra: HashMap::new(),
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            docker: false,
         }
     }
 
@@ -259,7 +306,9 @@ impl DevyConfig {
         let mut result = Vec::new();
         for raw in &self.dependencies {
             match raw {
-                RawDependency::Simple(name) => result.push(Dependency::simple(name)),
+                RawDependency::Simple(name) => {
+                    result.push(self.service_backend(Dependency::simple(name), None)?)
+                }
                 RawDependency::Configured(map) => {
                     if map.len() > 1 {
                         let keys: Vec<&str> = map.keys().map(String::as_str).collect();
@@ -271,23 +320,70 @@ impl DevyConfig {
                     }
                     for (name, cfg) in map {
                         let cfg = cfg.clone().unwrap_or_default();
-                        result.push(Dependency {
+                        let dep = Dependency {
                             name: name.clone(),
                             version: cfg.version,
                             tap: cfg.tap,
                             after_install: cfg.after_install,
                             shell: cfg.shell,
+                            image: cfg.image,
                             extra: cfg.extra,
                             version_from_lock: false,
                             allow_unfree: false,
                             allow_insecure: false,
-                        });
+                            docker: false,
+                        };
+                        result.push(self.service_backend(dep, cfg.service_manager)?);
                     }
                 }
             }
         }
         Ok(result)
     }
+
+    /// Whether there are dependencies and every one is a docker-managed service, so
+    /// nothing is installed through the package manager. False for an invalid config.
+    pub fn docker_only(&self) -> bool {
+        self.normalized_dependencies()
+            .is_ok_and(|deps| !deps.is_empty() && deps.iter().all(|d| d.docker))
+    }
+
+    /// Validates the per-dependency `service_manager`/`image` settings and marks `dep`
+    /// docker-managed when it is a built-in service and its own `service_manager`, or
+    /// failing that the top-level one, is `docker`. Non-services always use the package
+    /// manager.
+    fn service_backend(
+        &self,
+        mut dep: Dependency,
+        own: Option<ServiceManagerChoice>,
+    ) -> Result<Dependency> {
+        let is_service = crate::modules::get(&dep.name).is_service();
+        if !is_service && (own.is_some() || dep.image.is_some()) {
+            anyhow::bail!(
+                "{}: service_manager and image apply only to built-in services",
+                dep.name
+            );
+        }
+        if let Some(image) = dep.image.as_deref() {
+            validate_image(&dep.name, image)?;
+        }
+        dep.docker =
+            is_service && own.unwrap_or(self.service_manager) == ServiceManagerChoice::Docker;
+        Ok(dep)
+    }
+}
+
+/// Rejects an `image` that isn't a plain `[registry/]repository[:tag]`. It is passed to
+/// the container CLI as an argument, where a value starting with `-` would read as a flag.
+fn validate_image(dep: &str, image: &str) -> Result<()> {
+    let valid = image.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && image
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':'));
+    if !valid {
+        anyhow::bail!("{dep}: invalid image '{image}' — expected [registry/]repository[:tag]");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -354,6 +450,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
         assert_eq!(dep.versioned_name(), "node@20");
     }
@@ -432,6 +530,8 @@ mod tests {
             commands: HashMap::new(),
             hooks: Default::default(),
             package_manager: Default::default(),
+            service_manager: Default::default(),
+            container_cli: Default::default(),
         };
         assert!(
             config.normalized_dependencies().is_err(),
@@ -450,10 +550,204 @@ mod tests {
             commands: HashMap::new(),
             hooks: Default::default(),
             package_manager: Default::default(),
+            service_manager: Default::default(),
+            container_cli: Default::default(),
         };
         let deps = config.normalized_dependencies().unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "mysql");
+    }
+
+    // ── service_manager / container_cli ───────────────────────────────────────
+
+    fn parse(yaml: &str) -> Result<DevyConfig> {
+        Ok(serde_yml::from_str(yaml)?)
+    }
+
+    #[test]
+    fn service_manager_and_container_cli_default() {
+        let config = parse("dependencies: []\n").unwrap();
+        assert_eq!(config.service_manager, ServiceManagerChoice::Package);
+        assert_eq!(config.container_cli, ContainerCli::Docker);
+    }
+
+    #[test]
+    fn service_manager_and_container_cli_valid_values() {
+        let config = parse("service_manager: docker\ncontainer_cli: podman\n").unwrap();
+        assert_eq!(config.service_manager, ServiceManagerChoice::Docker);
+        assert_eq!(config.container_cli, ContainerCli::Podman);
+        assert_eq!(config.container_cli.binary(), "podman");
+        let config = parse("service_manager: package\ncontainer_cli: docker\n").unwrap();
+        assert_eq!(config.service_manager, ServiceManagerChoice::Package);
+        assert_eq!(config.container_cli.binary(), "docker");
+    }
+
+    #[test]
+    fn invalid_service_manager_or_container_cli_is_a_parse_error() {
+        assert!(parse("service_manager: kubernetes\n").is_err());
+        assert!(parse("service_manager: Docker\n").is_err());
+        assert!(parse("container_cli: nerdctl\n").is_err());
+        assert!(parse("dependencies:\n  - redis: { service_manager: kubernetes }\n").is_err());
+    }
+
+    #[test]
+    fn per_dependency_service_manager_and_image_are_typed() {
+        let config =
+            parse("dependencies:\n  - redis: { service_manager: docker, image: mirror/redis }\n")
+                .unwrap();
+        let deps = config.normalized_dependencies().unwrap();
+        assert_eq!(deps[0].image.as_deref(), Some("mirror/redis"));
+        assert!(deps[0].docker);
+        assert!(
+            deps[0].extra.is_empty(),
+            "service_manager and image must not land in extra: {:?}",
+            deps[0].extra
+        );
+    }
+
+    fn docker_flags(yaml: &str) -> Vec<(String, bool)> {
+        parse(yaml)
+            .unwrap()
+            .normalized_dependencies()
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.name, d.docker))
+            .collect()
+    }
+
+    #[test]
+    fn top_level_docker_applies_to_services_only() {
+        assert_eq!(
+            docker_flags("service_manager: docker\ndependencies:\n  - redis\n  - jq\n"),
+            vec![("redis".into(), true), ("jq".into(), false)]
+        );
+    }
+
+    #[test]
+    fn per_dependency_docker_opt_in() {
+        assert_eq!(
+            docker_flags("dependencies:\n  - postgres: { service_manager: docker }\n  - redis\n"),
+            vec![("postgres".into(), true), ("redis".into(), false)]
+        );
+    }
+
+    #[test]
+    fn per_dependency_package_opt_out() {
+        assert_eq!(
+            docker_flags(
+                "service_manager: docker\ndependencies:\n  - redis: { service_manager: package }\n  - mysql\n"
+            ),
+            vec![("redis".into(), false), ("mysql".into(), true)]
+        );
+    }
+
+    fn validation_error(yaml: &str) -> String {
+        parse(yaml)
+            .unwrap()
+            .normalized_dependencies()
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn service_manager_rejected_on_non_service() {
+        assert_eq!(
+            validation_error("dependencies:\n  - node: { service_manager: docker }\n"),
+            "node: service_manager and image apply only to built-in services"
+        );
+        assert_eq!(
+            validation_error("dependencies:\n  - node: { image: node }\n"),
+            "node: service_manager and image apply only to built-in services"
+        );
+    }
+
+    #[test]
+    fn service_manager_rejected_on_generic_dependency() {
+        assert_eq!(
+            validation_error("dependencies:\n  - foo: { service_manager: docker }\n"),
+            "foo: service_manager and image apply only to built-in services"
+        );
+    }
+
+    #[test]
+    fn top_level_docker_does_not_reject_non_services() {
+        let yaml = "service_manager: docker\ndependencies:\n  - node\n  - foo\n";
+        assert!(parse(yaml).unwrap().normalized_dependencies().is_ok());
+    }
+
+    #[test]
+    fn image_must_be_a_plain_reference() {
+        for bad in ["--privileged", "redis latest", "redis@sha256:abc", "/redis"] {
+            let yaml = format!("dependencies:\n  - redis: {{ image: \"{bad}\" }}\n");
+            assert!(
+                validation_error(&yaml).contains("invalid image"),
+                "{bad} must be rejected"
+            );
+        }
+        let yaml = "dependencies:\n  - redis: { image: \"registry.corp.example:5000/mirror/redis:7.2\" }\n";
+        assert!(parse(yaml).unwrap().normalized_dependencies().is_ok());
+    }
+
+    /// The first ```yaml block after `heading` in README.md.
+    fn readme_yaml(heading: &str) -> &'static str {
+        let readme = include_str!("../README.md");
+        let section = &readme[readme.find(heading).expect("heading in README")..];
+        let start = section.find("```yaml\n").expect("yaml block") + "```yaml\n".len();
+        let len = section[start..].find("```").expect("closed block");
+        &section[start..start + len]
+    }
+
+    #[test]
+    fn readme_reference_example_parses() {
+        let config = parse(readme_yaml("## devy.yml reference")).unwrap();
+        let deps = config.normalized_dependencies().unwrap();
+        let postgres = deps.iter().find(|d| d.name == "postgres").unwrap();
+        assert!(postgres.docker);
+        assert_eq!(
+            postgres.image.as_deref(),
+            Some("registry.corp.example/mirror/postgres")
+        );
+        assert!(!deps.iter().find(|d| d.name == "redis").unwrap().docker);
+    }
+
+    #[test]
+    fn readme_docker_section_example_parses() {
+        let config = parse(readme_yaml("## Running services with Docker or Podman")).unwrap();
+        let docker: Vec<(String, bool)> = config
+            .normalized_dependencies()
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.name, d.docker))
+            .collect();
+        assert_eq!(
+            docker,
+            vec![
+                ("node".into(), false),
+                ("postgresql".into(), true),
+                ("redis".into(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn readme_nix_free_example_parses() {
+        let config = parse(readme_yaml("### Without Nix")).unwrap();
+        assert_eq!(config.package_manager, PackageManagerChoice::Brew);
+        assert_eq!(config.service_manager, ServiceManagerChoice::Docker);
+        let docker: Vec<(String, bool)> = config
+            .normalized_dependencies()
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.name, d.docker))
+            .collect();
+        assert_eq!(
+            docker,
+            vec![
+                ("node".into(), false),
+                ("postgresql".into(), true),
+                ("redis".into(), true)
+            ]
+        );
     }
 
     // ── DevyConfig::load ──────────────────────────────────────────────────────

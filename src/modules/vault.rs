@@ -82,6 +82,31 @@ impl Module for VaultModule {
         Some("vault".to_string())
     }
 
+    fn docker_spec(&self, dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        // The image only needs IPC_LOCK for mlock, which neither mode uses.
+        let spec = super::DockerSpec::new("hashicorp/vault", "1.16", 8200)
+            .data("/vault/file")
+            .env(&[("SKIP_SETCAP", "true")]);
+        if dev_mode(dep) {
+            return Ok(Some(super::DockerSpec {
+                args: vec!["server".into(), "-dev".into()],
+                ..spec.env(&[
+                    ("VAULT_DEV_ROOT_TOKEN_ID", "root"),
+                    ("VAULT_DEV_LISTEN_ADDRESS", "0.0.0.0:8200"),
+                ])
+            }));
+        }
+        // The image's entrypoint writes VAULT_LOCAL_CONFIG into its config dir.
+        let config = format!(
+            r#"{{"storage":{{"file":{{"path":"/vault/file"}}}},"listener":{{"tcp":{{"address":"0.0.0.0:8200","tls_disable":true}}}},"api_addr":"http://127.0.0.1:{}","disable_mlock":true}}"#,
+            port(dep)?
+        );
+        Ok(Some(super::DockerSpec {
+            args: vec!["server".into()],
+            ..spec.env(&[("VAULT_LOCAL_CONFIG", &config)])
+        }))
+    }
+
     fn nix_unfree(&self) -> bool {
         true
     }

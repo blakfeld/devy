@@ -32,7 +32,7 @@ devy SHALL pass the module's service name to the package-manager backend when st
 - **THEN** the launchd label is `sh.devy.meili`
 
 ### Requirement: Listing services
-`devy services` SHALL print each declared service with a running or stopped indicator, and SHALL print `No services defined.` and exit 0 when no service dependencies exist.
+`devy services` SHALL print each declared service with a running or stopped indicator, suffixing docker-managed services with `(docker)`, and SHALL print `No services defined.` and exit 0 when no service dependencies exist.
 
 #### Scenario: Mixed running state
 - **WHEN** `devy.yml` declares `redis` (running) and `postgresql` (stopped)
@@ -41,6 +41,10 @@ devy SHALL pass the module's service name to the package-manager backend when st
 #### Scenario: No services
 - **WHEN** `devy.yml` declares only non-service dependencies
 - **THEN** devy prints `No services defined.` and exits 0
+
+#### Scenario: Docker-managed service labeled
+- **WHEN** `redis` is docker-managed and running
+- **THEN** devy prints `● redis (docker)`
 
 ### Requirement: Starting a single service
 `devy start <name>` SHALL resolve the service's port as `devy up` does (using `devy.lock`), start the service when it is not running, and then wait for its health check on that port; a health-check timeout MUST be reported as a warning rather than a failure.
@@ -77,7 +81,7 @@ devy SHALL pass the module's service name to the package-manager backend when st
 - **THEN** devy prints `○ <name> was already stopped` and then starts the service
 
 ### Requirement: Bringing the environment down
-`devy down` SHALL run the `before_down` hook, stop every running service in declaration order waiting for each to stop, and then run the `after_down` hook; it MUST NOT modify `devy.lock` or the shadowenv file.
+`devy down` SHALL run the `before_down` hook, stop every running service in declaration order waiting for each to stop, and then run the `after_down` hook; it MUST NOT modify `devy.lock` or the shadowenv file. Docker-managed services SHALL be stopped with the container CLI and their containers and volumes kept, unless `devy down --volumes` is given, in which case devy SHALL also remove each docker-managed service's container and named volume and print `✓ <dep> container and volume removed`. `--volumes` SHALL have no effect on package-managed services.
 
 #### Scenario: Mixed services
 - **WHEN** `devy.yml` declares `redis` (running) and `postgresql` (stopped)
@@ -94,6 +98,14 @@ devy SHALL pass the module's service name to the package-manager backend when st
 #### Scenario: Stop failure skips after_down
 - **WHEN** stopping a service fails
 - **THEN** devy exits with an error and does not run the `after_down` hook
+
+#### Scenario: Plain down keeps data
+- **WHEN** docker-managed `postgresql` is running and the user runs `devy down`
+- **THEN** devy stops the container and its volume `devy-<project>-postgresql` still exists
+
+#### Scenario: Down with volumes
+- **WHEN** docker-managed `postgresql` exists and the user runs `devy down --volumes`
+- **THEN** devy stops and removes the container and removes the volume `devy-<project>-postgresql`
 
 ### Requirement: Readiness and shutdown polling
 Waiting for a service SHALL poll its health check (or running state when stopping) up to a per-module attempt count with a fixed interval (default 10 attempts at 500 ms), failing with the attempt count when exhausted. Health waits SHALL print `Still waiting for <name> (<n>/<max>)` on every 10th attempt before the last, so a wait with the default 10 attempts prints no progress. Shutdown waits SHALL report no progress and SHALL fail with `<name> did not stop after <N> attempts — try stopping it manually or check its logs`.

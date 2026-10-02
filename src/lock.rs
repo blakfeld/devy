@@ -37,6 +37,10 @@ pub struct LockedDep {
     /// is set in devy.yml. User-configured ports in devy.yml always win.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub assigned_port: Option<u16>,
+    /// Repository digest (`<repository>@sha256:<hex>`) of a docker-managed service's
+    /// image, so teammates run the identical image. Absent for everything else.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub image_digest: Option<String>,
 }
 
 impl LockFile {
@@ -101,6 +105,7 @@ mod tests {
                 resolved_version: Some("20.11.0".into()),
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         deps.insert(
@@ -109,6 +114,7 @@ mod tests {
                 resolved_version: None,
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let lock = LockFile {
@@ -128,6 +134,7 @@ mod tests {
                 resolved_version: None,
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let lock = LockFile {
@@ -154,6 +161,7 @@ mod tests {
                 resolved_version: Some("20.0.0".into()),
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         deps.insert(
@@ -162,6 +170,7 @@ mod tests {
                 resolved_version: None,
                 source: "rustup".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let original = LockFile {
@@ -203,6 +212,7 @@ mod tests {
                 resolved_version: Some("7.2.3".into()),
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let lock = LockFile {
@@ -319,6 +329,7 @@ mod tests {
                 resolved_version: Some("16.0".into()),
                 source: "homebrew".into(),
                 assigned_port: None,
+                image_digest: None,
             },
         );
         let lock = LockFile {
@@ -332,5 +343,62 @@ mod tests {
             loaded.get("pg").unwrap().resolved_version,
             Some("16.0".into())
         );
+    }
+
+    // ── image_digest ──────────────────────────────────────────────────────────
+
+    fn docker_redis() -> LockedDep {
+        LockedDep {
+            resolved_version: Some("7".into()),
+            source: "docker".into(),
+            assigned_port: Some(51000),
+            image_digest: Some("redis@sha256:abc".into()),
+        }
+    }
+
+    #[test]
+    fn image_digest_round_trips() {
+        let dir = tmp_dir();
+        let path = lock_path(&dir);
+        let mut deps = BTreeMap::new();
+        deps.insert("redis".into(), docker_redis());
+        let lock = LockFile {
+            dependencies: deps,
+            ..Default::default()
+        };
+        lock.write(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("image_digest: redis@sha256:abc"),
+            "{content}"
+        );
+        assert!(content.contains("source: docker"), "{content}");
+        assert_eq!(LockFile::load(&path).unwrap().unwrap(), lock);
+    }
+
+    #[test]
+    fn package_entries_have_no_image_digest_key() {
+        let entry = LockedDep {
+            resolved_version: Some("20.11.0".into()),
+            source: "homebrew".into(),
+            assigned_port: None,
+            image_digest: None,
+        };
+        let yaml = serde_yml::to_string(&entry).unwrap();
+        assert!(!yaml.contains("image_digest"), "{yaml}");
+    }
+
+    #[test]
+    fn locks_without_image_digest_still_parse() {
+        let dir = tmp_dir();
+        let path = lock_path(&dir);
+        std::fs::write(
+            &path,
+            "version: 1\ndependencies:\n  redis:\n    resolved_version: 7.2.4\n    source: homebrew\n    assigned_port: 6380\n",
+        )
+        .unwrap();
+        let lock = LockFile::load(&path).unwrap().unwrap();
+        assert_eq!(lock.get("redis").unwrap().image_digest, None);
+        assert_eq!(lock.get("redis").unwrap().assigned_port, Some(6380));
     }
 }

@@ -42,6 +42,7 @@ Each snippet SHALL register completion for:
 It MUST complete:
 - `--update`, `--dry-run`, and `--bootstrap` after `up`
 - `--force` after `init`
+- `--volumes` after `down`
 - `--format` after `export`, and `shell flake` after `export --format`
 - `zsh bash fish` after `hook`
 
@@ -60,3 +61,7 @@ It MUST complete:
 #### Scenario: Export format values
 - **WHEN** the user tab-completes `devy export --format <TAB>`
 - **THEN** the candidates are `shell` and `flake`
+
+#### Scenario: Down flags
+- **WHEN** the user tab-completes `devy down --<TAB>`
+- **THEN** the candidates include `--volumes`

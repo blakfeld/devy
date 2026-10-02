@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 use crate::config::Dependency;
 use crate::output;
 use crate::package_manager::PackageManager;
+pub(crate) use helpers::fnv1a;
 use helpers::{
     PackageModule, extra_port, extra_strs, node_pkg, pm_dep, run_cmd, tcp_ping, write_mysql_config,
 };
@@ -116,6 +117,103 @@ impl LaunchSpec {
     }
 }
 
+/// How a service runs as a container under `service_manager: docker`. Built from the
+/// same resolved `dep.extra` values as the module's `env_vars`, so the container's
+/// settings and the exported variables agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerSpec {
+    /// Image repository, e.g. `redis` or `docker.elastic.co/elasticsearch/elasticsearch`.
+    pub image: String,
+    /// Tag used when the dependency has no `version`.
+    pub default_tag: String,
+    /// Port the service listens on inside the container. Fixed per module; the resolved
+    /// host port is published to it.
+    pub container_port: u16,
+    /// Further `(host, container)` ports to publish, e.g. MinIO's console.
+    pub extra_ports: Vec<(u16, u16)>,
+    /// Mount path of the service's named data volume; `None` for stateless services.
+    pub data_path: Option<String>,
+    pub env: Vec<(String, String)>,
+    /// Arguments after the image (the container's command).
+    pub args: Vec<String>,
+}
+
+impl DockerSpec {
+    pub fn new(image: &str, default_tag: &str, container_port: u16) -> Self {
+        Self {
+            image: image.to_string(),
+            default_tag: default_tag.to_string(),
+            container_port,
+            extra_ports: Vec::new(),
+            data_path: None,
+            env: Vec::new(),
+            args: Vec::new(),
+        }
+    }
+
+    fn data(mut self, path: &str) -> Self {
+        self.data_path = Some(path.to_string());
+        self
+    }
+
+    fn env(mut self, pairs: &[(&str, &str)]) -> Self {
+        self.env
+            .extend(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        self
+    }
+}
+
+/// An image repository and tag, e.g. `redis` and `7`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRef {
+    pub repository: String,
+    pub tag: String,
+}
+
+impl ImageRef {
+    /// `<repository>:<tag>`.
+    pub fn reference(&self) -> String {
+        format!("{}:{}", self.repository, self.tag)
+    }
+}
+
+/// Splits `image` into repository and tag. A `:` only starts a tag after the last `/`,
+/// so a registry port (`registry:5000/redis`) isn't mistaken for one.
+fn split_image_tag(image: &str) -> (&str, Option<&str>) {
+    let name_start = image.rfind('/').map_or(0, |i| i + 1);
+    match image[name_start..].rfind(':') {
+        Some(i) => (&image[..name_start + i], Some(&image[name_start + i + 1..])),
+        None => (image, None),
+    }
+}
+
+/// The image a docker-managed `dep` runs. The repository is the `image` override, or
+/// the module's image. The tag is a tag written in `image`, then `version`, then the
+/// module's default tag.
+pub(crate) fn docker_image(spec: &DockerSpec, dep: &Dependency) -> ImageRef {
+    let (repository, image_tag) = match dep.image.as_deref() {
+        Some(image) => split_image_tag(image),
+        None => (spec.image.as_str(), None),
+    };
+    let tag = image_tag
+        .or(dep.version.as_deref())
+        .unwrap_or(&spec.default_tag);
+    ImageRef {
+        repository: repository.to_string(),
+        tag: tag.to_string(),
+    }
+}
+
+/// Warning for a `version` that a tag in `image` overrides.
+pub(crate) fn docker_image_warning(dep: &Dependency) -> Option<String> {
+    let (_, tag) = split_image_tag(dep.image.as_deref()?);
+    let tag = tag?;
+    let version = dep.version.as_deref()?;
+    Some(format!(
+        "image tag {tag} overrides version {version} — remove one of them"
+    ))
+}
+
 /// Longest Unix socket path devy creates: macOS allows 103 bytes in `sun_path`, Linux
 /// 107, and servers add suffixes like `.lock`.
 const MAX_SOCKET_PATH: usize = 100;
@@ -130,14 +228,6 @@ pub(crate) fn socket_dir(data_dir: &Path, socket_name: &str) -> Result<PathBuf> 
     let dir = PathBuf::from(format!("/tmp/devy-{:016x}", fnv1a(&path_arg(data_dir))));
     std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     Ok(dir)
-}
-
-/// 64-bit FNV-1a: a stable hash for short, per-project names (unlike `DefaultHasher`,
-/// it doesn't change between Rust releases).
-pub(crate) fn fnv1a(s: &str) -> u64 {
-    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    })
 }
 
 /// One-time initialization of a service's data directory (e.g. `initdb`).
@@ -320,7 +410,8 @@ pub(crate) fn pkg_resolved_version(
 /// Warning for a `devy.yml` version the nix backend can't honor. Versions pinned from
 /// devy.lock, and modules that install outside the package manager, never warn.
 pub(crate) fn nix_version_warning(dep: &Dependency, pm: &dyn PackageManager) -> Option<String> {
-    if pm.name() != "nix" || dep.version_from_lock {
+    // Docker-managed services use `version` as an image tag.
+    if pm.name() != "nix" || dep.version_from_lock || dep.docker {
         return None;
     }
     let version = dep.version.as_deref()?;
@@ -418,6 +509,26 @@ pub trait Module: Sync {
     /// Returns `None` if Nix-backed service management is not supported for this service.
     fn nix_launch(&self, _dep: &Dependency, _data_dir: &Path) -> Result<Option<LaunchSpec>> {
         Ok(None)
+    }
+
+    /// How this service runs as a container under `service_manager: docker`: its image,
+    /// container port, data volume path, environment and arguments. `dep` has its port
+    /// already resolved; that is the host port, not the container's.
+    ///
+    /// Returns `None` for modules that can't run in a container (every non-service).
+    fn docker_spec(&self, _dep: &Dependency) -> Result<Option<DockerSpec>> {
+        Ok(None)
+    }
+
+    /// Warnings about running `dep` as a container (e.g. a setting docker ignores).
+    fn docker_warnings(&self, _dep: &Dependency) -> Vec<String> {
+        vec![]
+    }
+
+    /// Whether `post_setup` only writes the package manager's service config (e.g. a
+    /// conf.d file setting the port). Docker-managed services skip such a `post_setup`.
+    fn post_setup_writes_service_config(&self) -> bool {
+        false
     }
 
     /// The versioned nixpkgs attribute for `version` (e.g. `"22.11.0"` → `"nodejs_22"`).
@@ -879,6 +990,345 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    // ── docker specs ─────────────────────────────────────────────────────────
+
+    fn dspec(name: &str, dep: &Dependency) -> DockerSpec {
+        get(name)
+            .docker_spec(dep)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name} must have a docker spec"))
+    }
+
+    fn env_of<'a>(spec: &'a DockerSpec, key: &str) -> Option<&'a str> {
+        spec.env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn image_dep(name: &str, version: Option<&str>, image: Option<&str>) -> Dependency {
+        Dependency {
+            version: version.map(String::from),
+            image: image.map(String::from),
+            docker: true,
+            ..Dependency::simple(name)
+        }
+    }
+
+    fn image_of(name: &str, version: Option<&str>, image: Option<&str>) -> String {
+        let dep = image_dep(name, version, image);
+        docker_image(&dspec(name, &dep), &dep).reference()
+    }
+
+    #[test]
+    fn docker_image_tag_resolution() {
+        assert_eq!(image_of("redis", None, None), "redis:7");
+        assert_eq!(image_of("redis", Some("7.2"), None), "redis:7.2");
+        assert_eq!(
+            image_of("redis", None, Some("registry.corp.example/mirror/redis")),
+            "registry.corp.example/mirror/redis:7"
+        );
+        assert_eq!(
+            image_of(
+                "redis",
+                Some("7.2"),
+                Some("registry.corp.example/mirror/redis")
+            ),
+            "registry.corp.example/mirror/redis:7.2"
+        );
+        // A registry port is not a tag.
+        assert_eq!(
+            image_of("redis", None, Some("registry:5000/redis")),
+            "registry:5000/redis:7"
+        );
+    }
+
+    #[test]
+    fn docker_image_tag_in_image_wins_over_version_with_warning() {
+        let dep = image_dep(
+            "redis",
+            Some("7.2"),
+            Some("registry.corp.example/mirror/redis:7"),
+        );
+        let image = docker_image(&dspec("redis", &dep), &dep);
+        assert_eq!(image.repository, "registry.corp.example/mirror/redis");
+        assert_eq!(image.tag, "7");
+        assert_eq!(
+            docker_image_warning(&dep).as_deref(),
+            Some("image tag 7 overrides version 7.2 — remove one of them")
+        );
+        assert_eq!(
+            docker_image_warning(&image_dep("redis", None, Some("redis:7"))),
+            None
+        );
+        assert_eq!(
+            docker_image_warning(&image_dep("redis", Some("7"), Some("registry:5000/redis"))),
+            None
+        );
+    }
+
+    #[test]
+    fn postgres_docker_spec_trusts_local_connections() {
+        let spec = dspec("postgres", &Dependency::simple("postgres"));
+        assert_eq!(spec.image, "postgres");
+        assert_eq!(spec.default_tag, "16");
+        assert_eq!(spec.container_port, 5432);
+        assert_eq!(spec.data_path.as_deref(), Some("/var/lib/postgresql/data"));
+        assert_eq!(env_of(&spec, "POSTGRES_HOST_AUTH_METHOD"), Some("trust"));
+        assert!(env_of(&spec, "POSTGRES_USER").is_some_and(|u| !u.is_empty()));
+        assert!(env_of(&spec, "POSTGRES_PASSWORD").is_none());
+        assert!(spec.args.is_empty());
+    }
+
+    #[test]
+    fn mysql_family_docker_specs_allow_empty_password_and_sanitize_cli_args() {
+        let dep = with_extra(
+            "mysql",
+            &[(
+                "cli_args",
+                crate::config::ExtraValue::String(
+                    "--max-connections=50 bad=1 --sql_mode=ANSI".into(),
+                ),
+            )],
+        );
+        let mysql = dspec("mysql", &dep);
+        assert_eq!(
+            (mysql.image.as_str(), mysql.default_tag.as_str()),
+            ("mysql", "8.0")
+        );
+        assert_eq!(mysql.container_port, 3306);
+        assert_eq!(mysql.data_path.as_deref(), Some("/var/lib/mysql"));
+        assert_eq!(env_of(&mysql, "MYSQL_ALLOW_EMPTY_PASSWORD"), Some("yes"));
+        assert_eq!(mysql.args, s(&["--max-connections=50", "--sql_mode=ANSI"]));
+
+        let dep = Dependency {
+            name: "mariadb".into(),
+            ..dep
+        };
+        let mariadb = dspec("mariadb", &dep);
+        assert_eq!(
+            (mariadb.image.as_str(), mariadb.default_tag.as_str()),
+            ("mariadb", "11")
+        );
+        assert_eq!(mariadb.container_port, 3306);
+        assert_eq!(mariadb.data_path.as_deref(), Some("/var/lib/mysql"));
+        assert_eq!(
+            env_of(&mariadb, "MARIADB_ALLOW_EMPTY_ROOT_PASSWORD"),
+            Some("1")
+        );
+        assert_eq!(
+            mariadb.args,
+            s(&["--max-connections=50", "--sql_mode=ANSI"])
+        );
+    }
+
+    #[test]
+    fn simple_service_docker_specs() {
+        // (module, image, tag, container port, data path)
+        let cases: &[(&str, &str, &str, u16, Option<&str>)] = &[
+            ("redis", "redis", "7", 6379, Some("/data")),
+            ("mongodb", "mongo", "7", 27017, Some("/data/db")),
+            ("rabbitmq", "rabbitmq", "3", 5672, Some("/var/lib/rabbitmq")),
+            ("memcached", "memcached", "1", 11211, None),
+            ("nginx", "nginx", "stable", 80, None),
+            ("mailhog", "mailhog/mailhog", "latest", 1025, None),
+            (
+                "meilisearch",
+                "getmeili/meilisearch",
+                "v1.8",
+                7700,
+                Some("/meili_data"),
+            ),
+        ];
+        for &(name, image, tag, port, data) in cases {
+            let spec = dspec(name, &Dependency::simple(name));
+            assert_eq!(spec.image, image, "{name}");
+            assert_eq!(spec.default_tag, tag, "{name}");
+            assert_eq!(spec.container_port, port, "{name}");
+            assert_eq!(spec.data_path.as_deref(), data, "{name}");
+            assert!(spec.env.is_empty(), "{name}: {:?}", spec.env);
+            assert!(
+                spec.args.is_empty() && spec.extra_ports.is_empty(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn meilisearch_docker_spec_passes_master_key() {
+        let dep = with_extra(
+            "meilisearch",
+            &[(
+                "master_key",
+                crate::config::ExtraValue::String("s3cret".into()),
+            )],
+        );
+        assert_eq!(
+            env_of(&dspec("meilisearch", &dep), "MEILI_MASTER_KEY"),
+            Some("s3cret")
+        );
+    }
+
+    #[test]
+    fn search_server_docker_specs_run_single_node_without_security() {
+        let es = dspec("elasticsearch", &Dependency::simple("elasticsearch"));
+        assert_eq!(es.image, "docker.elastic.co/elasticsearch/elasticsearch");
+        assert_eq!(es.default_tag, "8.13.4");
+        assert_eq!(es.container_port, 9200);
+        assert_eq!(
+            es.data_path.as_deref(),
+            Some("/usr/share/elasticsearch/data")
+        );
+        assert_eq!(env_of(&es, "discovery.type"), Some("single-node"));
+        assert_eq!(env_of(&es, "xpack.security.enabled"), Some("false"));
+        assert_eq!(env_of(&es, "ES_JAVA_OPTS"), Some("-Xms512m -Xmx512m"));
+
+        let os = dspec("opensearch", &Dependency::simple("opensearch"));
+        assert_eq!(os.image, "opensearchproject/opensearch");
+        assert_eq!(os.default_tag, "2");
+        assert_eq!(os.container_port, 9200);
+        assert_eq!(os.data_path.as_deref(), Some("/usr/share/opensearch/data"));
+        assert_eq!(env_of(&os, "discovery.type"), Some("single-node"));
+        assert_eq!(env_of(&os, "DISABLE_SECURITY_PLUGIN"), Some("true"));
+    }
+
+    #[test]
+    fn minio_docker_spec_console_and_credentials() {
+        let plain = dspec("minio", &Dependency::simple("minio"));
+        assert_eq!(
+            (plain.image.as_str(), plain.default_tag.as_str()),
+            ("minio/minio", "latest")
+        );
+        assert_eq!(plain.container_port, 9000);
+        assert_eq!(plain.data_path.as_deref(), Some("/data"));
+        assert_eq!(
+            plain.args,
+            s(&["server", "/data", "--console-address", ":9001"])
+        );
+        assert!(plain.extra_ports.is_empty());
+        assert!(plain.env.is_empty());
+
+        let dep = with_extra(
+            "minio",
+            &[
+                ("console_port", num(9101)),
+                ("access_key", crate::config::ExtraValue::String("me".into())),
+                ("secret_key", crate::config::ExtraValue::String("pw".into())),
+            ],
+        );
+        let spec = dspec("minio", &dep);
+        assert_eq!(spec.extra_ports, vec![(9101, 9001)]);
+        assert_eq!(env_of(&spec, "MINIO_ROOT_USER"), Some("me"));
+        assert_eq!(env_of(&spec, "MINIO_ROOT_PASSWORD"), Some("pw"));
+    }
+
+    #[test]
+    fn vault_docker_spec_dev_mode_and_server_config() {
+        let dev = dspec(
+            "vault",
+            &with_extra(
+                "vault",
+                &[("dev_mode", crate::config::ExtraValue::Bool(true))],
+            ),
+        );
+        assert_eq!(
+            (dev.image.as_str(), dev.default_tag.as_str()),
+            ("hashicorp/vault", "1.16")
+        );
+        assert_eq!(dev.container_port, 8200);
+        assert_eq!(dev.args, s(&["server", "-dev"]));
+        assert_eq!(env_of(&dev, "VAULT_DEV_ROOT_TOKEN_ID"), Some("root"));
+        assert!(env_of(&dev, "VAULT_LOCAL_CONFIG").is_none());
+
+        let server = dspec("vault", &with_extra("vault", &[("port", num(51200))]));
+        assert_eq!(server.args, s(&["server"]));
+        assert_eq!(server.data_path.as_deref(), Some("/vault/file"));
+        let config: serde_json::Value =
+            serde_json::from_str(env_of(&server, "VAULT_LOCAL_CONFIG").unwrap()).unwrap();
+        assert_eq!(config["storage"]["file"]["path"], "/vault/file");
+        assert_eq!(config["listener"]["tcp"]["tls_disable"], true);
+        assert_eq!(config["disable_mlock"], true);
+        assert_eq!(config["api_addr"], "http://127.0.0.1:51200");
+        assert!(env_of(&server, "VAULT_DEV_ROOT_TOKEN_ID").is_none());
+    }
+
+    #[test]
+    fn kafka_docker_spec_kraft_with_host_port_listener() {
+        let spec = dspec("kafka", &with_extra("kafka", &[("port", num(51000))]));
+        assert_eq!(
+            (spec.image.as_str(), spec.default_tag.as_str()),
+            ("apache/kafka", "3.7.0")
+        );
+        assert_eq!(spec.container_port, 9092);
+        assert_eq!(spec.data_path.as_deref(), Some("/var/lib/kafka/data"));
+        assert_eq!(
+            env_of(&spec, "KAFKA_PROCESS_ROLES"),
+            Some("broker,controller")
+        );
+        assert_eq!(
+            env_of(&spec, "KAFKA_ADVERTISED_LISTENERS"),
+            Some("PLAINTEXT://127.0.0.1:51000")
+        );
+        assert_eq!(
+            env_of(&spec, "KAFKA_LISTENERS"),
+            Some("PLAINTEXT://:9092,CONTROLLER://:9093")
+        );
+        assert_eq!(
+            env_of(&spec, "KAFKA_CONTROLLER_QUORUM_VOTERS"),
+            Some("1@localhost:9093")
+        );
+        assert_eq!(
+            env_of(&spec, "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR"),
+            Some("1")
+        );
+        assert_eq!(env_of(&spec, "KAFKA_LOG_DIRS"), Some("/var/lib/kafka/data"));
+    }
+
+    #[test]
+    fn kafka_docker_warns_unless_kraft() {
+        let warning = "zookeeper mode is not supported with docker — running Kafka in KRaft mode";
+        assert_eq!(
+            get("kafka").docker_warnings(&Dependency::simple("kafka")),
+            vec![warning]
+        );
+        let off = with_extra(
+            "kafka",
+            &[("kraft", crate::config::ExtraValue::Bool(false))],
+        );
+        assert_eq!(get("kafka").docker_warnings(&off), vec![warning]);
+        let on = with_extra("kafka", &[("kraft", crate::config::ExtraValue::Bool(true))]);
+        assert!(get("kafka").docker_warnings(&on).is_empty());
+    }
+
+    #[test]
+    fn every_builtin_service_has_a_docker_spec_and_nothing_else_does() {
+        for (name, module) in REGISTRY {
+            let spec = module.docker_spec(&Dependency::simple(name)).unwrap();
+            assert_eq!(
+                spec.is_some(),
+                module.is_service(),
+                "{name}: docker spec iff service"
+            );
+        }
+        assert!(
+            get("someunknownservice")
+                .docker_spec(&Dependency::simple("someunknownservice"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn only_conf_writing_post_setups_are_skipped_under_docker() {
+        let mut skipped: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|(_, m)| m.post_setup_writes_service_config())
+            .map(|(n, _)| *n)
+            .collect();
+        skipped.sort_unstable();
+        assert_eq!(skipped, vec!["mariadb", "mysql", "postgresql"]);
     }
 
     #[test]
@@ -2308,6 +2758,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
         let pkgs = extra_strs(&dep, "global_packages");
         assert_eq!(pkgs, vec!["typescript", "eslint"]);
@@ -2330,6 +2782,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
         assert!(extra_strs(&dep, "global_packages").is_empty());
     }
@@ -2348,6 +2802,8 @@ mod tests {
             version_from_lock: false,
             allow_unfree: false,
             allow_insecure: false,
+            image: None,
+            docker: false,
         };
         let remapped = pm_dep(&dep, "ruby@3.2");
         assert_eq!(remapped.name, "ruby@3.2");

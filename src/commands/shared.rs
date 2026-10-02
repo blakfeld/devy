@@ -4,27 +4,25 @@ use std::collections::HashMap;
 
 use crate::config::Dependency;
 use crate::modules;
-use crate::package_manager::PackageManager;
+use crate::service_runner::{self, Runners};
 
 /// Renders the dependency status table and returns the number of issues found.
 /// Pass `bold_errors = true` when failures should be displayed in bold (check command).
-pub fn print_dep_table(
-    deps: &[Dependency],
-    pm: &dyn PackageManager,
-    bold_errors: bool,
-) -> Result<usize> {
-    let name_col = deps
+/// Docker-managed services are labeled `(docker)`; for them, a missing image counts as
+/// not installed and a missing container as stopped.
+pub fn print_dep_table(deps: &[Dependency], runners: &Runners, bold_errors: bool) -> Result<usize> {
+    let names: Vec<String> = deps
         .iter()
-        .map(|d| d.versioned_name().len())
-        .max()
-        .unwrap_or(0);
+        .map(|d| service_runner::display_name(&d.versioned_name(), runners.runner_for(d)))
+        .collect();
+    let name_col = names.iter().map(String::len).max().unwrap_or(0);
     const STATUS_COL: usize = "not installed".len();
     let mut issues = 0usize;
 
-    for dep in deps {
+    for (dep, name) in deps.iter().zip(names) {
         let module = modules::get(&dep.name);
-        let name = dep.versioned_name();
-        let installed = module.is_installed(pm, dep)?;
+        let runner = runners.runner_for(dep);
+        let installed = runner.is_installed(dep)?;
 
         let (icon, status) = if installed {
             (
@@ -44,7 +42,7 @@ pub fn print_dep_table(
         let service = if module.is_service() {
             if !installed {
                 "–".dimmed().to_string()
-            } else if module.is_running(pm, dep)? {
+            } else if runner.is_running(dep)? {
                 format!("{} {}", "✓".green().bold(), "running".green())
             } else {
                 issues += 1;
@@ -200,6 +198,8 @@ pub fn print_path_table(
 mod tests {
     use super::*;
     use crate::package_manager::MockPackageManager;
+    use crate::service_runner::package_runners;
+    use std::path::Path;
 
     #[test]
     fn print_dep_table_returns_zero_when_all_installed() {
@@ -208,7 +208,8 @@ mod tests {
             ..Default::default()
         };
         let deps = vec![Dependency::simple("node"), Dependency::simple("python")];
-        let issues = print_dep_table(&deps, &pm, false).unwrap();
+        let issues =
+            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
         assert_eq!(issues, 0, "no issues when all deps are installed");
     }
 
@@ -217,7 +218,8 @@ mod tests {
         // Kills `replace print_dep_table -> Ok(0)` and `replace -> Ok(1)`.
         let pm = MockPackageManager::default(); // installed=false
         let deps = vec![Dependency::simple("node"), Dependency::simple("python")];
-        let issues = print_dep_table(&deps, &pm, false).unwrap();
+        let issues =
+            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
         assert!(issues > 0, "should count missing deps as issues");
     }
 
@@ -230,7 +232,8 @@ mod tests {
             Dependency::simple("python"),
             Dependency::simple("ruby"),
         ];
-        let issues = print_dep_table(&deps, &pm, false).unwrap();
+        let issues =
+            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
         assert_eq!(issues, 3, "each missing dep must add 1 to issues");
     }
 
@@ -240,7 +243,7 @@ mod tests {
         // enter the service-running check and panic (service running check on non-service).
         // Actually, empty deps → no iterations → issues = 0.
         let pm = MockPackageManager::default();
-        let issues = print_dep_table(&[], &pm, false).unwrap();
+        let issues = print_dep_table(&[], &package_runners(&pm, Path::new("/tmp")), false).unwrap();
         assert_eq!(issues, 0);
     }
 
@@ -253,7 +256,8 @@ mod tests {
             ..Default::default()
         };
         let deps = vec![Dependency::simple("mysql")]; // mysql is a service
-        let issues = print_dep_table(&deps, &pm, false).unwrap();
+        let issues =
+            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
         assert_eq!(issues, 1, "stopped service must count as one issue");
     }
 
@@ -265,7 +269,8 @@ mod tests {
             ..Default::default()
         };
         let deps = vec![Dependency::simple("mysql")];
-        let issues = print_dep_table(&deps, &pm, false).unwrap();
+        let issues =
+            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
         assert_eq!(issues, 0, "running service must not add to issues");
     }
 
@@ -275,7 +280,8 @@ mod tests {
         // When not installed, service status shows "–" (not checked), so only 1 issue.
         let pm = MockPackageManager::default(); // installed=false, service_running=false
         let deps = vec![Dependency::simple("mysql")];
-        let issues = print_dep_table(&deps, &pm, false).unwrap();
+        let issues =
+            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
         assert_eq!(
             issues, 1,
             "uninstalled service should count as exactly 1 issue"

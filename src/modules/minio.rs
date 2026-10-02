@@ -58,6 +58,26 @@ impl Module for MinioModule {
         Some("minio".to_string())
     }
 
+    fn docker_spec(&self, dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        let mut spec = super::DockerSpec {
+            args: ["server", "/data", "--console-address", ":9001"]
+                .map(String::from)
+                .to_vec(),
+            ..super::DockerSpec::new("minio/minio", "latest", 9000).data("/data")
+        };
+        if dep.extra.contains_key("console_port") {
+            spec.extra_ports
+                .push((super::extra_port(dep, "console_port", 9001)?, 9001));
+        }
+        if let Some(user) = dep.extra.get("access_key").and_then(|v| v.as_str()) {
+            spec = spec.env(&[("MINIO_ROOT_USER", user)]);
+        }
+        if let Some(pass) = dep.extra.get("secret_key").and_then(|v| v.as_str()) {
+            spec = spec.env(&[("MINIO_ROOT_PASSWORD", pass)]);
+        }
+        Ok(Some(spec))
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(9000)
     }

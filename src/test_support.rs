@@ -102,5 +102,7 @@ pub fn make_config(
         commands: std::collections::HashMap::new(),
         hooks: Default::default(),
         package_manager: Default::default(),
+        service_manager: Default::default(),
+        container_cli: Default::default(),
     }
 }

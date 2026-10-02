@@ -75,6 +75,9 @@ _{bin}() {
         '--dry-run[Check status without making changes]' \
         '--bootstrap[Install the package manager if missing]'
       ;;
+    down)
+      _arguments '--volumes[Also remove docker-managed containers and volumes]'
+      ;;
     start|stop|restart)
       _arguments '1:service name'
       ;;
@@ -119,6 +122,9 @@ _{bin}_completions() {
   case "${COMP_WORDS[1]}" in
     up)
       COMPREPLY=($(compgen -W "--update --dry-run --bootstrap" -- "$cur"))
+      ;;
+    down)
+      COMPREPLY=($(compgen -W "--volumes" -- "$cur"))
       ;;
     init)
       COMPREPLY=($(compgen -W "--force" -- "$cur"))
@@ -176,6 +182,7 @@ complete -c {bin} -n "__fish_seen_subcommand_from hook" -a "zsh bash fish"
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l update  -d "Re-resolve all versions"
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l dry-run -d "Check without making changes"
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l bootstrap -d "Install the package manager if missing"
+complete -c {bin} -n "__fish_seen_subcommand_from down" -l volumes -d "Also remove docker containers and volumes"
 complete -c {bin} -n "__fish_seen_subcommand_from export" -l format -x -a "shell flake" -d "Output format"
 complete -c {bin} -n "__fish_seen_subcommand_from init" -l force -d "Overwrite existing {bin}.yml"
 "#;
@@ -329,5 +336,12 @@ mod tests {
                 assert!(s.contains(needle), "{shell} snippet missing '{needle}'");
             }
         }
+    }
+
+    #[test]
+    fn snippets_complete_down_volumes() {
+        assert!(zsh_snippet().contains("    down)\n      _arguments '--volumes["));
+        assert!(bash_snippet().contains("    down)\n      COMPREPLY=($(compgen -W \"--volumes\""));
+        assert!(fish_snippet().contains("-n \"__fish_seen_subcommand_from down\" -l volumes"));
     }
 }

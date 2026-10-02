@@ -113,6 +113,41 @@ impl Module for KafkaModule {
         Some("apacheKafka".to_string())
     }
 
+    fn docker_spec(&self, dep: &Dependency) -> Result<Option<super::DockerSpec>> {
+        // Single-node KRaft. Clients outside the container reach the broker through the
+        // published host port, so that is the advertised listener.
+        let advertised = format!("PLAINTEXT://127.0.0.1:{}", port(dep)?);
+        Ok(Some(
+            super::DockerSpec::new("apache/kafka", "3.7.0", 9092)
+                .data("/var/lib/kafka/data")
+                .env(&[
+                    ("KAFKA_NODE_ID", "1"),
+                    ("KAFKA_PROCESS_ROLES", "broker,controller"),
+                    ("KAFKA_LISTENERS", "PLAINTEXT://:9092,CONTROLLER://:9093"),
+                    ("KAFKA_ADVERTISED_LISTENERS", &advertised),
+                    ("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:9093"),
+                    ("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER"),
+                    ("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT"),
+                    (
+                        "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+                        "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT",
+                    ),
+                    ("KAFKA_LOG_DIRS", "/var/lib/kafka/data"),
+                    ("KAFKA_NUM_PARTITIONS", "1"),
+                    ("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1"),
+                    ("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1"),
+                    ("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1"),
+                ]),
+        ))
+    }
+
+    fn docker_warnings(&self, dep: &Dependency) -> Vec<String> {
+        if kraft_mode(dep) {
+            return vec![];
+        }
+        vec!["zookeeper mode is not supported with docker — running Kafka in KRaft mode".into()]
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(9092)
     }
