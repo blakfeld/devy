@@ -38,18 +38,25 @@ fn nix_attr_name(k: &str) -> String {
 }
 
 /// Returns `pkgs.<attr>` lines for each dependency, indented by `indent`.
+/// A `devy.yml` version that maps to a versioned nixpkgs attribute selects it.
 /// Deps whose module returns `None` from `nix_attr` are omitted.
 fn collect_pkg_lines(config: &DevyConfig, indent: &str) -> Vec<String> {
     config
         .dependencies
         .iter()
         .flat_map(|raw| match raw {
-            crate::config::RawDependency::Simple(name) => vec![name.clone()],
-            crate::config::RawDependency::Configured(map) => map.keys().cloned().collect(),
+            crate::config::RawDependency::Simple(name) => vec![(name.clone(), None)],
+            crate::config::RawDependency::Configured(map) => map
+                .iter()
+                .map(|(name, cfg)| (name.clone(), cfg.as_ref().and_then(|c| c.version.clone())))
+                .collect(),
         })
-        .filter_map(|name| {
+        .filter_map(|(name, version)| {
             let canonical = modules::canonical_name(&name);
-            let dep = crate::config::Dependency::simple(canonical);
+            let dep = crate::config::Dependency {
+                version,
+                ..crate::config::Dependency::simple(canonical)
+            };
             let attr = modules::get(canonical).nix_attr(&dep)?;
             if attr.is_empty() {
                 None
@@ -102,7 +109,7 @@ fn generate_shell_nix(config: &DevyConfig) -> String {
         "  shellHook = ''\n    echo \"Entered {project_name} dev shell\"\n  '';\n"
     ));
 
-    out.push_str("}}\n");
+    out.push_str("}\n");
     out
 }
 
@@ -211,7 +218,17 @@ mod tests {
         );
         assert_eq!(
             modules::get("mysql").nix_attr(&dep("mysql")).as_deref(),
-            Some("mysql80")
+            Some("mysql84")
+        );
+        assert_eq!(
+            modules::get("rabbitmq")
+                .nix_attr(&dep("rabbitmq"))
+                .as_deref(),
+            Some("rabbitmq-server")
+        );
+        assert_eq!(
+            modules::get("mongodb").nix_attr(&dep("mongodb")).as_deref(),
+            Some("mongodb-ce")
         );
         assert_eq!(
             modules::get("postgresql")
@@ -348,5 +365,49 @@ mod tests {
             export_impl(&config, ExportFormat::Shell, &dir).unwrap();
         });
         assert_eq!(warn_count, 1, "must warn exactly once when overwriting");
+    }
+
+    #[test]
+    fn export_uses_versioned_nix_attributes() {
+        let config = config_from_yaml(
+            "dependencies:\n  - node:\n      version: \"22\"\n  - python:\n      version: \"3.12.4\"\n  - redis:\n      version: \"7\"\n",
+        );
+        let out = generate_flake_nix(&config);
+        assert!(out.contains("pkgs.nodejs_22"), "{out}");
+        assert!(out.contains("pkgs.python312"), "{out}");
+        // redis has no versioned attributes: the unversioned one is used.
+        assert!(out.contains("pkgs.redis\n"), "{out}");
+        let out = generate_shell_nix(&config);
+        assert!(out.contains("pkgs.nodejs_22"), "{out}");
+    }
+
+    #[test]
+    fn generate_shell_nix_is_well_formed() {
+        let config =
+            config_from_yaml("dependencies:\n  - redis\n  - node\nenvironment:\n  FOO: bar\n");
+        let out = generate_shell_nix(&config);
+        assert_eq!(
+            out.matches('{').count(),
+            out.matches('}').count(),
+            "unbalanced braces in shell.nix:\n{out}"
+        );
+        assert!(
+            out.ends_with("\n}\n"),
+            "shell.nix must end with `}}`:\n{out}"
+        );
+
+        // When Nix is installed, confirm the expression actually parses.
+        if let Ok(bin) = which::which("nix-instantiate") {
+            let dir = crate::test_support::tmp_dir();
+            let path = dir.join("shell.nix");
+            std::fs::write(&path, &out).unwrap();
+            let status = std::process::Command::new(bin)
+                .arg("--parse")
+                .arg(&path)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "nix-instantiate --parse failed:\n{out}");
+        }
     }
 }

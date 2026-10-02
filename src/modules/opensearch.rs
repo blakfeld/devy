@@ -25,8 +25,16 @@ impl Module for OpenSearchModule {
         true
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("opensearch")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        Ok(Some(super::search_server_launch(
+            "opensearch",
+            port(dep)?,
+            data_dir,
+        )))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -52,8 +60,13 @@ impl Module for OpenSearchModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -90,6 +103,7 @@ mod tests {
             after_install: None,
             shell: None,
             extra,
+            version_from_lock: false,
         }
     }
 
@@ -205,7 +219,11 @@ mod tests {
         let pm = crate::package_manager::MockPackageManager::default();
         assert!(
             OpenSearchModule
-                .start(&pm, &Dependency::simple("opensearch"))
+                .start(
+                    &pm,
+                    &Dependency::simple("opensearch"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_ok()
         );
     }
@@ -218,7 +236,11 @@ mod tests {
         };
         assert!(
             OpenSearchModule
-                .start(&pm, &Dependency::simple("opensearch"))
+                .start(
+                    &pm,
+                    &Dependency::simple("opensearch"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }

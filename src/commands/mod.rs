@@ -5,6 +5,7 @@ pub mod export;
 pub mod hook;
 pub mod init;
 pub mod list_commands;
+pub mod ports;
 pub mod pr;
 pub mod service;
 pub mod shared;

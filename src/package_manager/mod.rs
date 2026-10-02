@@ -22,6 +22,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 use crate::config::{Dependency, PackageManagerChoice};
+use crate::modules::LaunchSpec;
 
 pub trait PackageManager {
     fn name(&self) -> &str;
@@ -30,7 +31,9 @@ pub trait PackageManager {
     fn is_package_installed(&self, dep: &Dependency) -> Result<bool>;
     fn install_package(&self, dep: &Dependency) -> Result<()>;
     fn is_service_running(&self, name: &str) -> Result<bool>;
-    fn start_service(&self, name: &str) -> Result<()>;
+    /// Starts a service. `launch` is how to run it under backends that launch the
+    /// process themselves (nix); others use the package's own service definition.
+    fn start_service(&self, name: &str, launch: Option<&LaunchSpec>) -> Result<()>;
     fn stop_service(&self, name: &str) -> Result<()>;
     /// Returns the exact version string currently installed, e.g. "20.11.0" or "7.2.3".
     fn resolved_version(&self, dep: &Dependency) -> Result<Option<String>>;
@@ -150,6 +153,8 @@ pub struct MockPackageManager {
     pub installed_pkg: Option<&'static str>,
     /// Tracks which service names were passed to `start_service`.
     pub started_services: std::cell::RefCell<Vec<String>>,
+    /// Tracks the launch spec passed with each `start_service` call.
+    pub started_launches: std::cell::RefCell<Vec<Option<LaunchSpec>>>,
     /// Tracks which service names were passed to `stop_service`.
     pub stopped_services: std::cell::RefCell<Vec<String>>,
     /// Tracks every package name passed to `install_package` (in dep.name form).
@@ -176,6 +181,7 @@ impl Default for MockPackageManager {
             config_dir: None,
             installed_pkg: None,
             started_services: std::cell::RefCell::new(Vec::new()),
+            started_launches: std::cell::RefCell::new(Vec::new()),
             stopped_services: std::cell::RefCell::new(Vec::new()),
             installed_packages: std::cell::RefCell::new(Vec::new()),
             version: None,
@@ -221,8 +227,9 @@ impl PackageManager for MockPackageManager {
         }
         Ok(self.service_running)
     }
-    fn start_service(&self, name: &str) -> Result<()> {
+    fn start_service(&self, name: &str, launch: Option<&LaunchSpec>) -> Result<()> {
         self.started_services.borrow_mut().push(name.to_string());
+        self.started_launches.borrow_mut().push(launch.cloned());
         if self.start_service_fails {
             anyhow::bail!("mock start_service failure")
         } else {
@@ -280,7 +287,7 @@ mod tests {
         fn is_service_running(&self, _: &str) -> Result<bool> {
             Ok(false)
         }
-        fn start_service(&self, _: &str) -> Result<()> {
+        fn start_service(&self, _: &str, _: Option<&LaunchSpec>) -> Result<()> {
             Ok(())
         }
         fn stop_service(&self, _: &str) -> Result<()> {
@@ -321,7 +328,7 @@ mod tests {
         fn is_service_running(&self, _: &str) -> Result<bool> {
             Ok(false)
         }
-        fn start_service(&self, _: &str) -> Result<()> {
+        fn start_service(&self, _: &str, _: Option<&LaunchSpec>) -> Result<()> {
             Ok(())
         }
         fn stop_service(&self, _: &str) -> Result<()> {

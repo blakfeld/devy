@@ -26,8 +26,16 @@ impl Module for MemcachedModule {
         true
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("memcached")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        _data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let p = port(dep)?;
+        Ok(Some(super::LaunchSpec::new(
+            "memcached",
+            ["-p".into(), p.to_string(), "-l".into(), "127.0.0.1".into()],
+        )))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -53,8 +61,13 @@ impl Module for MemcachedModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -88,6 +101,7 @@ mod tests {
             after_install: None,
             shell: None,
             extra,
+            version_from_lock: false,
         }
     }
 
@@ -203,7 +217,11 @@ mod tests {
         let pm = crate::package_manager::MockPackageManager::default();
         assert!(
             MemcachedModule
-                .start(&pm, &Dependency::simple("memcached"))
+                .start(
+                    &pm,
+                    &Dependency::simple("memcached"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_ok()
         );
     }
@@ -216,7 +234,11 @@ mod tests {
         };
         assert!(
             MemcachedModule
-                .start(&pm, &Dependency::simple("memcached"))
+                .start(
+                    &pm,
+                    &Dependency::simple("memcached"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }

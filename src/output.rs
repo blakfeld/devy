@@ -32,7 +32,7 @@ pub fn warn(msg: &str) {
     #[cfg(test)]
     if WARN_HOOK.with(|cell| {
         if let Some(f) = cell.borrow().as_ref() {
-            f();
+            f(msg);
             true
         } else {
             false
@@ -44,8 +44,11 @@ pub fn warn(msg: &str) {
 }
 
 #[cfg(test)]
+type WarnHook = Box<dyn Fn(&str)>;
+
+#[cfg(test)]
 std::thread_local! {
-    static WARN_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+    static WARN_HOOK: std::cell::RefCell<Option<WarnHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -53,18 +56,25 @@ std::thread_local! {
 /// Safe to use in parallel tests — each thread has its own counter.
 #[cfg(test)]
 pub fn with_warn_capture<F: FnOnce()>(f: F) -> usize {
-    use std::cell::Cell;
+    with_warn_messages(f).len()
+}
+
+/// Runs `f`, returns every message passed to `warn()` during `f`.
+/// Safe to use in parallel tests — each thread has its own buffer.
+#[cfg(test)]
+pub fn with_warn_messages<F: FnOnce()>(f: F) -> Vec<String> {
+    use std::cell::RefCell;
     use std::rc::Rc;
-    let count = Rc::new(Cell::new(0usize));
-    let count_clone = Rc::clone(&count);
+    let msgs = Rc::new(RefCell::new(Vec::new()));
+    let msgs_clone = Rc::clone(&msgs);
     WARN_HOOK.with(|cell| {
-        *cell.borrow_mut() = Some(Box::new(move || {
-            count_clone.set(count_clone.get() + 1);
+        *cell.borrow_mut() = Some(Box::new(move |m: &str| {
+            msgs_clone.borrow_mut().push(m.to_string());
         }));
     });
     f();
     WARN_HOOK.with(|cell| *cell.borrow_mut() = None);
-    count.get()
+    msgs.take()
 }
 
 #[cfg(test)]

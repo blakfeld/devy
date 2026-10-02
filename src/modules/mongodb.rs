@@ -11,12 +11,13 @@ use super::{Module, pm_dep};
 pub struct MongodbModule;
 
 // brew requires the mongodb/brew tap; users should add `tap: mongodb/brew` in devy.yml.
-// nix: mongodb is available in nixpkgs but may require nixpkgs.config.allowUnfree = true.
+// nix: mongodb-ce is the prebuilt binary package (mongodb builds from source). Both are
+// unfree, so installing needs NIXPKGS_ALLOW_UNFREE=1.
 fn package_name(pm: &dyn PackageManager) -> &'static str {
     match pm.name() {
         "apt" => "mongodb-org",
         "winget" => "MongoDB.Server",
-        "nix" => "mongodb",
+        "nix" => "mongodb-ce",
         _ => "mongodb-community",
     }
 }
@@ -31,7 +32,26 @@ impl Module for MongodbModule {
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
-        Some("mongodb".to_string())
+        Some("mongodb-ce".to_string())
+    }
+
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let p = port(dep)?;
+        Ok(Some(super::LaunchSpec::new(
+            "mongod",
+            [
+                "--port".into(),
+                p.to_string(),
+                "--bind_ip".into(),
+                "127.0.0.1".into(),
+                "--dbpath".into(),
+                super::path_arg(data_dir),
+            ],
+        )))
     }
 
     fn default_port(&self) -> Option<u16> {
@@ -61,8 +81,13 @@ impl Module for MongodbModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -215,7 +240,11 @@ mod tests {
         let pm = crate::package_manager::MockPackageManager::default();
         assert!(
             MongodbModule
-                .start(&pm, &Dependency::simple("mongodb"))
+                .start(
+                    &pm,
+                    &Dependency::simple("mongodb"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_ok()
         );
     }
@@ -228,7 +257,11 @@ mod tests {
         };
         assert!(
             MongodbModule
-                .start(&pm, &Dependency::simple("mongodb"))
+                .start(
+                    &pm,
+                    &Dependency::simple("mongodb"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }

@@ -160,7 +160,11 @@ impl PackageManager for Homebrew {
         parse_brew_service_info_json(&output.stdout)
     }
 
-    fn start_service(&self, name: &str) -> Result<()> {
+    fn start_service(
+        &self,
+        name: &str,
+        _launch: Option<&crate::modules::LaunchSpec>,
+    ) -> Result<()> {
         self.run_interactive(&["services", "start", name])
     }
 

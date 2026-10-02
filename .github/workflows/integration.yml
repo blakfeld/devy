@@ -53,6 +53,56 @@ jobs:
           test -x .devy/nix-profile/bin/jq
           .devy/nix-profile/bin/jq --version
 
+      # systemd --user needs a user manager; lingering starts one for the runner user.
+      - name: Enable systemd user session
+        run: |
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          for _ in $(seq 1 20); do
+            [ -S "/run/user/$(id -u)/bus" ] && break
+            sleep 0.5
+          done
+
+      - name: Services — redis and postgresql via Nix listen on their assigned ports
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+          cd "$WORK"
+          git init -q
+
+          cat > devy.yml <<'EOF'
+          name: smoke-nix-services
+          package_manager: nix
+          dependencies:
+            - redis
+            - postgresql
+          EOF
+
+          DEVY="$GITHUB_WORKSPACE/target/release/devy"
+          cleanup() {
+            "$DEVY" down || true
+            for f in "${TMPDIR:-/tmp}"/devy-*.log; do [ -f "$f" ] && { echo "== $f"; tail -50 "$f"; }; done
+            journalctl --user --no-pager -n 100 -u "devy-*" || true
+            rm -rf "$WORK"
+          }
+          trap cleanup EXIT
+
+          "$DEVY" up
+          "$DEVY" check
+
+          # Ports come from devy.lock (the shadowenv environment isn't active here).
+          lock_port() {
+            awk -v dep="  $1:" '$0 == dep {f=1; next} /^  [^ ]/ {f=0} f && /assigned_port:/ {print $2}' devy.lock
+          }
+          REDIS_PORT=$(lock_port redis)
+          POSTGRESQL_PORT=$(lock_port postgresql)
+          echo "redis=$REDIS_PORT postgresql=$POSTGRESQL_PORT"
+          test -n "$REDIS_PORT" && test -n "$POSTGRESQL_PORT"
+
+          .devy/nix-profile/bin/redis-cli -p "$REDIS_PORT" ping | grep -q PONG
+          .devy/nix-profile/bin/pg_isready -h 127.0.0.1 -p "$POSTGRESQL_PORT"
+          test -f .devy/data/postgresql/PG_VERSION
+
   # ── Nix (macOS) ─────────────────────────────────────────────────────────────
   nix-macos:
     name: Smoke test · Nix (macOS)
@@ -93,6 +143,45 @@ jobs:
 
           test -x .devy/nix-profile/bin/jq
           .devy/nix-profile/bin/jq --version
+
+      - name: Services — redis and postgresql via Nix listen on their assigned ports
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+          cd "$WORK"
+          git init -q
+
+          cat > devy.yml <<'EOF'
+          name: smoke-nix-services
+          package_manager: nix
+          dependencies:
+            - redis
+            - postgresql
+          EOF
+
+          DEVY="$GITHUB_WORKSPACE/target/release/devy"
+          cleanup() {
+            "$DEVY" down || true
+            for f in "${TMPDIR:-/tmp}"/devy-*.log; do [ -f "$f" ] && { echo "== $f"; tail -50 "$f"; }; done
+            rm -rf "$WORK"
+          }
+          trap cleanup EXIT
+
+          "$DEVY" up
+          "$DEVY" check
+
+          # Ports come from devy.lock (the shadowenv environment isn't active here).
+          lock_port() {
+            awk -v dep="  $1:" '$0 == dep {f=1; next} /^  [^ ]/ {f=0} f && /assigned_port:/ {print $2}' devy.lock
+          }
+          REDIS_PORT=$(lock_port redis)
+          POSTGRESQL_PORT=$(lock_port postgresql)
+          echo "redis=$REDIS_PORT postgresql=$POSTGRESQL_PORT"
+          test -n "$REDIS_PORT" && test -n "$POSTGRESQL_PORT"
+
+          .devy/nix-profile/bin/redis-cli -p "$REDIS_PORT" ping | grep -q PONG
+          .devy/nix-profile/bin/pg_isready -h 127.0.0.1 -p "$POSTGRESQL_PORT"
+          test -f .devy/data/postgresql/PG_VERSION
 
   # ── Homebrew (macOS) ─────────────────────────────────────────────────────────
   brew-macos:

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 
 use crate::config::Dependency;
@@ -29,13 +29,53 @@ fn dev_mode(dep: &Dependency) -> bool {
         .unwrap_or(false)
 }
 
+/// A non-dev Vault server config: file storage under `data_dir` and a plain-HTTP
+/// listener on 127.0.0.1. The server starts sealed; initialize and unseal it yourself.
+fn vault_hcl(port: u16, data_dir: &std::path::Path) -> String {
+    format!(
+        "# devy-managed — rewritten on every start\n\
+         storage \"file\" {{\n  path = {storage}\n}}\n\
+         \n\
+         listener \"tcp\" {{\n  address     = \"127.0.0.1:{port}\"\n  tls_disable = true\n}}\n\
+         \n\
+         api_addr      = \"http://127.0.0.1:{port}\"\n\
+         disable_mlock = true\n",
+        storage = super::quoted_conf_path(&data_dir.join("storage")),
+    )
+}
+
 impl Module for VaultModule {
     fn is_service(&self) -> bool {
         true
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("vault")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let p = port(dep)?;
+        if dev_mode(dep) {
+            return Ok(Some(super::LaunchSpec::new(
+                "vault",
+                [
+                    "server".into(),
+                    "-dev".into(),
+                    format!("-dev-listen-address=127.0.0.1:{p}"),
+                    "-dev-root-token-id=root".into(),
+                ],
+            )));
+        }
+        let conf = data_dir.join("vault.hcl");
+        std::fs::write(&conf, vault_hcl(p, data_dir))
+            .with_context(|| format!("Failed to write {}", conf.display()))?;
+        Ok(Some(super::LaunchSpec::new(
+            "vault",
+            [
+                "server".into(),
+                format!("-config={}", super::path_arg(&conf)),
+            ],
+        )))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -61,8 +101,13 @@ impl Module for VaultModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -263,7 +308,15 @@ mod tests {
     #[test]
     fn start_delegates_to_pm() {
         let pm = crate::package_manager::MockPackageManager::default();
-        assert!(VaultModule.start(&pm, &Dependency::simple("vault")).is_ok());
+        assert!(
+            VaultModule
+                .start(
+                    &pm,
+                    &Dependency::simple("vault"),
+                    std::path::Path::new("/tmp")
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -274,7 +327,11 @@ mod tests {
         };
         assert!(
             VaultModule
-                .start(&pm, &Dependency::simple("vault"))
+                .start(
+                    &pm,
+                    &Dependency::simple("vault"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }

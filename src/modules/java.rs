@@ -21,20 +21,14 @@ fn winget_package_id(dep: &Dependency) -> String {
     format!("Microsoft.OpenJDK.{major}")
 }
 
-fn nix_package_id(dep: &Dependency) -> String {
-    let major = dep
-        .version
-        .as_deref()
-        .and_then(|v| v.split('.').next())
-        .unwrap_or("21");
-    format!("jdk{major}")
-}
+/// The JDK nixpkgs installs when no supported version is given.
+const NIX_DEFAULT_JDK: &str = "jdk21";
 
 fn pkg_name(pm: &dyn PackageManager, dep: &Dependency) -> String {
     match pm.name() {
         "apt" => "default-jdk".into(),
         "winget" => winget_package_id(dep),
-        "nix" => nix_package_id(dep),
+        "nix" => super::nix_install_attr(&JavaModule, dep, NIX_DEFAULT_JDK),
         _ => "openjdk".into(),
     }
 }
@@ -76,11 +70,21 @@ fn detect_java_home() -> Option<String> {
 }
 
 impl Module for JavaModule {
+    fn nix_versioned_attr(&self, version: &str) -> Option<String> {
+        // `21` or `21.0.2` → `jdk21`.
+        super::helpers::allowlisted_attr(version, 1, &["8", "11", "17", "21", "25"], |v| {
+            format!("jdk{v}")
+        })
+    }
+
     fn nix_attr(&self, dep: &Dependency) -> Option<String> {
-        Some(nix_package_id(dep))
+        Some(super::nix_install_attr(self, dep, NIX_DEFAULT_JDK))
     }
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
+        if pm.name() == "nix" {
+            return super::pkg_installed(self, pm, dep, NIX_DEFAULT_JDK);
+        }
         pm.is_package_installed(&pm_dep(dep, &pkg_name(pm, dep)))
     }
 

@@ -24,8 +24,23 @@ impl Module for RedisModule {
         true
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("redis-server")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let port = super::extra_port(dep, "port", 6379)?;
+        Ok(Some(super::LaunchSpec::new(
+            "redis-server",
+            [
+                "--port".into(),
+                port.to_string(),
+                "--bind".into(),
+                "127.0.0.1".into(),
+                "--dir".into(),
+                super::path_arg(data_dir),
+            ],
+        )))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -51,8 +66,13 @@ impl Module for RedisModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -222,7 +242,15 @@ mod tests {
     #[test]
     fn start_delegates_to_pm() {
         let pm = MockPackageManager::default();
-        assert!(RedisModule.start(&pm, &Dependency::simple("redis")).is_ok());
+        assert!(
+            RedisModule
+                .start(
+                    &pm,
+                    &Dependency::simple("redis"),
+                    std::path::Path::new("/tmp")
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -233,7 +261,11 @@ mod tests {
         };
         assert!(
             RedisModule
-                .start(&pm, &Dependency::simple("redis"))
+                .start(
+                    &pm,
+                    &Dependency::simple("redis"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }

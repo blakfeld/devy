@@ -27,8 +27,23 @@ impl Module for MeilisearchModule {
         true
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("meilisearch")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let p = port(dep)?;
+        let mut args = vec![
+            "--http-addr".to_string(),
+            format!("127.0.0.1:{p}"),
+            "--db-path".to_string(),
+            super::path_arg(data_dir),
+        ];
+        if let Some(key) = dep.extra.get("master_key").and_then(|v| v.as_str()) {
+            args.push("--master-key".into());
+            args.push(key.to_string());
+        }
+        Ok(Some(super::LaunchSpec::new("meilisearch", args)))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -54,8 +69,13 @@ impl Module for MeilisearchModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -258,7 +278,11 @@ mod tests {
         let pm = crate::package_manager::MockPackageManager::default();
         assert!(
             MeilisearchModule
-                .start(&pm, &Dependency::simple("meilisearch"))
+                .start(
+                    &pm,
+                    &Dependency::simple("meilisearch"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_ok()
         );
     }
@@ -271,7 +295,11 @@ mod tests {
         };
         assert!(
             MeilisearchModule
-                .start(&pm, &Dependency::simple("meilisearch"))
+                .start(
+                    &pm,
+                    &Dependency::simple("meilisearch"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }
