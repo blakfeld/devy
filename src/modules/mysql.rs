@@ -50,14 +50,20 @@ impl Module for MysqlModule {
         ];
         // The X Protocol plugin would otherwise bind *:33060 and /tmp/mysqlx.sock,
         // colliding across projects and with a system mysqld.
-        Ok(Some(super::helpers::mysql_family_launch(
+        let spec = super::helpers::mysql_family_launch(
             "mysqld",
             init,
             &["--mysqlx=OFF"],
             port(dep)?,
             cli_args(dep).as_deref(),
             data_dir,
-        )?))
+        )?;
+        // mariadb wins profile name conflicts (it also ships `bin/mysqld`), so always run
+        // MySQL's own server from its package.
+        Ok(Some(super::LaunchSpec {
+            exec_package: Some(super::nix_install_attr(self, dep, "mysql84")),
+            ..spec
+        }))
     }
 
     fn nix_attr(&self, dep: &crate::config::Dependency) -> Option<String> {

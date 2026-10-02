@@ -57,6 +57,10 @@ pub struct LaunchSpec {
     /// Working directory for the service and its init step. `nix_launch_for` defaults it
     /// to the data dir so tools with relative default paths write there.
     pub working_dir: Option<PathBuf>,
+    /// nixpkgs attribute whose own `bin/` provides `exec` and the init command, instead
+    /// of the merged profile `bin/`. Needed when another package in the profile wins a
+    /// name conflict (mariadb's `bin/mysqld` is a symlink to `mariadbd`).
+    pub exec_package: Option<String>,
 }
 
 impl LaunchSpec {
@@ -67,6 +71,7 @@ impl LaunchSpec {
             env: Vec::new(),
             init: None,
             working_dir: None,
+            exec_package: None,
         }
     }
 }
@@ -907,6 +912,7 @@ mod tests {
                 "--innodb-buffer-pool-size=256M",
             ])
         );
+        assert_eq!(spec.exec_package.as_deref(), Some("mysql84"));
         let init = spec.init.unwrap();
         assert_eq!(init.marker, d.join("mysql"));
         assert_eq!(
@@ -931,6 +937,10 @@ mod tests {
             d,
         );
         assert_eq!(spec.exec, "mariadbd");
+        assert_eq!(
+            spec.exec_package, None,
+            "mariadb wins conflicts; the profile bin is fine"
+        );
         assert_eq!(spec.args[0], "--no-defaults");
         assert!(!spec.args.contains(&"--mysqlx=OFF".to_string()));
         assert!(spec.args.contains(&"--port=51002".to_string()));

@@ -121,13 +121,20 @@ fn profile_list_json(nix_bin: &Path, profile_path: &Path) -> Result<serde_json::
 /// `mysql84` (pname `mysql`) or `jdk21` (pname `openjdk`) are recognized. Entries without
 /// an `attrPath` fall back to `pname`, then to the element name.
 fn profile_find_pkg(json: &serde_json::Value, attr: &str) -> Option<String> {
-    let version_of = |entry: &serde_json::Value| {
+    profile_find_entry(json, attr).map(|entry| {
         entry
             .get("version")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string()
-    };
+    })
+}
+
+/// The profile entry for nixpkgs attribute `attr` (see `profile_find_pkg` for matching).
+fn profile_find_entry<'a>(
+    json: &'a serde_json::Value,
+    attr: &str,
+) -> Option<&'a serde_json::Value> {
     let matches = |entry: &serde_json::Value, key: Option<&str>| {
         if let Some(path) = entry.get("attrPath").and_then(|a| a.as_str()) {
             // `legacyPackages.<system>.<attr>`; attrs may themselves contain dots.
@@ -140,14 +147,38 @@ fn profile_find_pkg(json: &serde_json::Value, attr: &str) -> Option<String> {
     };
     // Old format (Nix < 2.18): a JSON array of entries.
     if let Some(arr) = json.as_array() {
-        return arr.iter().find(|e| matches(e, None)).map(version_of);
+        return arr.iter().find(|e| matches(e, None));
     }
     // New format (Nix ≥ 2.18): {"version":2|3,"elements":{"<name>":{...}}}.
     let elements = json.get("elements")?.as_object()?;
     elements
         .iter()
         .find(|(key, e)| matches(e, Some(key.as_str())))
-        .map(|(_, e)| version_of(e))
+        .map(|(_, e)| e)
+}
+
+/// Candidate `bin/` directories of `attr`'s own store paths in the profile. Outputs are
+/// listed in no particular order (e.g. `-man` may come first), so callers pick the first
+/// one that exists.
+fn profile_package_bins(json: &serde_json::Value, attr: &str) -> Vec<PathBuf> {
+    profile_find_entry(json, attr)
+        .and_then(|e| e.get("storePaths"))
+        .and_then(|p| p.as_array())
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(|p| p.as_str())
+                .map(|p| PathBuf::from(p).join("bin"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Profile priority for packages that must win name conflicts (lower wins; the default
+/// is 5). mariadb and mysql both ship `mysql`, `mysqldump`, `mysqld` and more, so
+/// mariadb's tools take those names whichever of the two is installed first.
+fn install_priority(attr: &str) -> Option<u32> {
+    (attr == "mariadb" || attr.starts_with("mariadb_")).then_some(4)
 }
 
 // ── nix-env (legacy) helpers ──────────────────────────────────────────────────
@@ -184,16 +215,11 @@ fn unsupported_service(name: &str) -> anyhow::Error {
     )
 }
 
-/// `[<profile_bin>/<exec>, args…]`: the full command line a unit runs.
-fn program_arguments(launch: &LaunchSpec, profile_bin: &Path) -> Vec<String> {
-    std::iter::once(
-        profile_bin
-            .join(&launch.exec)
-            .to_string_lossy()
-            .into_owned(),
-    )
-    .chain(launch.args.iter().cloned())
-    .collect()
+/// `[<exec_dir>/<exec>, args…]`: the full command line a unit runs.
+fn program_arguments(launch: &LaunchSpec, exec_dir: &Path) -> Vec<String> {
+    std::iter::once(exec_dir.join(&launch.exec).to_string_lossy().into_owned())
+        .chain(launch.args.iter().cloned())
+        .collect()
 }
 
 /// The launch environment plus a PATH that finds the project profile's binaries first,
@@ -213,7 +239,8 @@ fn unit_environment(launch: &LaunchSpec, profile_bin: &Path) -> Vec<(String, Str
 }
 
 /// Runs the launch spec's one-time init step unless its marker already exists.
-fn run_init(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
+/// `init.cmd[0]` is resolved in `exec_dir`; PATH points at `profile_bin`.
+fn run_init(name: &str, launch: &LaunchSpec, exec_dir: &Path, profile_bin: &Path) -> Result<()> {
     let Some(init) = &launch.init else {
         return Ok(());
     };
@@ -224,7 +251,7 @@ fn run_init(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
         bail!("Failed to initialize {name}: empty init command");
     };
     output::step(&format!("Initializing {name} ({})", init.cmd.join(" ")));
-    let out = Command::new(profile_bin.join(prog))
+    let out = Command::new(exec_dir.join(prog))
         .args(args)
         .envs(unit_environment(launch, profile_bin))
         .current_dir(launch.working_dir.as_deref().unwrap_or(Path::new("/")))
@@ -325,13 +352,18 @@ fn launchagent_path(name: &str) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn write_launchagent(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
+fn write_launchagent(
+    name: &str,
+    launch: &LaunchSpec,
+    exec_dir: &Path,
+    profile_bin: &Path,
+) -> Result<()> {
     let dir = launchagent_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
 
     let plist = launchagent_plist(
         &format!("sh.devy.{name}"),
-        &program_arguments(launch, profile_bin),
+        &program_arguments(launch, exec_dir),
         &unit_environment(launch, profile_bin),
         launch.working_dir.as_deref(),
         &std::env::temp_dir().join(format!("devy-{name}.log")),
@@ -380,9 +412,14 @@ fn is_running_macos(name: &str) -> Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
-fn start_service_macos(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
+fn start_service_macos(
+    name: &str,
+    launch: &LaunchSpec,
+    exec_dir: &Path,
+    profile_bin: &Path,
+) -> Result<()> {
     // Always rewrite and reload so port and config changes take effect.
-    write_launchagent(name, launch, profile_bin)?;
+    write_launchagent(name, launch, exec_dir, profile_bin)?;
     let plist = launchagent_path(name)?;
     let plist_str = plist
         .to_str()
@@ -484,13 +521,18 @@ fn systemd_unit_path(name: &str) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_systemd_unit(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
+fn write_systemd_unit(
+    name: &str,
+    launch: &LaunchSpec,
+    exec_dir: &Path,
+    profile_bin: &Path,
+) -> Result<()> {
     let dir = systemd_user_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
 
     let unit = systemd_unit(
         name,
-        &program_arguments(launch, profile_bin),
+        &program_arguments(launch, exec_dir),
         &unit_environment(launch, profile_bin),
         launch.working_dir.as_deref(),
     );
@@ -522,9 +564,14 @@ fn is_running_linux(name: &str) -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn start_service_linux(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
+fn start_service_linux(
+    name: &str,
+    launch: &LaunchSpec,
+    exec_dir: &Path,
+    profile_bin: &Path,
+) -> Result<()> {
     // Always rewrite and reload so port and config changes take effect.
-    write_systemd_unit(name, launch, profile_bin)?;
+    write_systemd_unit(name, launch, exec_dir, profile_bin)?;
     systemctl_user(&["daemon-reload"])?;
     systemctl_user(&["start", &format!("devy-{name}")])
 }
@@ -538,6 +585,18 @@ fn stop_service_linux(name: &str) -> Result<()> {
 // ── PackageManager impl ───────────────────────────────────────────────────────
 
 impl NixPackageManager {
+    /// `attr`'s own `bin/` in the project profile. `None` for the legacy nix-env style
+    /// or when it can't be determined; callers fall back to the merged profile `bin/`.
+    fn package_bin(&self, attr: &str) -> Option<PathBuf> {
+        if !self.profile_path.exists() || self.effective_style() != NixStyle::Profile {
+            return None;
+        }
+        let json = profile_list_json(&self.nix_bin(), &self.profile_path).ok()?;
+        profile_package_bins(&json, attr)
+            .into_iter()
+            .find(|bin| bin.is_dir())
+    }
+
     fn query_version(&self, dep: &Dependency) -> Result<Option<String>> {
         // Profile symlink doesn't exist yet → nothing installed in it. Guard here
         // to prevent Nix from falling back to the user's global profile, which would
@@ -610,10 +669,21 @@ impl PackageManager for NixPackageManager {
         match self.effective_style() {
             NixStyle::Profile => {
                 let attr = format!("nixpkgs#{}", dep.name);
-                output::step(&format!("nix profile install {attr}"));
+                let priority = install_priority(&dep.name);
+                let priority_args = match priority {
+                    Some(p) => vec!["--priority".to_string(), p.to_string()],
+                    None => vec![],
+                };
+                output::step(&format!(
+                    "nix profile install {attr}{}",
+                    priority_args
+                        .iter()
+                        .fold(String::new(), |acc, a| format!("{acc} {a}"))
+                ));
                 let status = Command::new(self.nix_bin())
                     .args(["profile", "install", "--profile"])
                     .arg(&self.profile_path)
+                    .args(&priority_args)
                     .arg(&attr)
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
@@ -659,13 +729,19 @@ impl PackageManager for NixPackageManager {
     fn start_service(&self, name: &str, launch: Option<&LaunchSpec>) -> Result<()> {
         let launch = launch.ok_or_else(|| unsupported_service(name))?;
         let profile_bin = self.profile_bin();
-        run_init(name, launch, &profile_bin)?;
+        let exec_dir = match &launch.exec_package {
+            Some(attr) => self
+                .package_bin(attr)
+                .unwrap_or_else(|| profile_bin.clone()),
+            None => profile_bin.clone(),
+        };
+        run_init(name, launch, &exec_dir, &profile_bin)?;
 
         #[cfg(target_os = "macos")]
-        return start_service_macos(name, launch, &profile_bin);
+        return start_service_macos(name, launch, &exec_dir, &profile_bin);
 
         #[cfg(target_os = "linux")]
-        return start_service_linux(name, launch, &profile_bin);
+        return start_service_linux(name, launch, &exec_dir, &profile_bin);
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         bail!("Service management is not supported on this platform with the nix backend");
@@ -856,7 +932,7 @@ mod tests {
             }),
             ..redis_launch()
         };
-        assert!(run_init("postgresql", &launch, &dir).is_ok());
+        assert!(run_init("postgresql", &launch, &dir, &dir).is_ok());
     }
 
     #[test]
@@ -869,7 +945,7 @@ mod tests {
             }),
             ..redis_launch()
         };
-        let err = run_init("postgresql", &launch, &dir).unwrap_err();
+        let err = run_init("postgresql", &launch, &dir, &dir).unwrap_err();
         assert!(
             err.to_string()
                 .starts_with("Failed to initialize postgresql"),
@@ -898,8 +974,8 @@ mod tests {
             }),
             ..redis_launch()
         };
-        run_init("postgresql", &launch, &dir).unwrap();
-        run_init("postgresql", &launch, &dir).unwrap();
+        run_init("postgresql", &launch, &dir, &dir).unwrap();
+        run_init("postgresql", &launch, &dir, &dir).unwrap();
         assert!(marker.exists());
         let count = std::fs::read_to_string(dir.join("count")).unwrap();
         assert_eq!(count.lines().count(), 1, "init must run exactly once");
@@ -920,7 +996,9 @@ mod tests {
             }),
             ..redis_launch()
         };
-        let err = run_init("mysql", &launch, &dir).unwrap_err().to_string();
+        let err = run_init("mysql", &launch, &dir, &dir)
+            .unwrap_err()
+            .to_string();
         assert!(err.starts_with("Failed to initialize mysql"), "{err}");
         assert!(err.contains("boom"), "stderr must be included: {err}");
     }
@@ -1030,6 +1108,60 @@ mod tests {
         assert_eq!(profile_find_pkg(&json, "mysql84"), Some("8.4.11".into()));
         assert_eq!(profile_find_pkg(&json, "jdk21"), Some("21.0.11".into()));
         assert_eq!(profile_find_pkg(&json, "mysql"), None);
+    }
+
+    #[test]
+    fn mariadb_wins_profile_conflicts() {
+        assert_eq!(install_priority("mariadb"), Some(4));
+        assert_eq!(install_priority("mariadb_114"), Some(4));
+        assert_eq!(install_priority("mysql84"), None);
+        assert_eq!(install_priority("redis"), None);
+    }
+
+    #[test]
+    fn profile_package_bins_lists_every_output() {
+        let json = serde_json::json!({
+            "version": 3,
+            "elements": {
+                "mysql84": {
+                    "attrPath": "legacyPackages.aarch64-darwin.mysql84",
+                    "storePaths": [
+                        "/nix/store/aaa-mysql-8.4.11-man",
+                        "/nix/store/bbb-mysql-8.4.11"
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            profile_package_bins(&json, "mysql84"),
+            vec![
+                PathBuf::from("/nix/store/aaa-mysql-8.4.11-man/bin"),
+                PathBuf::from("/nix/store/bbb-mysql-8.4.11/bin"),
+            ]
+        );
+        assert!(profile_package_bins(&json, "postgresql").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_init_resolves_command_in_exec_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let exec_dir = crate::test_support::tmp_dir();
+        let profile_bin = crate::test_support::tmp_dir();
+        let marker = exec_dir.join("marker");
+        let script = exec_dir.join("fake-init");
+        std::fs::write(&script, "#!/bin/sh\ntouch \"$1\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launch = LaunchSpec {
+            init: Some(crate::modules::InitStep {
+                marker: marker.clone(),
+                cmd: vec!["fake-init".into(), marker.to_string_lossy().into_owned()],
+            }),
+            ..redis_launch()
+        };
+        // fake-init exists only in exec_dir, not in the profile bin.
+        run_init("mysql", &launch, &exec_dir, &profile_bin).unwrap();
+        assert!(marker.exists());
     }
 
     fn pm_with_missing_profile() -> NixPackageManager {
