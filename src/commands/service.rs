@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use colored::Colorize;
+use std::path::{Path, PathBuf};
 
+use crate::commands::ports::{self, PortMode};
 use crate::config::{Dependency, DevyConfig};
 use crate::modules;
 use crate::output;
@@ -43,11 +45,15 @@ pub(crate) fn list_impl(config: &DevyConfig, pm: &dyn PackageManager) -> Result<
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn start(name: &str) -> Result<()> {
-    let (dep, pm) = resolve(name)?;
-    start_impl(&dep, pm.as_ref())
+    let (dep, pm, project_root) = resolve(name, true)?;
+    start_impl(&dep, pm.as_ref(), &project_root)
 }
 
-pub(crate) fn start_impl(dep: &Dependency, pm: &dyn PackageManager) -> Result<()> {
+pub(crate) fn start_impl(
+    dep: &Dependency,
+    pm: &dyn PackageManager,
+    project_root: &Path,
+) -> Result<()> {
     let module = modules::get(&dep.name);
 
     if module.is_running(pm, dep)? {
@@ -56,7 +62,7 @@ pub(crate) fn start_impl(dep: &Dependency, pm: &dyn PackageManager) -> Result<()
     }
 
     output::step(&format!("Starting {}…", dep.name));
-    module.start(pm, dep)?;
+    module.start(pm, dep, project_root)?;
     if let Err(e) = module.wait_for_ready(dep) {
         output::warn(&format!(
             "{} started but health check timed out — verify manually: {}",
@@ -69,7 +75,7 @@ pub(crate) fn start_impl(dep: &Dependency, pm: &dyn PackageManager) -> Result<()
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn stop(name: &str) -> Result<()> {
-    let (dep, pm) = resolve(name)?;
+    let (dep, pm, _) = resolve(name, false)?;
     stop_impl(&dep, pm.as_ref())
 }
 
@@ -90,11 +96,15 @@ pub(crate) fn stop_impl(dep: &Dependency, pm: &dyn PackageManager) -> Result<()>
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn restart(name: &str) -> Result<()> {
-    let (dep, pm) = resolve(name)?;
-    restart_impl(&dep, pm.as_ref())
+    let (dep, pm, project_root) = resolve(name, true)?;
+    restart_impl(&dep, pm.as_ref(), &project_root)
 }
 
-pub(crate) fn restart_impl(dep: &Dependency, pm: &dyn PackageManager) -> Result<()> {
+pub(crate) fn restart_impl(
+    dep: &Dependency,
+    pm: &dyn PackageManager,
+    project_root: &Path,
+) -> Result<()> {
     let module = modules::get(&dep.name);
 
     if module.is_running(pm, dep)? {
@@ -107,7 +117,7 @@ pub(crate) fn restart_impl(dep: &Dependency, pm: &dyn PackageManager) -> Result<
     }
 
     output::step(&format!("Starting {}…", dep.name));
-    module.start(pm, dep)?;
+    module.start(pm, dep, project_root)?;
     if let Err(e) = module.wait_for_ready(dep) {
         output::warn(&format!(
             "{} started but health check timed out — verify manually: {}",
@@ -136,11 +146,44 @@ pub(crate) fn resolve_dep(config: &DevyConfig, name: &str) -> Result<Dependency>
     Ok(dep)
 }
 
-fn resolve(name: &str) -> Result<(Dependency, Box<dyn PackageManager>)> {
+/// Like `resolve_dep`, then resolves the service's port from devy.lock exactly as
+/// `devy up` would, so start/restart launch and health-check the same port.
+/// Never assigns a new port or writes devy.lock.
+///
+/// With `require_port`, fails when `devy up` hasn't assigned the port yet: starting on
+/// the default port would leave the service where `devy up` later won't look.
+pub(crate) fn resolve_service(
+    config: &DevyConfig,
+    name: &str,
+    pm: &dyn PackageManager,
+    project_root: &Path,
+    require_port: bool,
+) -> Result<Dependency> {
+    let mut dep = resolve_dep(config, name)?;
+    let lock = ports::load_lock(project_root)?;
+    let resolved = ports::resolve_ports(
+        std::slice::from_mut(&mut dep),
+        lock.as_ref(),
+        pm,
+        PortMode::ReadOnly,
+    )?;
+    if require_port && resolved[0] == Some(ports::ResolvedPort::Unassigned) {
+        bail!(
+            "'{}' has no port in devy.lock yet — run `devy up` first",
+            dep.name
+        );
+    }
+    Ok(dep)
+}
+
+fn resolve(
+    name: &str,
+    require_port: bool,
+) -> Result<(Dependency, Box<dyn PackageManager>, PathBuf)> {
     let (config, project_root) = DevyConfig::load_with_root()?;
     let pm = package_manager::detect(config.package_manager, &project_root)?;
-    let dep = resolve_dep(&config, name)?;
-    Ok((dep, pm))
+    let dep = resolve_service(&config, name, pm.as_ref(), &project_root, require_port)?;
+    Ok((dep, pm, project_root))
 }
 
 #[cfg(test)]
@@ -269,7 +312,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         assert!(
-            start_impl(&dep, &pm).is_err(),
+            start_impl(&dep, &pm, Path::new("/tmp")).is_err(),
             "start error must be propagated"
         );
     }
@@ -282,7 +325,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         // Returns Ok without calling start_service.
-        start_impl(&dep, &pm).unwrap();
+        start_impl(&dep, &pm, Path::new("/tmp")).unwrap();
         assert!(pm.started_services.borrow().is_empty());
     }
 
@@ -297,7 +340,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         assert!(
-            start_impl(&dep, &pm).is_ok(),
+            start_impl(&dep, &pm, Path::new("/tmp")).is_ok(),
             "start_impl must return Ok when start succeeds, even if health check times out"
         );
     }
@@ -313,7 +356,7 @@ mod tests {
         };
         let dep = Dependency::simple("mysql");
         assert!(
-            restart_impl(&dep, &pm).is_err(),
+            restart_impl(&dep, &pm, Path::new("/tmp")).is_err(),
             "restart must propagate start error"
         );
     }
@@ -349,5 +392,75 @@ mod tests {
             list_impl(&config, &pm).is_err(),
             "list_impl must propagate is_running errors"
         );
+    }
+
+    // ── resolve_service ───────────────────────────────────────────────────────
+
+    fn write_lock_with_port(dir: &std::path::Path, name: &str, port: u16) {
+        let mut deps = std::collections::BTreeMap::new();
+        deps.insert(
+            name.to_string(),
+            crate::lock::LockedDep {
+                resolved_version: None,
+                source: "nix".into(),
+                assigned_port: Some(port),
+            },
+        );
+        crate::lock::LockFile {
+            dependencies: deps,
+            ..Default::default()
+        }
+        .write(&dir.join(crate::lock::PATH))
+        .unwrap();
+    }
+
+    #[test]
+    fn start_health_checks_the_locked_port() {
+        let dir = crate::test_support::tmp_dir();
+        write_lock_with_port(&dir, "redis", 51000);
+        let config = make_config(&["redis"]);
+        let pm = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        let dep = resolve_service(&config, "redis", &pm, &dir, true).unwrap();
+        assert_eq!(
+            crate::modules::helpers::extra_port(&dep, "port", 6379).unwrap(),
+            51000,
+            "start must probe the port recorded in devy.lock"
+        );
+        // The health check reports the port it probed.
+        let err = modules::get("redis").health_check(&dep).unwrap_err();
+        assert!(err.to_string().contains("51000"), "{err}");
+    }
+
+    #[test]
+    fn resolve_service_does_not_write_lock() {
+        let dir = crate::test_support::tmp_dir();
+        let config = make_config(&["redis"]);
+        let pm = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        resolve_service(&config, "redis", &pm, &dir, false).unwrap();
+        assert!(!dir.join(crate::lock::PATH).exists());
+    }
+
+    #[test]
+    fn start_requires_a_port_from_up() {
+        let dir = crate::test_support::tmp_dir();
+        let config = make_config(&["redis"]);
+        let nix = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        let err = resolve_service(&config, "redis", &nix, &dir, true).unwrap_err();
+        assert!(err.to_string().contains("run `devy up` first"), "{err}");
+        // Backends that can't apply ports always use the default, so nothing is missing.
+        let brew = MockPackageManager {
+            name: "brew",
+            ..Default::default()
+        };
+        assert!(resolve_service(&config, "redis", &brew, &dir, true).is_ok());
     }
 }

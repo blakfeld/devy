@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 
 use super::PackageManager;
 use crate::config::Dependency;
-use crate::modules;
+use crate::modules::LaunchSpec;
 use crate::output;
 
 pub struct NixPackageManager {
@@ -113,52 +113,41 @@ fn profile_list_json(nix_bin: &Path, profile_path: &Path) -> Result<serde_json::
     serde_json::from_slice(&out.stdout).context("Failed to parse `nix profile list --json` output")
 }
 
-fn profile_find_pkg(json: &serde_json::Value, pname: &str) -> Option<String> {
-    // Old format (Nix < 2.18): a JSON array of entries each with a "pname" field.
-    if let Some(arr) = json.as_array() {
-        return arr.iter().find_map(|entry| {
-            if entry.get("pname")?.as_str()? == pname {
-                Some(
-                    entry
-                        .get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                )
-            } else {
-                None
-            }
-        });
-    }
-    // New format (Nix ≥ 2.18): {"version":2,"elements":{"name":{...}}}
-    // Element values may have "pname" directly, or the attr name is the last component
-    // of "attrPath" (e.g. "legacyPackages.x86_64-linux.redis" → "redis").
-    let elements = json.get("elements")?.as_object()?;
-    elements.values().find_map(|entry| {
-        let matched = entry
-            .get("pname")
-            .and_then(|p| p.as_str())
-            .map(|ep| ep == pname)
-            .unwrap_or_else(|| {
-                entry
-                    .get("attrPath")
-                    .and_then(|a| a.as_str())
-                    .and_then(|a| a.rsplit('.').next())
-                    .map(|tail| tail == pname)
-                    .unwrap_or(false)
-            });
-        if matched {
-            Some(
-                entry
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string(),
-            )
-        } else {
-            None
+/// Finds the profile entry for nixpkgs attribute `attr` and returns its version
+/// (`"unknown"` when the entry doesn't record one).
+///
+/// Entries are matched on the exact attribute devy installed (the last component of
+/// `attrPath`), so `nodejs_22` and `nodejs` are different packages, and mapped names like
+/// `mysql84` (pname `mysql`) or `jdk21` (pname `openjdk`) are recognized. Entries without
+/// an `attrPath` fall back to `pname`, then to the element name.
+fn profile_find_pkg(json: &serde_json::Value, attr: &str) -> Option<String> {
+    let version_of = |entry: &serde_json::Value| {
+        entry
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
+    let matches = |entry: &serde_json::Value, key: Option<&str>| {
+        if let Some(path) = entry.get("attrPath").and_then(|a| a.as_str()) {
+            // `legacyPackages.<system>.<attr>`; attrs may themselves contain dots.
+            return path == attr || path.ends_with(&format!(".{attr}"));
         }
-    })
+        if let Some(pname) = entry.get("pname").and_then(|p| p.as_str()) {
+            return pname == attr;
+        }
+        key == Some(attr)
+    };
+    // Old format (Nix < 2.18): a JSON array of entries.
+    if let Some(arr) = json.as_array() {
+        return arr.iter().find(|e| matches(e, None)).map(version_of);
+    }
+    // New format (Nix ≥ 2.18): {"version":2|3,"elements":{"<name>":{...}}}.
+    let elements = json.get("elements")?.as_object()?;
+    elements
+        .iter()
+        .find(|(key, e)| matches(e, Some(key.as_str())))
+        .map(|(_, e)| version_of(e))
 }
 
 // ── nix-env (legacy) helpers ──────────────────────────────────────────────────
@@ -184,7 +173,79 @@ fn env_find_pkg(json: &serde_json::Value, pname: &str) -> Option<String> {
     })
 }
 
-#[cfg(target_os = "macos")]
+// ── Service management — shared ───────────────────────────────────────────────
+
+/// Error for a service with no nix launch definition (only generic-module services).
+fn unsupported_service(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Service management for '{}' is not yet supported with the nix backend. \
+         Start it manually using the binary in .devy/nix-profile/bin/.",
+        name
+    )
+}
+
+/// `[<profile_bin>/<exec>, args…]`: the full command line a unit runs.
+fn program_arguments(launch: &LaunchSpec, profile_bin: &Path) -> Vec<String> {
+    std::iter::once(
+        profile_bin
+            .join(&launch.exec)
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .chain(launch.args.iter().cloned())
+    .collect()
+}
+
+/// The launch environment plus a PATH that finds the project profile's binaries first,
+/// so wrapper scripts (kafka, rabbitmq) can find their helpers.
+fn unit_environment(launch: &LaunchSpec, profile_bin: &Path) -> Vec<(String, String)> {
+    let mut env = launch.env.clone();
+    if !env.iter().any(|(k, _)| k == "PATH") {
+        env.push((
+            "PATH".into(),
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                profile_bin.to_string_lossy()
+            ),
+        ));
+    }
+    env
+}
+
+/// Runs the launch spec's one-time init step unless its marker already exists.
+fn run_init(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
+    let Some(init) = &launch.init else {
+        return Ok(());
+    };
+    if init.marker.exists() {
+        return Ok(());
+    }
+    let Some((prog, args)) = init.cmd.split_first() else {
+        bail!("Failed to initialize {name}: empty init command");
+    };
+    output::step(&format!("Initializing {name} ({})", init.cmd.join(" ")));
+    let out = Command::new(profile_bin.join(prog))
+        .args(args)
+        .envs(unit_environment(launch, profile_bin))
+        .current_dir(launch.working_dir.as_deref().unwrap_or(Path::new("/")))
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("Failed to initialize {name}: could not run `{prog}`"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "Failed to initialize {name}: `{}` exited with {}\n{}",
+            init.cmd.join(" "),
+            out.status,
+            stderr.trim_end()
+        );
+    }
+    Ok(())
+}
+
+// ── Service management — macOS (launchd) ──────────────────────────────────────
+
+#[cfg(any(test, target_os = "macos"))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -192,7 +253,65 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-// ── Service management — macOS (launchd) ──────────────────────────────────────
+/// A launchd agent plist that runs `program` with `env` in `working_dir`, logging to `log`.
+#[cfg(any(test, target_os = "macos"))]
+fn launchagent_plist(
+    label: &str,
+    program: &[String],
+    env: &[(String, String)],
+    working_dir: Option<&Path>,
+    log: &Path,
+) -> String {
+    let working_dir = working_dir
+        .map(|d| {
+            format!(
+                "    <key>WorkingDirectory</key>\n    <string>{}</string>\n",
+                xml_escape(&d.to_string_lossy())
+            )
+        })
+        .unwrap_or_default();
+    let args: String = program
+        .iter()
+        .map(|a| format!("        <string>{}</string>\n", xml_escape(a)))
+        .collect();
+    let env_entries: String = env
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "        <key>{}</key>\n        <string>{}</string>\n",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        })
+        .collect();
+    let label_e = xml_escape(label);
+    let log_e = xml_escape(&log.to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label_e}</string>
+    <key>ProgramArguments</key>
+    <array>
+{args}    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+{env_entries}    </dict>
+{working_dir}    <key>KeepAlive</key>
+    <false/>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>{log_e}</string>
+    <key>StandardErrorPath</key>
+    <string>{log_e}</string>
+</dict>
+</plist>
+"#,
+    )
+}
 
 #[cfg(target_os = "macos")]
 fn launchagent_dir() -> Result<PathBuf> {
@@ -206,40 +325,17 @@ fn launchagent_path(name: &str) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn write_launchagent(name: &str, exec: &str, profile_bin: &Path) -> Result<()> {
+fn write_launchagent(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
     let dir = launchagent_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
 
-    let bin = profile_bin.join(exec);
-    let label = format!("sh.devy.{name}");
-    let log = std::env::temp_dir().join(format!("devy-{name}.log"));
-    let label_e = xml_escape(&label);
-    let bin_e = xml_escape(&bin.to_string_lossy());
-    let log_e = xml_escape(&log.to_string_lossy());
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label_e}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{bin_e}</string>
-    </array>
-    <key>KeepAlive</key>
-    <false/>
-    <key>RunAtLoad</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>{log_e}</string>
-    <key>StandardErrorPath</key>
-    <string>{log_e}</string>
-</dict>
-</plist>
-"#,
+    let plist = launchagent_plist(
+        &format!("sh.devy.{name}"),
+        &program_arguments(launch, profile_bin),
+        &unit_environment(launch, profile_bin),
+        launch.working_dir.as_deref(),
+        &std::env::temp_dir().join(format!("devy-{name}.log")),
     );
-
     let path = launchagent_path(name)?;
     std::fs::write(&path, plist).with_context(|| format!("Failed to write {}", path.display()))
 }
@@ -254,6 +350,18 @@ fn launchctl(args: &[&str]) -> Result<()> {
         bail!("launchctl {} failed", args.join(" "));
     }
     Ok(())
+}
+
+/// Whether launchd knows the agent at all (loaded), running or not.
+#[cfg(target_os = "macos")]
+fn is_loaded_macos(name: &str) -> bool {
+    Command::new("launchctl")
+        .args(["list", &format!("sh.devy.{name}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]
@@ -272,19 +380,16 @@ fn is_running_macos(name: &str) -> Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
-fn start_service_macos(name: &str, profile_bin: &Path) -> Result<()> {
-    let exec = modules::get(name).service_exec_name().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Service management for '{}' is not yet supported with the nix backend on macOS. \
-             Start it manually using the binary in .devy/nix-profile/bin/.",
-            name
-        )
-    })?;
-    write_launchagent(name, exec, profile_bin)?;
+fn start_service_macos(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
+    // Always rewrite and reload so port and config changes take effect.
+    write_launchagent(name, launch, profile_bin)?;
     let plist = launchagent_path(name)?;
     let plist_str = plist
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 plist path"))?;
+    if is_loaded_macos(name) {
+        launchctl(&["unload", plist_str])?;
+    }
     launchctl(&["load", plist_str])?;
     launchctl(&["start", &format!("sh.devy.{name}")])
 }
@@ -305,6 +410,65 @@ fn stop_service_macos(name: &str) -> Result<()> {
 
 // ── Service management — Linux (systemd user units) ───────────────────────────
 
+/// Quotes one word for a systemd unit file: double-quoted with C-style escapes,
+/// and `%` doubled so specifiers are not expanded. `$` is doubled too when `exec`,
+/// since ExecStart expands `$VAR`.
+#[cfg(any(test, target_os = "linux"))]
+fn systemd_quote(s: &str, exec: bool) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '%' => out.push_str("%%"),
+            '$' if exec => out.push_str("$$"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A systemd user unit that runs `program` with `env` in `working_dir`.
+#[cfg(any(test, target_os = "linux"))]
+fn systemd_unit(
+    name: &str,
+    program: &[String],
+    env: &[(String, String)],
+    working_dir: Option<&Path>,
+) -> String {
+    // WorkingDirectory= takes a bare path; only specifiers need escaping.
+    let working_dir = working_dir
+        .map(|d| {
+            format!(
+                "WorkingDirectory={}\n",
+                d.to_string_lossy().replace('%', "%%")
+            )
+        })
+        .unwrap_or_default();
+    let exec_start = program
+        .iter()
+        .map(|a| systemd_quote(a, true))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let env_lines: String = env
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "Environment={}\n",
+                systemd_quote(&format!("{k}={v}"), false)
+            )
+        })
+        .collect();
+    format!(
+        "[Unit]\nDescription=devy managed {name} service\n\n\
+         [Service]\nExecStart={exec_start}\n{env_lines}{working_dir}Restart=on-failure\n\n\
+         [Install]\nWantedBy=default.target\n"
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn systemd_user_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("$HOME not set")?;
@@ -320,19 +484,16 @@ fn systemd_unit_path(name: &str) -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn write_systemd_unit(name: &str, exec: &str, profile_bin: &Path) -> Result<()> {
+fn write_systemd_unit(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
     let dir = systemd_user_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
 
-    let bin = profile_bin.join(exec);
-    let unit = format!(
-        "[Unit]\nDescription=devy managed {name} service\n\n\
-         [Service]\nExecStart={bin}\nRestart=on-failure\n\n\
-         [Install]\nWantedBy=default.target\n",
-        name = name,
-        bin = bin.display(),
+    let unit = systemd_unit(
+        name,
+        &program_arguments(launch, profile_bin),
+        &unit_environment(launch, profile_bin),
+        launch.working_dir.as_deref(),
     );
-
     let path = systemd_unit_path(name)?;
     std::fs::write(&path, unit).with_context(|| format!("Failed to write {}", path.display()))
 }
@@ -361,15 +522,9 @@ fn is_running_linux(name: &str) -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn start_service_linux(name: &str, profile_bin: &Path) -> Result<()> {
-    let exec = modules::get(name).service_exec_name().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Service management for '{}' is not yet supported with the nix backend on Linux. \
-             Start it manually using the binary in .devy/nix-profile/bin/.",
-            name
-        )
-    })?;
-    write_systemd_unit(name, exec, profile_bin)?;
+fn start_service_linux(name: &str, launch: &LaunchSpec, profile_bin: &Path) -> Result<()> {
+    // Always rewrite and reload so port and config changes take effect.
+    write_systemd_unit(name, launch, profile_bin)?;
     systemctl_user(&["daemon-reload"])?;
     systemctl_user(&["start", &format!("devy-{name}")])
 }
@@ -501,12 +656,16 @@ impl PackageManager for NixPackageManager {
         bail!("Service management is not supported on this platform with the nix backend");
     }
 
-    fn start_service(&self, name: &str) -> Result<()> {
+    fn start_service(&self, name: &str, launch: Option<&LaunchSpec>) -> Result<()> {
+        let launch = launch.ok_or_else(|| unsupported_service(name))?;
+        let profile_bin = self.profile_bin();
+        run_init(name, launch, &profile_bin)?;
+
         #[cfg(target_os = "macos")]
-        return start_service_macos(name, &self.profile_bin());
+        return start_service_macos(name, launch, &profile_bin);
 
         #[cfg(target_os = "linux")]
-        return start_service_linux(name, &self.profile_bin());
+        return start_service_linux(name, launch, &profile_bin);
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         bail!("Service management is not supported on this platform with the nix backend");
@@ -580,36 +739,190 @@ mod tests {
         assert!(std::path::Path::new(&prepends[0]).ends_with(".devy/nix-profile/bin"));
     }
 
-    #[test]
-    fn service_exec_name_known_services() {
-        use crate::modules;
-        assert_eq!(
-            modules::get("redis").service_exec_name(),
-            Some("redis-server")
-        );
-        assert_eq!(modules::get("mysql").service_exec_name(), Some("mysqld"));
-        assert_eq!(
-            modules::get("postgresql").service_exec_name(),
-            Some("postgres")
-        );
-        assert_eq!(modules::get("nginx").service_exec_name(), Some("nginx"));
-        assert_eq!(
-            modules::get("rabbitmq").service_exec_name(),
-            Some("rabbitmq-server")
-        );
-        assert_eq!(
-            modules::get("memcached").service_exec_name(),
-            Some("memcached")
-        );
-        assert_eq!(modules::get("minio").service_exec_name(), Some("minio"));
-        assert_eq!(modules::get("vault").service_exec_name(), Some("vault"));
+    // ── service launch ────────────────────────────────────────────────────────
+
+    fn redis_launch() -> LaunchSpec {
+        LaunchSpec::new(
+            "redis-server",
+            [
+                "--port".into(),
+                "51000".into(),
+                "--dir".into(),
+                "/proj dir/.devy/data/redis".into(),
+            ],
+        )
     }
 
     #[test]
-    fn service_exec_name_returns_none_for_unsupported() {
-        use crate::modules;
-        assert!(modules::get("unknownservice").service_exec_name().is_none());
-        assert!(modules::get("kafka").service_exec_name().is_none());
+    fn start_service_without_launch_spec_is_unsupported() {
+        let pm = NixPackageManager::for_project(&crate::test_support::tmp_dir());
+        let err = pm.start_service("someservice", None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not yet supported with the nix backend"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_arguments_prefix_profile_binary() {
+        let args = program_arguments(&redis_launch(), Path::new("/p/.devy/nix-profile/bin"));
+        assert_eq!(args[0], "/p/.devy/nix-profile/bin/redis-server");
+        assert_eq!(
+            args[1..],
+            ["--port", "51000", "--dir", "/proj dir/.devy/data/redis"]
+        );
+    }
+
+    #[test]
+    fn unit_environment_adds_profile_path() {
+        let mut launch = redis_launch();
+        launch.env.push(("A".into(), "b".into()));
+        let env = unit_environment(&launch, Path::new("/p/bin"));
+        assert_eq!(env[0], ("A".to_string(), "b".to_string()));
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "PATH" && v.starts_with("/p/bin:"))
+        );
+    }
+
+    #[test]
+    fn launchagent_plist_has_arguments_and_environment() {
+        let plist = launchagent_plist(
+            "sh.devy.redis",
+            &[
+                "/p/bin/redis-server".into(),
+                "--dir".into(),
+                "/a b/\"q\"&<x>".into(),
+            ],
+            &[("RABBITMQ_NODE_PORT".into(), "5 & 6".into())],
+            Some(Path::new("/p/.devy/data/redis")),
+            Path::new("/tmp/devy-redis.log"),
+        );
+        assert!(plist.contains("<key>ProgramArguments</key>"));
+        assert!(
+            plist.contains("<string>/p/bin/redis-server</string>\n        <string>--dir</string>")
+        );
+        assert!(plist.contains("<string>/a b/&quot;q&quot;&amp;&lt;x&gt;</string>"));
+        assert!(plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(
+            plist.contains("<key>RABBITMQ_NODE_PORT</key>\n        <string>5 &amp; 6</string>")
+        );
+        assert!(plist.contains("<key>KeepAlive</key>\n    <false/>"));
+        assert!(plist.contains("<key>RunAtLoad</key>\n    <false/>"));
+        assert!(plist.contains("<string>/tmp/devy-redis.log</string>"));
+        assert!(
+            plist.contains("<key>WorkingDirectory</key>\n    <string>/p/.devy/data/redis</string>")
+        );
+    }
+
+    #[test]
+    fn systemd_unit_quotes_arguments_and_environment() {
+        let unit = systemd_unit(
+            "redis",
+            &[
+                "/p/bin/redis-server".into(),
+                "--dir".into(),
+                "/a b/\"q\"\\x%i$HOME".into(),
+            ],
+            &[("MINIO_ROOT_PASSWORD".into(), "p\"w 100%$".into())],
+            Some(Path::new("/p/data 100%")),
+        );
+        assert!(
+            unit.contains(
+                "ExecStart=\"/p/bin/redis-server\" \"--dir\" \"/a b/\\\"q\\\"\\\\x%%i$$HOME\"\n"
+            ),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("Environment=\"MINIO_ROOT_PASSWORD=p\\\"w 100%%$\"\n"),
+            "{unit}"
+        );
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("WorkingDirectory=/p/data 100%%\n"), "{unit}");
+    }
+
+    #[test]
+    fn run_init_skipped_when_marker_exists() {
+        let dir = crate::test_support::tmp_dir();
+        let marker = dir.join("PG_VERSION");
+        std::fs::write(&marker, "16").unwrap();
+        let launch = LaunchSpec {
+            init: Some(crate::modules::InitStep {
+                marker,
+                // Would fail if run: the binary doesn't exist.
+                cmd: vec!["no-such-initdb".into()],
+            }),
+            ..redis_launch()
+        };
+        assert!(run_init("postgresql", &launch, &dir).is_ok());
+    }
+
+    #[test]
+    fn run_init_failure_reports_failed_to_initialize() {
+        let dir = crate::test_support::tmp_dir();
+        let launch = LaunchSpec {
+            init: Some(crate::modules::InitStep {
+                marker: dir.join("PG_VERSION"),
+                cmd: vec!["no-such-initdb".into()],
+            }),
+            ..redis_launch()
+        };
+        let err = run_init("postgresql", &launch, &dir).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("Failed to initialize postgresql"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_init_runs_command_from_profile_bin_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::tmp_dir();
+        let script = dir.join("fake-initdb");
+        // Appends to a counter file and creates the marker passed as $1.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho run >> \"$(dirname \"$1\")/count\"\ntouch \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let marker = dir.join("PG_VERSION");
+        let launch = LaunchSpec {
+            init: Some(crate::modules::InitStep {
+                marker: marker.clone(),
+                cmd: vec!["fake-initdb".into(), marker.to_string_lossy().into_owned()],
+            }),
+            ..redis_launch()
+        };
+        run_init("postgresql", &launch, &dir).unwrap();
+        run_init("postgresql", &launch, &dir).unwrap();
+        assert!(marker.exists());
+        let count = std::fs::read_to_string(dir.join("count")).unwrap();
+        assert_eq!(count.lines().count(), 1, "init must run exactly once");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_init_nonzero_exit_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::tmp_dir();
+        let script = dir.join("bad-init");
+        std::fs::write(&script, "#!/bin/sh\necho boom >&2\nexit 3\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let launch = LaunchSpec {
+            init: Some(crate::modules::InitStep {
+                marker: dir.join("marker"),
+                cmd: vec!["bad-init".into()],
+            }),
+            ..redis_launch()
+        };
+        let err = run_init("mysql", &launch, &dir).unwrap_err().to_string();
+        assert!(err.starts_with("Failed to initialize mysql"), "{err}");
+        assert!(err.contains("boom"), "stderr must be included: {err}");
     }
 
     #[test]
@@ -654,6 +967,69 @@ mod tests {
         });
         assert_eq!(profile_find_pkg(&json, "redis"), Some("unknown".into()));
         assert_eq!(profile_find_pkg(&json, "curl"), None);
+    }
+
+    // Nix ≥ 2.20 (profile JSON v3): no pname or version, only attrPath.
+    fn v3_profile(attrs: &[&str]) -> serde_json::Value {
+        let elements: serde_json::Map<String, serde_json::Value> = attrs
+            .iter()
+            .map(|a| {
+                (
+                    a.to_string(),
+                    serde_json::json!({
+                        "active": true,
+                        "attrPath": format!("legacyPackages.aarch64-darwin.{a}"),
+                        "originalUrl": "flake:nixpkgs",
+                        "storePaths": [format!("/nix/store/abc-{a}")],
+                    }),
+                )
+            })
+            .collect();
+        serde_json::json!({ "version": 3, "elements": elements })
+    }
+
+    #[test]
+    fn profile_find_pkg_matches_versioned_attr() {
+        let json = v3_profile(&["nodejs_22"]);
+        assert!(profile_find_pkg(&json, "nodejs_22").is_some());
+    }
+
+    #[test]
+    fn profile_find_pkg_version_change_is_not_installed() {
+        let json = v3_profile(&["nodejs_22"]);
+        assert!(profile_find_pkg(&json, "nodejs_24").is_none());
+        // The unversioned attr is a different package from nodejs_22.
+        assert!(profile_find_pkg(&json, "nodejs").is_none());
+    }
+
+    #[test]
+    fn profile_find_pkg_matches_unversioned_attr() {
+        let json = v3_profile(&["jq", "nodejs"]);
+        assert!(profile_find_pkg(&json, "nodejs").is_some());
+        assert!(profile_find_pkg(&json, "nodejs_22").is_none());
+    }
+
+    #[test]
+    fn profile_find_pkg_matches_mapped_attr_not_pname() {
+        // mysql84's pname is "mysql" and jdk21's is "openjdk": match on attrPath.
+        let json = serde_json::json!({
+            "version": 2,
+            "elements": {
+                "mysql84": {
+                    "attrPath": "legacyPackages.x86_64-linux.mysql84",
+                    "pname": "mysql",
+                    "version": "8.4.11"
+                },
+                "jdk21": {
+                    "attrPath": "legacyPackages.x86_64-linux.jdk21",
+                    "pname": "openjdk",
+                    "version": "21.0.11"
+                }
+            }
+        });
+        assert_eq!(profile_find_pkg(&json, "mysql84"), Some("8.4.11".into()));
+        assert_eq!(profile_find_pkg(&json, "jdk21"), Some("21.0.11".into()));
+        assert_eq!(profile_find_pkg(&json, "mysql"), None);
     }
 
     fn pm_with_missing_profile() -> NixPackageManager {

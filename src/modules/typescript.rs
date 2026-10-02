@@ -8,21 +8,29 @@ use crate::package_manager::PackageManager;
 
 use super::helpers::{stamp_matches, write_stamp};
 use super::node::detect_node_pm;
-use super::{Module, extra_strs, node_pkg, pm_dep, run_cmd};
+use super::{Module, extra_strs, node_pkg, run_cmd};
 
 pub struct TypeScriptModule;
 
 impl Module for TypeScriptModule {
-    fn nix_attr(&self, _dep: &Dependency) -> Option<String> {
-        Some("nodejs".to_string())
+    fn nix_versioned_attr(&self, version: &str) -> Option<String> {
+        super::node::nix_versioned_node(version)
+    }
+
+    fn nix_attr(&self, dep: &Dependency) -> Option<String> {
+        Some(super::nix_install_attr(self, dep, "nodejs"))
+    }
+
+    fn known_extra_keys(&self) -> Option<&'static [&'static str]> {
+        Some(&["global_packages"])
     }
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
-        pm.is_package_installed(&pm_dep(dep, node_pkg(pm)))
+        super::pkg_installed(self, pm, dep, node_pkg(pm))
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&pm_dep(dep, node_pkg(pm)))?;
+        pm.install_package(&super::pkg_dep(self, pm, dep, node_pkg(pm)))?;
 
         let mut globals = vec!["typescript".to_string()];
         globals.extend(extra_strs(dep, "global_packages"));
@@ -166,5 +174,11 @@ mod tests {
             !pm.installed_packages.borrow().is_empty(),
             "install must call pm.install_package"
         );
+    }
+
+    #[test]
+    fn typescript_accepts_global_packages_key() {
+        let known = TypeScriptModule.known_extra_keys().unwrap();
+        assert!(known.contains(&"global_packages"));
     }
 }

@@ -33,6 +33,77 @@ fn kraft_mode(dep: &Dependency) -> bool {
         .unwrap_or(false)
 }
 
+/// Escapes a value for a Java `.properties` file.
+fn properties_value(v: &str) -> String {
+    v.replace('\\', "\\\\")
+}
+
+/// A single-node KRaft config: broker and controller on 127.0.0.1, logs under `data_dir`.
+fn server_properties(port: u16, controller_port: u16, data_dir: &std::path::Path) -> String {
+    let logs = properties_value(&super::path_arg(&data_dir.join("logs")));
+    format!(
+        "# devy-managed — rewritten on every start\n\
+         process.roles=broker,controller\n\
+         node.id=1\n\
+         controller.quorum.voters=1@127.0.0.1:{controller_port}\n\
+         listeners=PLAINTEXT://127.0.0.1:{port},CONTROLLER://127.0.0.1:{controller_port}\n\
+         advertised.listeners=PLAINTEXT://127.0.0.1:{port}\n\
+         controller.listener.names=CONTROLLER\n\
+         inter.broker.listener.name=PLAINTEXT\n\
+         listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT\n\
+         log.dirs={logs}\n\
+         num.partitions=1\n\
+         offsets.topic.replication.factor=1\n\
+         transaction.state.log.replication.factor=1\n\
+         transaction.state.log.min.isr=1\n\
+         share.coordinator.state.topic.replication.factor=1\n\
+         share.coordinator.state.topic.min.isr=1\n"
+    )
+}
+
+/// Reads the controller port back out of a previously generated `server.properties`.
+fn controller_port_from(properties: &str) -> Option<u16> {
+    properties
+        .lines()
+        .find_map(|l| l.strip_prefix("controller.quorum.voters=1@127.0.0.1:"))
+        .and_then(|p| p.trim().parse().ok())
+        .filter(|p| *p != 0)
+}
+
+/// A random Kafka cluster id: 16 bytes, base64url without padding (22 characters).
+fn new_cluster_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut bytes = Vec::with_capacity(16);
+    for i in 0..2u64 {
+        // RandomState is seeded randomly per process; mix in time for extra entropy.
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(i);
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+        );
+        bytes.extend_from_slice(&h.finish().to_le_bytes());
+    }
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(22);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for b in bytes {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 6 {
+            bits -= 6;
+            out.push(ALPHABET[((acc >> bits) & 0x3f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((acc << (6 - bits)) & 0x3f) as usize] as char);
+    }
+    out
+}
+
 impl Module for KafkaModule {
     fn is_service(&self) -> bool {
         true
@@ -61,24 +132,77 @@ impl Module for KafkaModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let conf = data_dir.join("server.properties");
+        // Reuse the controller port from a previous start so the KRaft quorum stays valid.
+        let controller_port = match std::fs::read_to_string(&conf)
+            .ok()
+            .and_then(|s| controller_port_from(&s))
+        {
+            Some(p) => p,
+            None => super::helpers::find_available_port()
+                .context("Failed to find available port for the Kafka controller")?,
+        };
+        std::fs::write(
+            &conf,
+            server_properties(port(dep)?, controller_port, data_dir),
+        )
+        .with_context(|| format!("Failed to write {}", conf.display()))?;
+        let conf_arg = super::path_arg(&conf);
+        Ok(Some(super::LaunchSpec {
+            // kafka-run-class.sh defaults its own logs into the read-only package.
+            env: vec![(
+                "LOG_DIR".into(),
+                super::path_arg(&data_dir.join("app-logs")),
+            )],
+            init: Some(super::InitStep {
+                marker: data_dir.join("logs").join("meta.properties"),
+                cmd: vec![
+                    "kafka-storage.sh".into(),
+                    "format".into(),
+                    "-t".into(),
+                    new_cluster_id(),
+                    "-c".into(),
+                    conf_arg.clone(),
+                ],
+            }),
+            ..super::LaunchSpec::new("kafka-server-start.sh", [conf_arg])
+        }))
+    }
+
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
         // ZooKeeper must be running before Kafka in classic mode.
         // In KRaft mode (`kraft: true`) ZooKeeper is not used; we skip it.
         // We also skip it if the start call fails — the user may have set up
         // ZooKeeper through another means or may be running a KRaft build.
-        if !kraft_mode(dep)
-            && let Err(e) = pm.start_service("zookeeper")
+        // nixpkgs ships Kafka 4, which has no ZooKeeper, so nix always runs KRaft.
+        if pm.name() == "nix" {
+            if !kraft_mode(dep) {
+                output::info("kafka: running in KRaft mode — the nix Kafka has no ZooKeeper");
+            }
+        } else if !kraft_mode(dep)
+            && let Err(e) = pm.start_service("zookeeper", None)
         {
             output::warn(&format!(
                 "ZooKeeper failed to start: {e} — Kafka may not start"
             ));
         }
-        pm.start_service(&self.service_name(dep))
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
         pm.stop_service(&self.service_name(dep))?;
-        if !kraft_mode(dep)
+        if pm.name() != "nix"
+            && !kraft_mode(dep)
             && let Err(e) = pm.stop_service("zookeeper")
         {
             output::warn(&format!(
@@ -247,7 +371,11 @@ mod tests {
     fn start_in_kraft_mode_skips_zookeeper() {
         let pm = crate::package_manager::MockPackageManager::default();
         let dep = dep_with_kraft(true);
-        assert!(KafkaModule.start(&pm, &dep).is_ok());
+        assert!(
+            KafkaModule
+                .start(&pm, &dep, std::path::Path::new("/tmp"))
+                .is_ok()
+        );
         let started = pm.started_services.borrow();
         assert!(
             !started.iter().any(|s| s == "zookeeper"),
@@ -259,7 +387,11 @@ mod tests {
     fn start_in_classic_mode_attempts_zookeeper() {
         let pm = crate::package_manager::MockPackageManager::default();
         let dep = Dependency::simple("kafka");
-        assert!(KafkaModule.start(&pm, &dep).is_ok());
+        assert!(
+            KafkaModule
+                .start(&pm, &dep, std::path::Path::new("/tmp"))
+                .is_ok()
+        );
         let started = pm.started_services.borrow();
         assert!(
             started.iter().any(|s| s == "zookeeper"),
@@ -274,7 +406,11 @@ mod tests {
             ..Default::default()
         };
         let dep = dep_with_kraft(true);
-        assert!(KafkaModule.start(&pm, &dep).is_err());
+        assert!(
+            KafkaModule
+                .start(&pm, &dep, std::path::Path::new("/tmp"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -344,6 +480,87 @@ mod tests {
         assert_eq!(
             warn_count, 0,
             "no warning when ZooKeeper stops successfully"
+        );
+    }
+
+    // ── nix launch ────────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn nix_launch_writes_kraft_config_and_format_step() {
+        let dir = crate::test_support::tmp_dir();
+        let spec = KafkaModule
+            .nix_launch(&dep_with_port(51000), &dir)
+            .unwrap()
+            .unwrap();
+        let conf = dir.join("server.properties");
+        assert_eq!(spec.exec, "kafka-server-start.sh");
+        assert_eq!(spec.args, vec![conf.to_string_lossy().into_owned()]);
+
+        let text = std::fs::read_to_string(&conf).unwrap();
+        assert!(text.contains("process.roles=broker,controller"));
+        assert!(text.contains("listeners=PLAINTEXT://127.0.0.1:51000,CONTROLLER://127.0.0.1:"));
+        assert!(text.contains(&format!("log.dirs={}", dir.join("logs").display())));
+
+        let init = spec.init.expect("KRaft storage must be formatted once");
+        assert_eq!(init.marker, dir.join("logs").join("meta.properties"));
+        assert_eq!(init.cmd[..3], ["kafka-storage.sh", "format", "-t"]);
+        assert_eq!(init.cmd[3].len(), 22, "cluster id is 16 bytes base64url");
+        assert_eq!(
+            init.cmd[4..],
+            ["-c".to_string(), conf.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn nix_launch_reuses_controller_port() {
+        let dir = crate::test_support::tmp_dir();
+        KafkaModule.nix_launch(&dep_with_port(51000), &dir).unwrap();
+        let first =
+            controller_port_from(&std::fs::read_to_string(dir.join("server.properties")).unwrap())
+                .unwrap();
+        KafkaModule.nix_launch(&dep_with_port(51001), &dir).unwrap();
+        let text = std::fs::read_to_string(dir.join("server.properties")).unwrap();
+        assert_eq!(controller_port_from(&text), Some(first));
+        assert!(
+            text.contains("PLAINTEXT://127.0.0.1:51001"),
+            "broker port must update"
+        );
+    }
+
+    #[test]
+    fn nix_launch_is_kraft_even_without_kraft_key() {
+        // nixpkgs Kafka 4 has no ZooKeeper, so zookeeper mode isn't available under nix.
+        let dir = crate::test_support::tmp_dir();
+        let spec = KafkaModule
+            .nix_launch(&dep_with_kraft(false), &dir)
+            .unwrap()
+            .unwrap();
+        assert!(spec.init.is_some());
+    }
+
+    #[test]
+    fn start_under_nix_never_starts_zookeeper() {
+        let dir = crate::test_support::tmp_dir();
+        let pm = crate::package_manager::MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        KafkaModule
+            .start(&pm, &dep_with_kraft(false), &dir)
+            .unwrap();
+        assert_eq!(*pm.started_services.borrow(), vec!["kafka".to_string()]);
+        assert!(pm.started_launches.borrow()[0].is_some());
+    }
+
+    #[test]
+    fn cluster_ids_are_url_safe_and_distinct() {
+        let a = new_cluster_id();
+        let b = new_cluster_id();
+        assert_ne!(a, b);
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
     }
 }

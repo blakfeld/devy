@@ -40,6 +40,10 @@ impl Module for MariadbModule {
     fn default_port(&self) -> Option<u16> {
         Some(3306)
     }
+    fn port_applicable(&self, pm: &dyn PackageManager) -> bool {
+        pm.name() == "nix" || pm.service_config_dir("mariadb").is_some()
+    }
+
     fn known_extra_keys(&self) -> Option<&'static [&'static str]> {
         Some(&["port", "cli_args"])
     }
@@ -63,12 +67,15 @@ impl Module for MariadbModule {
         if p != 3306 || args.is_some() {
             match pm.service_config_dir("mariadb") {
                 Some(config_dir) => write_mysql_config(&config_dir, p, args.as_deref())?,
-                None => {
+                // Under nix the port and cli_args go on the command line instead. An
+                // unapplied explicit port is reported by the shared port resolver.
+                None if pm.name() != "nix" && args.is_some() => {
                     output::warn(&format!(
-                        "port/cli_args ignored: {} does not support service config dirs",
+                        "cli_args ignored: {} does not support service config dirs",
                         pm.name()
                     ));
                 }
+                None => {}
             }
         }
         Ok(())
@@ -94,8 +101,26 @@ impl Module for MariadbModule {
         Cow::Borrowed("mariadb")
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("mariadbd")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        // Password (not unix_socket) auth for root, so DATABASE_URL works over TCP.
+        let init = vec![
+            "mariadb-install-db".to_string(),
+            "--no-defaults".to_string(),
+            format!("--datadir={}", super::path_arg(data_dir)),
+            "--auth-root-authentication-method=normal".to_string(),
+        ];
+        Ok(Some(super::helpers::mysql_family_launch(
+            "mariadbd",
+            init,
+            &[],
+            port(dep)?,
+            cli_args(dep).as_deref(),
+            data_dir,
+        )?))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -106,8 +131,13 @@ impl Module for MariadbModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -353,7 +383,11 @@ mod tests {
         let pm = crate::package_manager::MockPackageManager::default();
         assert!(
             MariadbModule
-                .start(&pm, &Dependency::simple("mariadb"))
+                .start(
+                    &pm,
+                    &Dependency::simple("mariadb"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_ok()
         );
     }
@@ -366,7 +400,11 @@ mod tests {
         };
         assert!(
             MariadbModule
-                .start(&pm, &Dependency::simple("mariadb"))
+                .start(
+                    &pm,
+                    &Dependency::simple("mariadb"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }

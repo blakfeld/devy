@@ -8,8 +8,8 @@ use crate::config::Dependency;
 use crate::output;
 use crate::package_manager::PackageManager;
 
+use super::Module;
 use super::helpers::{stamp_matches, write_stamp};
-use super::{Module, pm_dep};
 
 pub struct PythonModule;
 
@@ -90,16 +90,23 @@ impl Module for PythonModule {
         Some(&["venv_path", "install_cmd"])
     }
 
-    fn nix_attr(&self, _dep: &Dependency) -> Option<String> {
-        Some("python3".to_string())
+    fn nix_versioned_attr(&self, version: &str) -> Option<String> {
+        // `3.12` or `3.12.4` → `python312`.
+        super::helpers::allowlisted_attr(version, 2, &["3.11", "3.12", "3.13", "3.14"], |v| {
+            format!("python{}", v.replace('.', ""))
+        })
+    }
+
+    fn nix_attr(&self, dep: &Dependency) -> Option<String> {
+        Some(super::nix_install_attr(self, dep, "python3"))
     }
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
-        pm.is_package_installed(&pm_dep(dep, pkg_name(pm)))
+        super::pkg_installed(self, pm, dep, pkg_name(pm))
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&pm_dep(dep, pkg_name(pm)))
+        pm.install_package(&super::pkg_dep(self, pm, dep, pkg_name(pm)))
     }
 
     fn env_vars(
@@ -298,6 +305,7 @@ mod tests {
             after_install: None,
             shell: None,
             extra,
+            version_from_lock: false,
         };
         assert_eq!(venv_path(&dep), "venv");
     }
@@ -346,6 +354,7 @@ mod tests {
             after_install: None,
             shell: None,
             extra,
+            version_from_lock: false,
         };
         let dir = std::env::temp_dir();
         let venv = dir.join(".venv");

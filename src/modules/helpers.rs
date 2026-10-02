@@ -16,6 +16,13 @@ pub(super) struct PackageModule {
     pub(super) apt: &'static str,
     pub(super) winget: &'static str,
     pub(super) nix: &'static str,
+    /// Maps a version to a versioned nixpkgs attribute (see `Module::nix_versioned_attr`).
+    pub(super) nix_versioned: fn(&str) -> Option<String>,
+}
+
+/// `PackageModule::nix_versioned` for packages without versioned nixpkgs attributes.
+pub(super) fn no_nix_versions(_version: &str) -> Option<String> {
+    None
 }
 
 impl PackageModule {
@@ -31,15 +38,19 @@ impl PackageModule {
 
 impl Module for PackageModule {
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
-        pm.is_package_installed(&pm_dep(dep, self.name_for(pm)))
+        super::pkg_installed(self, pm, dep, self.name_for(pm))
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&pm_dep(dep, self.name_for(pm)))
+        pm.install_package(&super::pkg_dep(self, pm, dep, self.name_for(pm)))
     }
 
-    fn nix_attr(&self, _dep: &Dependency) -> Option<String> {
-        Some(self.nix.to_string())
+    fn nix_versioned_attr(&self, version: &str) -> Option<String> {
+        (self.nix_versioned)(version)
+    }
+
+    fn nix_attr(&self, dep: &Dependency) -> Option<String> {
+        Some(super::nix_install_attr(self, dep, self.nix))
     }
 }
 
@@ -54,6 +65,18 @@ pub(super) fn write_mysql_config(
         .with_context(|| format!("Failed to create config dir {}", config_dir.display()))?;
 
     let mut ini = format!("[mysqld]\nport = {}\n", port);
+    for (key, val) in sanitized_mysql_args(cli_args) {
+        ini.push_str(&format!("{} = {}\n", key, val));
+    }
+
+    std::fs::write(config_dir.join("my.cnf"), ini).context("Failed to write my.cnf")?;
+    Ok(())
+}
+
+/// Parses MySQL-compatible `cli_args` into `(key, value)` pairs, warning about and
+/// skipping any token that isn't a safe `--key=value`.
+pub(super) fn sanitized_mysql_args(cli_args: Option<&str>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
     if let Some(args) = cli_args {
         for arg in args.split_whitespace() {
             // Require the -- prefix so bare key=value tokens can't inject directives.
@@ -90,12 +113,47 @@ pub(super) fn write_mysql_config(
                 ));
                 continue;
             }
-            ini.push_str(&format!("{} = {}\n", key, val));
+            out.push((key.to_string(), val.to_string()));
         }
     }
+    out
+}
 
-    std::fs::write(config_dir.join("my.cnf"), ini).context("Failed to write my.cnf")?;
-    Ok(())
+/// Launch spec shared by MySQL and MariaDB under nix: listens on 127.0.0.1:`port` with
+/// its datadir (and, when the path is short enough, socket) under `data_dir`, then
+/// `extra_args`, then each sanitized `cli_args` token. `--no-defaults` keeps system
+/// option files (`/etc/my.cnf`, `~/.my.cnf`) from leaking in; it must come first.
+pub(super) fn mysql_family_launch(
+    server: &str,
+    init_cmd: Vec<String>,
+    extra_args: &[&str],
+    port: u16,
+    cli_args: Option<&str>,
+    data_dir: &std::path::Path,
+) -> Result<super::LaunchSpec> {
+    let data = super::path_arg(data_dir);
+    let socket = super::socket_dir(data_dir, "mysql.sock")?.join("mysql.sock");
+    let mut args = vec![
+        "--no-defaults".to_string(),
+        format!("--datadir={data}"),
+        format!("--port={port}"),
+        "--bind-address=127.0.0.1".to_string(),
+        format!("--socket={}", super::path_arg(&socket)),
+    ];
+    args.extend(extra_args.iter().map(|a| a.to_string()));
+    args.extend(
+        sanitized_mysql_args(cli_args)
+            .into_iter()
+            .map(|(k, v)| format!("--{k}={v}")),
+    );
+    Ok(super::LaunchSpec {
+        init: Some(super::InitStep {
+            // The `mysql` system schema directory exists once the datadir is initialized.
+            marker: data_dir.join("mysql"),
+            cmd: init_cmd,
+        }),
+        ..super::LaunchSpec::new(server, args)
+    })
 }
 
 /// Runs a command, inheriting stdio, and bails on non-zero exit.
@@ -147,6 +205,26 @@ pub(super) fn extra_strs(dep: &Dependency, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Maps `version` to `attr(key)`, where `key` is its first `parts` numeric components
+/// (e.g. `"3.12.4"` with 2 parts → `"3.12"`), when `key` is in `allowed`.
+pub(super) fn allowlisted_attr(
+    version: &str,
+    parts: usize,
+    allowed: &[&str],
+    attr: impl Fn(&str) -> String,
+) -> Option<String> {
+    let comps: Vec<&str> = version.trim().split('.').take(parts).collect();
+    if comps.len() < parts
+        || comps
+            .iter()
+            .any(|c| c.is_empty() || !c.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let key = comps.join(".");
+    allowed.contains(&key.as_str()).then(|| attr(&key))
+}
+
 /// Returns a copy of `dep` with the name replaced by the platform-appropriate package name.
 pub(super) fn pm_dep(dep: &Dependency, name: &str) -> Dependency {
     Dependency {
@@ -156,6 +234,7 @@ pub(super) fn pm_dep(dep: &Dependency, name: &str) -> Dependency {
         after_install: None,
         shell: None,
         extra: HashMap::new(),
+        version_from_lock: dep.version_from_lock,
     }
 }
 

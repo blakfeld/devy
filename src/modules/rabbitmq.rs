@@ -13,7 +13,7 @@ fn package_name(pm: &dyn PackageManager) -> &'static str {
     match pm.name() {
         "apt" => "rabbitmq-server",
         "winget" => "VMware.RabbitMQ",
-        "nix" => "rabbitmq",
+        "nix" => "rabbitmq-server",
         _ => "rabbitmq",
     }
 }
@@ -27,12 +27,55 @@ impl Module for RabbitmqModule {
         true
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("rabbitmq-server")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let p = port(dep)?;
+        // RabbitMQ derives its distribution port as node port + 20000, which overflows
+        // for OS-assigned ports, so pick one and keep it across starts.
+        let dist_file = data_dir.join("dist_port");
+        let dist_port = match std::fs::read_to_string(&dist_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .filter(|p| *p != 0)
+        {
+            Some(p) => p,
+            None => {
+                let p = super::helpers::find_available_port()
+                    .context("Failed to find available port for the RabbitMQ distribution")?;
+                std::fs::write(&dist_file, p.to_string())
+                    .with_context(|| format!("Failed to write {}", dist_file.display()))?;
+                p
+            }
+        };
+        // A per-project node name keeps this node apart from a system RabbitMQ in epmd.
+        let node_name = format!(
+            "devy-{:08x}@localhost",
+            super::fnv1a(&super::path_arg(data_dir)) as u32
+        );
+        Ok(Some(super::LaunchSpec {
+            env: vec![
+                ("RABBITMQ_NODE_PORT".into(), p.to_string()),
+                ("RABBITMQ_DIST_PORT".into(), dist_port.to_string()),
+                ("RABBITMQ_NODENAME".into(), node_name),
+                ("RABBITMQ_NODE_IP_ADDRESS".into(), "127.0.0.1".into()),
+                (
+                    "RABBITMQ_MNESIA_BASE".into(),
+                    super::path_arg(&data_dir.join("mnesia")),
+                ),
+                (
+                    "RABBITMQ_LOG_BASE".into(),
+                    super::path_arg(&data_dir.join("log")),
+                ),
+            ],
+            ..super::LaunchSpec::new("rabbitmq-server", [])
+        }))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
-        Some("rabbitmq".to_string())
+        Some("rabbitmq-server".to_string())
     }
 
     fn default_port(&self) -> Option<u16> {
@@ -54,8 +97,13 @@ impl Module for RabbitmqModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -89,6 +137,7 @@ mod tests {
             after_install: None,
             shell: None,
             extra,
+            version_from_lock: false,
         }
     }
 
@@ -213,7 +262,11 @@ mod tests {
         let pm = crate::package_manager::MockPackageManager::default();
         assert!(
             RabbitmqModule
-                .start(&pm, &Dependency::simple("rabbitmq"))
+                .start(
+                    &pm,
+                    &Dependency::simple("rabbitmq"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_ok()
         );
     }
@@ -226,7 +279,11 @@ mod tests {
         };
         assert!(
             RabbitmqModule
-                .start(&pm, &Dependency::simple("rabbitmq"))
+                .start(
+                    &pm,
+                    &Dependency::simple("rabbitmq"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }

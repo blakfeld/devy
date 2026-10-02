@@ -25,8 +25,33 @@ impl Module for MinioModule {
         true
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("minio")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let p = port(dep)?;
+        let mut args = vec![
+            "server".to_string(),
+            super::path_arg(data_dir),
+            "--address".to_string(),
+            format!("127.0.0.1:{p}"),
+        ];
+        if let Some(cp) = dep.extra.get("console_port").and_then(|v| v.as_u64()) {
+            args.push("--console-address".into());
+            args.push(format!(":{cp}"));
+        }
+        let mut env = Vec::new();
+        if let Some(user) = dep.extra.get("access_key").and_then(|v| v.as_str()) {
+            env.push(("MINIO_ROOT_USER".to_string(), user.to_string()));
+        }
+        if let Some(pass) = dep.extra.get("secret_key").and_then(|v| v.as_str()) {
+            env.push(("MINIO_ROOT_PASSWORD".to_string(), pass.to_string()));
+        }
+        Ok(Some(super::LaunchSpec {
+            env,
+            ..super::LaunchSpec::new("minio", args)
+        }))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -52,8 +77,13 @@ impl Module for MinioModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -248,7 +278,15 @@ mod tests {
     #[test]
     fn start_delegates_to_pm() {
         let pm = crate::package_manager::MockPackageManager::default();
-        assert!(MinioModule.start(&pm, &Dependency::simple("minio")).is_ok());
+        assert!(
+            MinioModule
+                .start(
+                    &pm,
+                    &Dependency::simple("minio"),
+                    std::path::Path::new("/tmp")
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -259,7 +297,11 @@ mod tests {
         };
         assert!(
             MinioModule
-                .start(&pm, &Dependency::simple("minio"))
+                .start(
+                    &pm,
+                    &Dependency::simple("minio"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }

@@ -103,7 +103,11 @@ impl PackageManager for WinGet {
         Ok(stdout.contains("RUNNING"))
     }
 
-    fn start_service(&self, name: &str) -> Result<()> {
+    fn start_service(
+        &self,
+        name: &str,
+        _launch: Option<&crate::modules::LaunchSpec>,
+    ) -> Result<()> {
         let status = Command::new("net")
             .args(["start", name])
             .stdin(Stdio::inherit())

@@ -23,13 +23,63 @@ fn port(dep: &Dependency) -> anyhow::Result<u16> {
     super::extra_port(dep, "port", 80)
 }
 
+/// A foreground nginx config that keeps every runtime file under `data_dir`.
+fn nginx_conf(port: u16, data_dir: &std::path::Path) -> String {
+    let path = |name: &str| super::quoted_conf_path(&data_dir.join(name));
+    format!(
+        "# devy-managed — rewritten on every start\n\
+         daemon off;\n\
+         worker_processes 1;\n\
+         pid {pid};\n\
+         error_log {error_log};\n\
+         \n\
+         events {{\n    worker_connections 64;\n}}\n\
+         \n\
+         http {{\n\
+         \x20   access_log {access_log};\n\
+         \x20   client_body_temp_path {client_body};\n\
+         \x20   proxy_temp_path {proxy};\n\
+         \x20   fastcgi_temp_path {fastcgi};\n\
+         \x20   uwsgi_temp_path {uwsgi};\n\
+         \x20   scgi_temp_path {scgi};\n\
+         \n\
+         \x20   server {{\n\
+         \x20       listen 127.0.0.1:{port};\n\
+         \x20   }}\n\
+         }}\n",
+        pid = path("nginx.pid"),
+        error_log = path("error.log"),
+        access_log = path("access.log"),
+        client_body = path("client_body_temp"),
+        proxy = path("proxy_temp"),
+        fastcgi = path("fastcgi_temp"),
+        uwsgi = path("uwsgi_temp"),
+        scgi = path("scgi_temp"),
+    )
+}
+
 impl Module for NginxModule {
     fn is_service(&self) -> bool {
         true
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("nginx")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let conf = data_dir.join("nginx.conf");
+        std::fs::write(&conf, nginx_conf(port(dep)?, data_dir))
+            .with_context(|| format!("Failed to write {}", conf.display()))?;
+        Ok(Some(super::LaunchSpec::new(
+            "nginx",
+            [
+                "-p".into(),
+                super::path_arg(data_dir),
+                "-c".into(),
+                super::path_arg(&conf),
+            ],
+        )))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -55,7 +105,12 @@ impl Module for NginxModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
             let p = port(dep)?;
@@ -66,7 +121,7 @@ impl Module for NginxModule {
                 ));
             }
         }
-        pm.start_service(&self.service_name(dep))
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -199,7 +254,15 @@ mod tests {
     #[test]
     fn start_delegates_to_pm() {
         let pm = crate::package_manager::MockPackageManager::default();
-        assert!(NginxModule.start(&pm, &Dependency::simple("nginx")).is_ok());
+        assert!(
+            NginxModule
+                .start(
+                    &pm,
+                    &Dependency::simple("nginx"),
+                    std::path::Path::new("/tmp")
+                )
+                .is_ok()
+        );
     }
 
     #[test]
@@ -210,7 +273,11 @@ mod tests {
         };
         assert!(
             NginxModule
-                .start(&pm, &Dependency::simple("nginx"))
+                .start(
+                    &pm,
+                    &Dependency::simple("nginx"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }

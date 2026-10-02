@@ -7,7 +7,7 @@ use crate::output;
 use crate::package_manager::PackageManager;
 
 use super::helpers::{stamp_matches, write_stamp};
-use super::{Module, extra_strs, node_pkg, pm_dep, run_cmd};
+use super::{Module, extra_strs, node_pkg, run_cmd};
 
 pub struct NodeModule;
 
@@ -29,21 +29,31 @@ pub(crate) fn detect_node_pm(project_root: &Path) -> (&'static str, Option<PathB
     ("npm", None)
 }
 
+/// `22` or `22.11.0` → `nodejs_22`, for Node majors nixpkgs carries.
+/// Shared with the typescript module, which installs the same Node.
+pub(super) fn nix_versioned_node(version: &str) -> Option<String> {
+    super::helpers::allowlisted_attr(version, 1, &["22", "24"], |v| format!("nodejs_{v}"))
+}
+
 impl Module for NodeModule {
     fn known_extra_keys(&self) -> Option<&'static [&'static str]> {
         Some(&["global_packages"])
     }
 
-    fn nix_attr(&self, _dep: &Dependency) -> Option<String> {
-        Some("nodejs".to_string())
+    fn nix_versioned_attr(&self, version: &str) -> Option<String> {
+        nix_versioned_node(version)
+    }
+
+    fn nix_attr(&self, dep: &Dependency) -> Option<String> {
+        Some(super::nix_install_attr(self, dep, "nodejs"))
     }
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
-        pm.is_package_installed(&pm_dep(dep, node_pkg(pm)))
+        super::pkg_installed(self, pm, dep, node_pkg(pm))
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&pm_dep(dep, node_pkg(pm)))
+        pm.install_package(&super::pkg_dep(self, pm, dep, node_pkg(pm)))
     }
 
     fn post_setup(

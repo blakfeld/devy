@@ -78,9 +78,9 @@ dependencies:
   - redis
   - jq
 
-  # Pinned version
+  # Pinned version (under Nix, see "Versions under Nix" below)
   - node:
-      version: "20"
+      version: "22"
 
   # MySQL with a custom port and extra server flags
   - mysql:
@@ -89,16 +89,10 @@ dependencies:
 
   # Node with global npm packages
   - node:
-      version: "20"
+      version: "22"
       global_packages:
         - typescript
         - eslint
-
-  # Ruby with gems
-  - ruby:
-      gems:
-        - rails
-        - bundler
 
   # Rust with a specific toolchain, targets, and components
   - rust:
@@ -155,6 +149,22 @@ package_manager: apt    # Linux only — uses apt-get (requires sudo)
 ```
 
 When `package_manager` is omitted or set to `auto`, devy prints a warning and falls back to Nix.
+
+### Versions under Nix
+
+Nix installs one nixpkgs attribute per dependency. A `version:` is honored when it maps to a versioned attribute that nixpkgs carries. devy matches on the major version (major.minor for Python, MySQL and Go), so `22` and `22.11.0` both install `nodejs_22`:
+
+| Module | Supported versions | Attribute | Without a version |
+|---|---|---|---|
+| `node`, `typescript` | 22, 24 | `nodejs_22` | `nodejs` |
+| `python` | 3.11–3.14 | `python312` | `python3` |
+| `postgresql` | 14–18 | `postgresql_16` | `postgresql` |
+| `mysql` | 8.4 | `mysql84` | `mysql84` |
+| `java` | 8, 11, 17, 21, 25 | `jdk21` | `jdk21` |
+| `dotnet` | 6–10 | `dotnet-sdk_8` | `dotnet-sdk_8` |
+| `go` | 1.26 | `go_1_26` | `go` |
+
+Every other module, and any version outside these lists, installs the unversioned attribute. When that happens for a `version:` written in `devy.yml`, `devy up` and `devy check` warn `<dep>: version <v> is not supported by the nix backend — installing the nixpkgs default`. Versions pinned from `devy.lock` never warn. Modules that install through their own tooling (`rust` via rustup, `ruby` via rbenv, `deno`, `bun`, `gcloud`) honor `version:` themselves. `devy export` uses the same attributes.
 
 ## Commands
 
@@ -259,7 +269,7 @@ The snippet does two things:
 
 ## Lock file
 
-`devy up` writes `devy.lock` recording the exact version of every dependency that was installed, and the port assigned to every service. On subsequent runs without `--update`, devy pins each versionless dependency to its locked version and reuses its locked port, so the environment is reproducible across machines.
+`devy up` writes `devy.lock` recording the exact version of every dependency that was installed, and the port assigned to every service whose port devy applies (see [Service environment variables](#service-environment-variables)). On subsequent runs without `--update`, devy pins each versionless dependency to its locked version and reuses its locked port, so the environment is reproducible across machines.
 
 Commit `devy.lock` to version control. Run `devy up --update` when you want to upgrade.
 
@@ -296,13 +306,24 @@ For every service dependency, `devy up` automatically injects two environment va
 
 The prefix is the canonical service name, uppercased, with hyphens replaced by underscores. For example, `redis` → `REDIS_HOST` / `REDIS_PORT`, and `postgresql` → `POSTGRESQL_HOST` / `POSTGRESQL_PORT`.
 
+Which ports devy can choose depends on whether the backend can make the service actually listen on them:
+
+| Backend | Services whose port devy applies |
+|---|---|
+| Nix (macOS, Linux) | Every built-in service. devy launches the process itself, with the port, a `127.0.0.1` bind and a data directory under `.devy/data/<service>/`. |
+| Homebrew, apt | `postgresql`, `mysql` and `mariadb` only, via a devy-managed file in the service's `conf.d` directory. |
+| WinGet | None. |
+
 Port assignment follows this priority order:
 
 1. **Explicit port in `devy.yml`** — e.g. `port: 3307` — always wins.
-2. **Port saved in `devy.lock`** — reused on every subsequent `devy up`, including after `--update`, so the port stays stable across machines and teammates.
-3. **Random available port** — assigned on the first run when no port is configured and no lock entry exists.
+2. **Port saved in `devy.lock`** — when the backend applies the port, it's reused on every later `devy up`, including after `--update`, so the port stays stable across machines and teammates.
+3. **Random available port** — when the backend applies the port, assigned on the first `devy up` if no port is configured and there's no lock entry.
+4. **The service's default port** — everywhere else. For example, `redis` under Homebrew always uses 6379, so `REDIS_PORT` and `REDIS_URL` point where Redis actually listens.
 
-devy errors at startup if two services resolve to the same port, whether from explicit config or defaults.
+If you set an explicit, non-default port that the backend can't apply (e.g. `redis` with `port: 6380` under Homebrew), devy still exports that port but warns that you have to configure the service to listen on it yourself.
+
+`devy start`, `devy restart`, `devy check` and `devy status` resolve ports the same way using `devy.lock`, but never assign new ports or write the lock. devy errors if two services resolve to the same port. Ports that `devy up` hasn't assigned yet are excluded, so `mysql` and `mariadb` under Nix don't conflict, but `elasticsearch` and `opensearch` under Homebrew (both 9200) do.
 
 Values set under `environment:` in `devy.yml` take precedence over the auto-injected `_HOST` / `_PORT` variables, so you can override them if needed.
 
@@ -312,7 +333,7 @@ Values set under `environment:` in `devy.yml` take precedence over the auto-inje
 |---|---|
 | `node`, `nodejs`, `javascript`, `js` | Supports `global_packages` |
 | `typescript`, `ts` | Installs Node + TypeScript globally; supports `global_packages` |
-| `ruby` | Supports `gems` |
+| `ruby` | Runs `bundle install` when a `Gemfile` is present |
 | `rust`, `rustup` | Installs via rustup (all platforms); supports `toolchain`, `targets`, `components` |
 | `python`, `python3` | |
 | `go`, `golang` | |
@@ -335,15 +356,15 @@ Each module knows the correct package name for each package manager — you alwa
 
 | Module | Nix (`nixpkgs`) | Homebrew | apt | WinGet |
 |---|---|---|---|---|
-| `mysql` | `mysql80` | `mysql` | `mysql-server` | `Oracle.MySQL` |
-| `postgresql` | `postgresql` | `postgresql` | `postgresql` | `PostgreSQL.PostgreSQL` |
+| `mysql` | `mysql84` (version-matched) | `mysql` | `mysql-server` | `Oracle.MySQL` |
+| `postgresql` | `postgresql` (version-matched) | `postgresql` | `postgresql` | `PostgreSQL.PostgreSQL` |
 | `redis` | `redis` | `redis` | `redis-server` | `Redis.Redis` |
-| `mongodb` | `mongodb` | `mongodb-community` | `mongodb-org` | `MongoDB.Server` |
+| `mongodb` | `mongodb-ce` (unfree) | `mongodb-community` | `mongodb-org` | `MongoDB.Server` |
 | `nginx` | `nginx` | `nginx` | `nginx` | `Nginx.Nginx` |
-| `node` | `nodejs` | `node` | `nodejs` | `OpenJS.NodeJS` |
-| `python` | `python3` | `python` | `python3` | `Python.Python.3` |
-| `go` | `go` | `go` | `golang-go` | `GoLang.Go` |
-| `java` | `jdk` (version-matched) | `openjdk` | `default-jdk` | `Microsoft.OpenJDK.21` |
+| `node` | `nodejs` (version-matched) | `node` | `nodejs` | `OpenJS.NodeJS` |
+| `python` | `python3` (version-matched) | `python` | `python3` | `Python.Python.3` |
+| `go` | `go` (version-matched) | `go` | `golang-go` | `GoLang.Go` |
+| `java` | `jdk21` (version-matched) | `openjdk` | `default-jdk` | `Microsoft.OpenJDK.21` |
 | `kotlin` | `kotlin` | `kotlin` | `kotlin` | `JetBrains.Kotlin` |
 | `ruby` | `ruby` | `ruby` | `ruby` | `RubyInstallerTeam.Ruby.3` |
 
@@ -352,6 +373,8 @@ Each module knows the correct package name for each package manager — you alwa
 **macOS (Nix default):** Services are managed via launchd. devy writes a `LaunchAgent` plist to `~/Library/LaunchAgents/sh.devy.<name>.plist` and uses `launchctl` to start and stop them.
 
 **Linux (Nix default):** Services are managed via systemd user units. devy writes a unit file to `~/.config/systemd/user/devy-<name>.service` and uses `systemctl --user` to start and stop them — no `sudo` required.
+
+**Services under Nix:** devy launches each service from `.devy/nix-profile/bin` with its resolved port, a `127.0.0.1` bind, and its data, sockets and generated config under `.devy/data/<service>/`. The plist or unit is rewritten on every start, so port changes take effect. Databases are initialized on first start (`initdb`, `mysqld --initialize-insecure`, `mariadb-install-db`), and Kafka's storage is formatted once. Kafka always runs in KRaft mode, because nixpkgs ships Kafka 4, which has no ZooKeeper. Vault without `dev_mode` gets a file-storage config and starts sealed, so initialize and unseal it yourself. `mongodb` installs nixpkgs' unfree `mongodb-ce`. Unit names aren't per-project, so two projects can't run the same service under Nix at the same time.
 
 **macOS (Homebrew):** Set `package_manager: brew` in `devy.yml`. Service management uses `brew services`.
 

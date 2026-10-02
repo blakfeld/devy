@@ -35,22 +35,35 @@ fn find_dotnet_manifest(project_root: &Path) -> Option<PathBuf> {
     csproj
 }
 
+/// The SDK nixpkgs installs when no supported version is given.
+const NIX_DEFAULT_SDK: &str = "dotnet-sdk_8";
+
 fn package_name(pm: &dyn PackageManager, dep: &Dependency) -> String {
     let major = major_version(dep);
     match pm.name() {
         "apt" => format!("dotnet-sdk-{major}.0"),
         "winget" => format!("Microsoft.DotNet.SDK.{major}"),
-        "nix" => format!("dotnet-sdk_{major}"),
+        "nix" => super::nix_install_attr(&DotnetModule, dep, NIX_DEFAULT_SDK),
         _ => "dotnet".to_string(),
     }
 }
 
 impl Module for DotnetModule {
+    fn nix_versioned_attr(&self, version: &str) -> Option<String> {
+        // `8` or `8.0.100` → `dotnet-sdk_8`.
+        super::helpers::allowlisted_attr(version, 1, &["6", "7", "8", "9", "10"], |v| {
+            format!("dotnet-sdk_{v}")
+        })
+    }
+
     fn nix_attr(&self, dep: &Dependency) -> Option<String> {
-        Some(format!("dotnet-sdk_{}", major_version(dep)))
+        Some(super::nix_install_attr(self, dep, NIX_DEFAULT_SDK))
     }
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
+        if pm.name() == "nix" {
+            return super::pkg_installed(self, pm, dep, NIX_DEFAULT_SDK);
+        }
         let name = package_name(pm, dep);
         pm.is_package_installed(&pm_dep(dep, &name))
     }

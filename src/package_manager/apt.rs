@@ -131,7 +131,11 @@ impl PackageManager for Apt {
         Ok(parse_systemctl_status(&stdout))
     }
 
-    fn start_service(&self, name: &str) -> Result<()> {
+    fn start_service(
+        &self,
+        name: &str,
+        _launch: Option<&crate::modules::LaunchSpec>,
+    ) -> Result<()> {
         let status = Command::new("sudo")
             .args(["systemctl", "start", name])
             .stdin(Stdio::inherit())

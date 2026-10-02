@@ -156,6 +156,9 @@ pub struct Dependency {
     /// Shell interpreter for `after_install`. `None` means use the platform default.
     pub shell: Option<String>,
     pub extra: HashMap<String, ExtraValue>,
+    /// True when `version` was pinned from devy.lock rather than written in devy.yml.
+    /// Never read from or written to any file.
+    pub version_from_lock: bool,
 }
 
 impl Dependency {
@@ -167,6 +170,7 @@ impl Dependency {
             after_install: None,
             shell: None,
             extra: HashMap::new(),
+            version_from_lock: false,
         }
     }
 
@@ -269,6 +273,7 @@ impl DevyConfig {
                             after_install: cfg.after_install,
                             shell: cfg.shell,
                             extra: cfg.extra,
+                            version_from_lock: false,
                         });
                     }
                 }
@@ -339,6 +344,7 @@ mod tests {
             after_install: None,
             shell: None,
             extra: HashMap::new(),
+            version_from_lock: false,
         };
         assert_eq!(dep.versioned_name(), "node@20");
     }

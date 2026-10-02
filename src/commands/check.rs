@@ -10,6 +10,7 @@ use crate::output;
 use crate::package_manager;
 use crate::package_manager::PackageManager;
 
+use super::ports::{self, PortMode};
 use super::shared;
 
 pub(crate) fn check_impl(
@@ -24,7 +25,10 @@ pub(crate) fn check_impl(
     let mut issues: usize = 0;
 
     let deps = config.normalized_dependencies()?;
-    super::up::check_port_conflicts(&deps)?;
+    // Resolve ports exactly as `up` would, without assigning new ones or writing the lock.
+    let lock = ports::load_lock(project_root)?;
+    let mut resolved_deps = deps.clone();
+    ports::resolve_and_check(&mut resolved_deps, lock.as_ref(), pm, PortMode::ReadOnly)?;
 
     if !deps.is_empty() {
         for dep in &deps {
@@ -47,7 +51,12 @@ pub(crate) fn check_impl(
                     }
                 }
             }
-            for warning in module.config_warnings(dep) {
+            let warnings = module
+                .config_warnings(dep)
+                .into_iter()
+                .chain(ports::unapplied_port_warning(dep, pm))
+                .chain(modules::nix_version_warning(dep, pm));
+            for warning in warnings {
                 output::warn(&format!("{}: {}", dep.name, warning));
             }
             if let Some(shell) = dep.shell.as_deref()
@@ -58,7 +67,7 @@ pub(crate) fn check_impl(
             }
         }
         output::header("Dependencies");
-        issues += shared::print_dep_table(&deps, pm, true)?;
+        issues += shared::print_dep_table(&resolved_deps, pm, true)?;
     }
 
     // Collect PATH prepends from all modules.
@@ -298,6 +307,98 @@ mod tests {
         assert!(
             result.is_err(),
             "check_impl must return Err when dep.shell is not in the allowed list"
+        );
+    }
+
+    #[test]
+    fn check_impl_warns_on_unhonored_nix_version_without_counting_issue() {
+        let dir = crate::test_support::tmp_dir();
+        let yaml = "dependencies:\n  - jq:\n      version: \"1.6\"\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            ..Default::default()
+        };
+        let mut result = None;
+        let warnings = crate::output::with_warn_messages(|| {
+            result = Some(check_impl(&config, &pm, &MockEnvManager::default(), &dir));
+        });
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w == "jq: version 1.6 is not supported by the nix backend — installing the nixpkgs default"),
+            "{warnings:?}"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "the warning must not count as an issue"
+        );
+    }
+
+    #[test]
+    fn check_impl_accepts_typescript_global_packages() {
+        let yaml = "dependencies:\n  - typescript:\n      global_packages: [eslint]\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let pm = MockPackageManager {
+            installed: true,
+            ..Default::default()
+        };
+        let mut result = None;
+        let warnings = crate::output::with_warn_messages(|| {
+            result = Some(check_impl(
+                &config,
+                &pm,
+                &MockEnvManager::default(),
+                Path::new("."),
+            ));
+        });
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn check_impl_no_conflict_for_unassigned_ports_under_nix() {
+        let dir = crate::test_support::tmp_dir();
+        let config = make_config(&["mysql", "mariadb"], HashMap::new());
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            service_running: true,
+            ..Default::default()
+        };
+        let result = check_impl(&config, &pm, &MockEnvManager::default(), &dir);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !dir.join(crate::lock::PATH).exists(),
+            "check must never write devy.lock"
+        );
+    }
+
+    #[test]
+    fn check_impl_warns_on_unapplied_explicit_port_without_counting_issue() {
+        let dir = crate::test_support::tmp_dir();
+        let yaml = "dependencies:\n  - redis:\n      port: 6380\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let pm = MockPackageManager {
+            name: "brew",
+            installed: true,
+            service_running: true,
+            ..Default::default()
+        };
+        let mut result = None;
+        let warnings = crate::output::with_warn_messages(|| {
+            result = Some(check_impl(&config, &pm, &MockEnvManager::default(), &dir));
+        });
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("cannot make redis listen on port 6380 with brew")),
+            "{warnings:?}"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "a warning must not count as an issue"
         );
     }
 }

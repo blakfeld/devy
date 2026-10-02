@@ -55,6 +55,8 @@ _{bin}() {
     'check:Validate the environment without making changes'
     'init:Create an empty {bin}.yml'
     'hook:Print shell integration snippet'
+    'pr:Open a GitHub pull request for the current branch'
+    'export:Export the environment as a Nix shell.nix or flake.nix'
   )
   local user_cmd
   while IFS= read -r user_cmd; do
@@ -70,7 +72,8 @@ _{bin}() {
     up)
       _arguments \
         '--update[Re-resolve all versions and rewrite {bin}.lock]' \
-        '--dry-run[Check status without making changes]'
+        '--dry-run[Check status without making changes]' \
+        '--bootstrap[Install the package manager if missing]'
       ;;
     start|stop|restart)
       _arguments '1:service name'
@@ -80,6 +83,9 @@ _{bin}() {
       ;;
     hook)
       _values 'shell' zsh bash fish
+      ;;
+    export)
+      _arguments '--format[Output format]:format:(shell flake)'
       ;;
   esac
 }
@@ -100,7 +106,7 @@ const BASH_SNIPPET_TEMPLATE: &str = r#"
 
 _{bin}_completions() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
-  local subcmds="up down services start stop restart status check init hook"
+  local subcmds="up down services start stop restart status check init hook pr export"
   local user_cmds
   user_cmds=$(command {bin} _commands 2>/dev/null)
   [ -n "$user_cmds" ] && subcmds="$subcmds $user_cmds"
@@ -112,13 +118,20 @@ _{bin}_completions() {
 
   case "${COMP_WORDS[1]}" in
     up)
-      COMPREPLY=($(compgen -W "--update --dry-run" -- "$cur"))
+      COMPREPLY=($(compgen -W "--update --dry-run --bootstrap" -- "$cur"))
       ;;
     init)
       COMPREPLY=($(compgen -W "--force" -- "$cur"))
       ;;
     hook)
       COMPREPLY=($(compgen -W "zsh bash fish" -- "$cur"))
+      ;;
+    export)
+      if [ "${COMP_WORDS[COMP_CWORD-1]}" = "--format" ]; then
+        COMPREPLY=($(compgen -W "shell flake" -- "$cur"))
+      else
+        COMPREPLY=($(compgen -W "--format" -- "$cur"))
+      fi
       ;;
   esac
 }
@@ -142,7 +155,7 @@ function __{bin}_user_commands
 end
 
 function __{bin}_no_subcommand
-  not __fish_seen_subcommand_from up down services start stop restart status check init hook
+  not __fish_seen_subcommand_from up down services start stop restart status check init hook pr export
 end
 
 complete -c {bin} -f
@@ -156,10 +169,14 @@ complete -c {bin} -n __{bin}_no_subcommand -a status   -d "Show install and envi
 complete -c {bin} -n __{bin}_no_subcommand -a check    -d "Validate the environment"
 complete -c {bin} -n __{bin}_no_subcommand -a init     -d "Scaffold a {bin}.yml"
 complete -c {bin} -n __{bin}_no_subcommand -a hook     -d "Print shell integration snippet"
+complete -c {bin} -n __{bin}_no_subcommand -a pr       -d "Open a GitHub pull request"
+complete -c {bin} -n __{bin}_no_subcommand -a export   -d "Export a Nix shell.nix or flake.nix"
 complete -c {bin} -n __{bin}_no_subcommand -a "(__{bin}_user_commands)" -d "User-defined command"
 complete -c {bin} -n "__fish_seen_subcommand_from hook" -a "zsh bash fish"
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l update  -d "Re-resolve all versions"
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l dry-run -d "Check without making changes"
+complete -c {bin} -n "__fish_seen_subcommand_from up" -l bootstrap -d "Install the package manager if missing"
+complete -c {bin} -n "__fish_seen_subcommand_from export" -l format -x -a "shell flake" -d "Output format"
 complete -c {bin} -n "__fish_seen_subcommand_from init" -l force -d "Overwrite existing {bin}.yml"
 "#;
 
@@ -245,7 +262,8 @@ mod tests {
     fn all_builtin_subcommands_appear_in_zsh_snippet() {
         let s = zsh_snippet();
         for cmd in &[
-            "up", "down", "services", "start", "stop", "restart", "status", "check", "init", "hook",
+            "up", "down", "services", "start", "stop", "restart", "status", "check", "init",
+            "hook", "pr", "export",
         ] {
             assert!(s.contains(cmd), "zsh snippet missing '{}'", cmd);
         }
@@ -255,7 +273,8 @@ mod tests {
     fn all_builtin_subcommands_appear_in_bash_snippet() {
         let s = bash_snippet();
         for cmd in &[
-            "up", "down", "services", "start", "stop", "restart", "status", "check", "init", "hook",
+            "up", "down", "services", "start", "stop", "restart", "status", "check", "init",
+            "hook", "pr", "export",
         ] {
             assert!(s.contains(cmd), "bash snippet missing '{}'", cmd);
         }
@@ -265,7 +284,8 @@ mod tests {
     fn all_builtin_subcommands_appear_in_fish_snippet() {
         let s = fish_snippet();
         for cmd in &[
-            "up", "down", "services", "start", "stop", "restart", "status", "check", "init", "hook",
+            "up", "down", "services", "start", "stop", "restart", "status", "check", "init",
+            "hook", "pr", "export",
         ] {
             assert!(s.contains(cmd), "fish snippet missing '{}'", cmd);
         }
@@ -296,5 +316,18 @@ mod tests {
         assert!(!zsh_snippet().contains("{bin}"));
         assert!(!bash_snippet().contains("{bin}"));
         assert!(!fish_snippet().contains("{bin}"));
+    }
+
+    #[test]
+    fn snippets_complete_new_flags_and_values() {
+        for (shell, s) in [
+            ("zsh", zsh_snippet()),
+            ("bash", bash_snippet()),
+            ("fish", fish_snippet()),
+        ] {
+            for needle in ["pr", "export", "bootstrap", "format", "shell flake"] {
+                assert!(s.contains(needle), "{shell} snippet missing '{needle}'");
+            }
+        }
     }
 }

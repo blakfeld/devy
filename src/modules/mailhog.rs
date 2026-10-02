@@ -27,8 +27,16 @@ impl Module for MailhogModule {
         true
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("MailHog")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        _data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let p = smtp_port(dep)?;
+        Ok(Some(super::LaunchSpec::new(
+            "MailHog",
+            ["-smtp-bind-addr".into(), format!("127.0.0.1:{p}")],
+        )))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -57,8 +65,13 @@ impl Module for MailhogModule {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -227,7 +240,11 @@ mod tests {
         let pm = crate::package_manager::MockPackageManager::default();
         assert!(
             MailhogModule
-                .start(&pm, &Dependency::simple("mailhog"))
+                .start(
+                    &pm,
+                    &Dependency::simple("mailhog"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_ok()
         );
     }
@@ -240,7 +257,11 @@ mod tests {
         };
         assert!(
             MailhogModule
-                .start(&pm, &Dependency::simple("mailhog"))
+                .start(
+                    &pm,
+                    &Dependency::simple("mailhog"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }
@@ -274,12 +295,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_service_ports_injects_into_smtp_port_key() {
+    fn resolve_ports_injects_into_smtp_port_key() {
         let mut deps = vec![Dependency::simple("mailhog")];
-        crate::commands::up::resolve_service_ports(&mut deps, None).unwrap();
+        let pm = crate::package_manager::MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        crate::commands::ports::resolve_ports(
+            &mut deps,
+            None,
+            &pm,
+            crate::commands::ports::PortMode::Assign,
+        )
+        .unwrap();
         assert!(
             deps[0].extra.contains_key("smtp_port"),
-            "resolve_service_ports must inject into smtp_port, not port"
+            "resolve_ports must inject into smtp_port, not port"
         );
         assert!(
             !deps[0].extra.contains_key("port"),

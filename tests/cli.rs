@@ -313,9 +313,11 @@ fn check_exits_nonzero_with_unknown_top_level_key() {
 
 #[test]
 fn check_exits_nonzero_with_port_conflict() {
-    // mysql and mariadb both default to port 3306. Port conflict is detected before
-    // any package manager method is called, so this test is safe on all platforms.
-    let proj = TempProject::with_yaml("name: test\ndependencies:\n  - mysql\n  - mariadb\n");
+    // Explicit identical ports conflict on every backend. Explicit ports are resolved
+    // before any package manager method is called, so this is safe on all platforms.
+    let proj = TempProject::with_yaml(
+        "name: test\ndependencies:\n  - mysql:\n      port: 3307\n  - mariadb:\n      port: 3307\n",
+    );
     let out = proj.run(&["check"]);
     assert!(
         !out.status.success(),
@@ -323,8 +325,29 @@ fn check_exits_nonzero_with_port_conflict() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("3306") || stderr.contains("port"),
-        "error must mention the conflicting port; got: {stderr}"
+        stderr.contains("port conflict: 'mysql' and 'mariadb' both use port 3307"),
+        "error must name both services and the port; got: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_no_port_conflict_for_unassigned_ports_under_nix() {
+    // Under nix, `up` would give mysql and mariadb distinct random ports, so `check`
+    // must not report a conflict. The project profile doesn't exist, so nothing is
+    // reported installed and no nix command runs.
+    let proj = TempProject::with_yaml(
+        "name: test\npackage_manager: nix\ndependencies:\n  - mysql\n  - mariadb\n",
+    );
+    let out = proj.run(&["check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("port conflict"),
+        "check must not report a conflict for unassigned ports; got: {stderr}"
+    );
+    assert!(
+        !proj.file("devy.lock").exists(),
+        "check must not write devy.lock"
     );
 }
 

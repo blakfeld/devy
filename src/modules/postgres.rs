@@ -9,9 +9,7 @@ use std::time::Duration;
 use crate::config::Dependency;
 use crate::package_manager::PackageManager;
 
-use crate::output;
-
-use super::{Module, pm_dep};
+use super::Module;
 
 pub struct PostgresModule;
 
@@ -42,16 +40,27 @@ impl Module for PostgresModule {
     fn default_port(&self) -> Option<u16> {
         Some(5432)
     }
+    fn port_applicable(&self, pm: &dyn PackageManager) -> bool {
+        pm.name() == "nix" || pm.service_config_dir("postgresql").is_some()
+    }
+
     fn known_extra_keys(&self) -> Option<&'static [&'static str]> {
         Some(&["port"])
     }
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
-        pm.is_package_installed(&pm_dep(dep, package_name(pm)))
+        super::pkg_installed(self, pm, dep, package_name(pm))
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&pm_dep(dep, package_name(pm)))
+        pm.install_package(&super::pkg_dep(self, pm, dep, package_name(pm)))
+    }
+
+    fn nix_versioned_attr(&self, version: &str) -> Option<String> {
+        // `16` or `16.4` → `postgresql_16`.
+        super::helpers::allowlisted_attr(version, 1, &["14", "15", "16", "17", "18"], |v| {
+            format!("postgresql_{v}")
+        })
     }
 
     fn post_setup(
@@ -62,14 +71,11 @@ impl Module for PostgresModule {
     ) -> Result<()> {
         let p = port(dep)?;
         if p != 5432 {
-            match pm.service_config_dir("postgresql") {
-                Some(config_dir) => write_config(&config_dir, p)?,
-                None => {
-                    output::warn(&format!(
-                        "port ignored: {} does not support service config dirs",
-                        pm.name()
-                    ));
-                }
+            // Without a config dir (nix passes the port on the command line), there is
+            // nothing to write. An unapplied explicit port is reported by the shared
+            // port resolver.
+            if let Some(config_dir) = pm.service_config_dir("postgresql") {
+                write_config(&config_dir, p)?;
             }
         }
         Ok(())
@@ -93,20 +99,50 @@ impl Module for PostgresModule {
         Cow::Borrowed("postgresql")
     }
 
-    fn service_exec_name(&self) -> Option<&'static str> {
-        Some("postgres")
+    fn nix_launch(
+        &self,
+        dep: &Dependency,
+        data_dir: &std::path::Path,
+    ) -> Result<Option<super::LaunchSpec>> {
+        let p = port(dep)?;
+        let data = super::path_arg(data_dir);
+        let sockets = super::path_arg(&super::socket_dir(data_dir, &format!(".s.PGSQL.{p}"))?);
+        Ok(Some(super::LaunchSpec {
+            init: Some(super::InitStep {
+                marker: data_dir.join("PG_VERSION"),
+                cmd: vec!["initdb".into(), "-D".into(), data.clone()],
+            }),
+            ..super::LaunchSpec::new(
+                "postgres",
+                [
+                    "-D".into(),
+                    data.clone(),
+                    "-p".into(),
+                    p.to_string(),
+                    "-k".into(),
+                    sockets,
+                    "-c".into(),
+                    "listen_addresses=127.0.0.1".into(),
+                ],
+            )
+        }))
     }
 
-    fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
-        Some("postgresql".to_string())
+    fn nix_attr(&self, dep: &crate::config::Dependency) -> Option<String> {
+        Some(super::nix_install_attr(self, dep, "postgresql"))
     }
 
     fn is_running(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         pm.is_service_running(&self.service_name(dep))
     }
 
-    fn start(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.start_service(&self.service_name(dep))
+    fn start(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        project_root: &std::path::Path,
+    ) -> Result<()> {
+        super::start_via_pm(self, pm, dep, project_root)
     }
 
     fn stop(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
@@ -334,7 +370,11 @@ mod tests {
         let pm = crate::package_manager::MockPackageManager::default();
         assert!(
             PostgresModule
-                .start(&pm, &Dependency::simple("postgresql"))
+                .start(
+                    &pm,
+                    &Dependency::simple("postgresql"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_ok()
         );
     }
@@ -347,7 +387,11 @@ mod tests {
         };
         assert!(
             PostgresModule
-                .start(&pm, &Dependency::simple("postgresql"))
+                .start(
+                    &pm,
+                    &Dependency::simple("postgresql"),
+                    std::path::Path::new("/tmp")
+                )
                 .is_err()
         );
     }
