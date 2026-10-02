@@ -44,20 +44,70 @@ impl Detector for Compose {
         let Some(services) = doc.get("services").and_then(|s| s.as_mapping()) else {
             return;
         };
+        let native = native_tooling(dir);
+        // Services this detector added; ones found earlier stay as they were detected.
+        let mut added: Vec<&str> = Vec::new();
         for (service, spec) in services {
             // Build-only services are the project itself, not a dependency.
             let Some(image) = spec.get("image").and_then(|i| i.as_str()) else {
                 continue;
             };
             match map_image(image) {
-                Some((name, version)) => draft.add_dep(name, version),
+                Some((name, version)) => {
+                    if !draft.has_dep(name) {
+                        added.push(name);
+                    }
+                    draft.add_dep(name, version);
+                }
                 None => draft.todo(format!(
                     "compose service `{}` uses image `{image}`, which devy has no module for",
                     service.as_str().unwrap_or("?")
                 )),
             }
         }
+        if let Some(evidence) = native {
+            if !added.is_empty() {
+                draft.todo(format!(
+                    "compose services are left on the package manager because of `{evidence}`; \
+                     add `service_manager: docker` to run them as containers"
+                ));
+            }
+            return;
+        }
+        for dep in draft
+            .deps
+            .iter_mut()
+            .filter(|d| added.contains(&d.name.as_str()))
+        {
+            dep.docker = can_run_in_docker(&dep.name);
+        }
     }
+}
+
+/// The first sign that the project already manages tools natively (Nix, devbox, brew).
+fn native_tooling(dir: &Path) -> Option<&'static str> {
+    const FILES: &[&str] = &[
+        "flake.nix",
+        "shell.nix",
+        "default.nix",
+        "devbox.json",
+        "Brewfile",
+    ];
+    if let Some(file) = FILES.iter().find(|f| dir.join(f).is_file()) {
+        return Some(file);
+    }
+    // Only searched for direnv's nix directives; nothing else from .envrc is used.
+    let envrc = read(dir, ".envrc")?;
+    envrc
+        .lines()
+        .map(str::trim)
+        .any(|l| l.starts_with("use nix") || l.starts_with("use flake"))
+        .then_some(".envrc")
+}
+
+fn can_run_in_docker(name: &str) -> bool {
+    let dep = crate::config::Dependency::simple(name);
+    matches!(modules::get(name).docker_spec(&dep), Ok(Some(_)))
 }
 
 /// Maps an image reference to a service module and, when the tag is a version, its version.
@@ -138,6 +188,73 @@ mod tests {
         assert_eq!(mapped("myorg/api:latest"), None);
         assert_eq!(mapped("node:22"), None, "runtimes are not compose services");
         assert_eq!(mapped("myorg/postgres:16"), None);
+    }
+
+    const PG: &str = "services:\n  db:\n    image: postgres:16\n";
+
+    fn detect(files: &[(&str, &str)]) -> Draft {
+        let dir = fixture(files);
+        let mut draft = Draft::default();
+        Compose.detect(&dir, &mut draft);
+        draft
+    }
+
+    #[test]
+    fn compose_services_run_in_docker() {
+        let draft = detect(&[("docker-compose.yml", PG)]);
+        assert_eq!(draft.deps.len(), 1);
+        assert!(draft.deps[0].docker, "{draft:?}");
+        assert!(draft.todos.is_empty(), "{:?}", draft.todos);
+    }
+
+    #[test]
+    fn native_tooling_keeps_package_manager() {
+        for (file, content) in [
+            ("flake.nix", "{}"),
+            ("Brewfile", "brew \"jq\"\n"),
+            (".envrc", "export FOO=1\nuse flake\n"),
+        ] {
+            let draft = detect(&[("docker-compose.yml", PG), (file, content)]);
+            assert!(!draft.deps[0].docker, "{file}");
+            assert_eq!(draft.todos.len(), 1, "{file}: {:?}", draft.todos);
+            assert!(
+                draft.todos[0].contains(file) && draft.todos[0].contains("service_manager: docker"),
+                "{:?}",
+                draft.todos
+            );
+        }
+    }
+
+    #[test]
+    fn envrc_without_nix_is_not_native_tooling() {
+        let draft = detect(&[("docker-compose.yml", PG), (".envrc", "export X=1\n")]);
+        assert!(draft.deps[0].docker);
+    }
+
+    #[test]
+    fn service_detected_earlier_is_left_alone() {
+        let dir = fixture(&[("docker-compose.yml", PG)]);
+        let mut draft = Draft::default();
+        draft.add_dep("postgres", Some("16.2".into()));
+        Compose.detect(&dir, &mut draft);
+        assert_eq!(draft.deps.len(), 1);
+        assert!(!draft.deps[0].docker);
+        assert_eq!(draft.deps[0].version.as_deref(), Some("16.2"));
+    }
+
+    #[test]
+    fn duplicate_compose_services_stay_docker() {
+        let compose = "services:\n  a:\n    image: redis:7\n  b:\n    image: redis:7\n";
+        let draft = detect(&[("compose.yaml", compose)]);
+        assert_eq!(draft.deps.len(), 1);
+        assert!(draft.deps[0].docker);
+    }
+
+    #[test]
+    fn every_mappable_service_can_run_in_docker() {
+        for entry in modules::catalog().into_iter().filter(|e| e.service) {
+            assert!(can_run_in_docker(entry.name), "{}", entry.name);
+        }
     }
 
     #[test]
