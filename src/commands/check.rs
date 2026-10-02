@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::Path;
 
-use crate::config::DevyConfig;
+use crate::config::{Dependency, DevyConfig};
 use crate::env_manager::{EnvManager, Shadowenv};
 use crate::error::SilentExit;
 use crate::modules;
@@ -57,21 +57,9 @@ pub(crate) fn check_with_runtime(
                     .with_context(|| format!("{}: config validation failed", dep.name))?;
             }
             let module = modules::get(&dep.name);
-            if let Some(known) = module.known_extra_keys() {
-                for key in dep.extra.keys() {
-                    if !known.contains(&key.as_str()) {
-                        issues += 1;
-                        let hint = if known.is_empty() {
-                            "this module accepts no extra keys".to_string()
-                        } else {
-                            format!("known keys: {}", known.join(", "))
-                        };
-                        output::warn(&format!(
-                            "{}: unrecognized config key `{}` — {hint}",
-                            dep.name, key
-                        ));
-                    }
-                }
+            for issue in extra_key_issues(dep) {
+                issues += 1;
+                output::warn(&issue);
             }
             let warnings = module
                 .config_warnings(dep)
@@ -82,11 +70,9 @@ pub(crate) fn check_with_runtime(
             for warning in warnings {
                 output::warn(&format!("{}: {}", dep.name, warning));
             }
-            if let Some(shell) = dep.shell.as_deref()
-                && let Err(e) = crate::commands::exec::validate_shell(shell)
-            {
+            if let Some(issue) = shell_issue(dep) {
                 issues += 1;
-                output::warn(&format!("{}: invalid shell '{}': {}", dep.name, shell, e));
+                output::warn(&issue);
             }
         }
         output::header("Dependencies");
@@ -119,6 +105,72 @@ pub(crate) fn check_with_runtime(
         eprintln!("  {}  {} {} found", "✗".red().bold(), issues, noun);
         Err(SilentExit(1).into())
     }
+}
+
+/// Problems in `config` that are detectable without a package manager, env manager or
+/// lock: dependency normalization, unrecognized extra keys, invalid shells and conflicts
+/// between explicit ports. Used to validate a config before anything is installed.
+pub(crate) fn static_issues(config: &DevyConfig) -> Result<Vec<String>> {
+    let deps = config.normalized_dependencies()?;
+    let mut issues = Vec::new();
+    for dep in &deps {
+        issues.extend(extra_key_issues(dep));
+        issues.extend(shell_issue(dep));
+    }
+    issues.extend(explicit_port_conflict(&deps));
+    Ok(issues)
+}
+
+fn extra_key_issues(dep: &Dependency) -> Vec<String> {
+    let Some(known) = modules::get(&dep.name).known_extra_keys() else {
+        return vec![];
+    };
+    let hint = if known.is_empty() {
+        "this module accepts no extra keys".to_string()
+    } else {
+        format!("known keys: {}", known.join(", "))
+    };
+    let mut keys: Vec<&String> = dep
+        .extra
+        .keys()
+        .filter(|key| !known.contains(&key.as_str()))
+        .collect();
+    keys.sort();
+    keys.into_iter()
+        .map(|key| format!("{}: unrecognized config key `{key}` — {hint}", dep.name))
+        .collect()
+}
+
+fn shell_issue(dep: &Dependency) -> Option<String> {
+    let shell = dep.shell.as_deref()?;
+    let e = crate::commands::exec::validate_shell(shell).err()?;
+    Some(format!("{}: invalid shell '{}': {}", dep.name, shell, e))
+}
+
+/// Conflicts and out-of-range values among ports written explicitly in devy.yml. Default
+/// and assigned ports depend on the backend, so they are left to `check` and `up`.
+fn explicit_port_conflict(deps: &[Dependency]) -> Option<String> {
+    let mut explicit = Vec::with_capacity(deps.len());
+    for dep in deps {
+        let port = modules::get(&dep.name)
+            .port_key()
+            .and_then(|key| dep.extra.get(key))
+            .and_then(|v| v.as_u64());
+        match port.map(u16::try_from) {
+            None => explicit.push(None),
+            Some(Ok(p)) if p != 0 => explicit.push(Some(ports::ResolvedPort::Explicit(p))),
+            Some(_) => {
+                return Some(format!(
+                    "'{}': port value {} is out of range (must be 1–65535)",
+                    dep.name,
+                    port.unwrap_or_default()
+                ));
+            }
+        }
+    }
+    ports::check_port_conflicts(deps, &explicit)
+        .err()
+        .map(|e| e.to_string())
 }
 
 #[cfg_attr(test, mutants::skip)] // cosmetic singular/plural; no observable behavioral difference
@@ -540,5 +592,58 @@ mod tests {
             result.unwrap().is_ok(),
             "a warning must not count as an issue"
         );
+    }
+
+    #[test]
+    fn static_issues_reports_misspelled_port_key() {
+        let yaml = "dependencies:\n  - redis: { prot: 6380 }\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let issues = static_issues(&config).unwrap();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(
+            issues[0].contains("unrecognized config key `prot`"),
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn static_issues_empty_for_clean_config() {
+        let yaml =
+            "dependencies:\n  - node:\n      version: \"22\"\n  - redis:\n      port: 6380\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(static_issues(&config).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn static_issues_reports_explicit_port_conflict() {
+        let yaml =
+            "dependencies:\n  - redis:\n      port: 5432\n  - postgresql:\n      port: 5432\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let issues = static_issues(&config).unwrap();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("port conflict"), "{issues:?}");
+    }
+
+    #[test]
+    fn static_issues_ignores_default_port_overlap() {
+        // mysql and mariadb share a default port; only explicit ports are compared.
+        let config = make_config(&["mysql", "mariadb"], HashMap::new());
+        assert!(static_issues(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn static_issues_reports_invalid_shell() {
+        let yaml = "dependencies:\n  - node:\n      shell: not-a-shell\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let issues = static_issues(&config).unwrap();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("invalid shell"), "{issues:?}");
+    }
+
+    #[test]
+    fn static_issues_errs_on_multi_key_dependency() {
+        let yaml = "dependencies:\n  - node: {}\n    redis: {}\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        assert!(static_issues(&config).is_err());
     }
 }

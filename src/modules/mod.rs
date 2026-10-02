@@ -915,16 +915,98 @@ pub fn get(name: &str) -> &'static dyn Module {
     REGISTRY_MAP.get(canonical).copied().unwrap_or(&GENERIC)
 }
 
+/// Whether `name` (or the alias it resolves to) has its own module rather than the
+/// generic fallback.
+pub fn is_registered(name: &str) -> bool {
+    REGISTRY_MAP.contains_key(canonical_name(name))
+}
+
 /// Returns the canonical registry name for `name`, resolving aliases.
 /// `"postgres"` → `"postgresql"`, `"js"` → `"node"`, unknown → unchanged.
 pub fn canonical_name(name: &str) -> &str {
     ALIASES_MAP.get(name).copied().unwrap_or(name)
 }
 
+/// One registry entry as described to an AI model: everything needed to write a valid
+/// `dependencies:` item and to reference the variables a service injects.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CatalogEntry {
+    pub name: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<&'static str>,
+    pub service: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_port: Option<u16>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    /// `None` when the module accepts any extra key.
+    pub extra_keys: Option<&'static [&'static str]>,
+}
+
+/// The module catalog, generated from `REGISTRY` and `ALIASES` so it cannot drift.
+pub fn catalog() -> Vec<CatalogEntry> {
+    REGISTRY
+        .iter()
+        .map(|&(name, module)| {
+            let service = module.is_service();
+            let env = if service {
+                let prefix = name.replace('-', "_").to_ascii_uppercase();
+                let mut env = vec![format!("{prefix}_HOST")];
+                if module.default_port().is_some() || module.port_key().is_some() {
+                    env.push(format!("{prefix}_PORT"));
+                }
+                env
+            } else {
+                vec![]
+            };
+            CatalogEntry {
+                name,
+                aliases: ALIASES
+                    .iter()
+                    .filter(|&&(_, canon)| canon == name)
+                    .map(|&(alias, _)| alias)
+                    .collect(),
+                service,
+                default_port: module.default_port(),
+                env,
+                extra_keys: module.known_extra_keys(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // ── catalog ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn catalog_lists_every_registry_name_and_alias() {
+        let catalog = catalog();
+        let json = serde_json::to_string(&catalog).unwrap();
+        assert!(!json.contains('\n'), "catalog JSON must be compact");
+        for (name, _) in REGISTRY {
+            assert!(catalog.iter().any(|e| e.name == *name), "missing {name}");
+        }
+        for (alias, canon) in ALIASES {
+            let entry = catalog.iter().find(|e| e.name == *canon).unwrap();
+            assert!(entry.aliases.contains(alias), "missing alias {alias}");
+        }
+    }
+
+    #[test]
+    fn catalog_lists_injected_service_vars() {
+        let catalog = catalog();
+        let pg = catalog.iter().find(|e| e.name == "postgresql").unwrap();
+        assert!(pg.service);
+        assert_eq!(pg.default_port, Some(5432));
+        assert!(pg.env.contains(&"POSTGRESQL_HOST".to_string()));
+        assert!(pg.env.contains(&"POSTGRESQL_PORT".to_string()));
+        let node = catalog.iter().find(|e| e.name == "node").unwrap();
+        assert!(!node.service && node.env.is_empty());
+    }
 
     // ── registry integrity ────────────────────────────────────────────────────
 
