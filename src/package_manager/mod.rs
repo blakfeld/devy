@@ -159,6 +159,8 @@ pub struct MockPackageManager {
     pub stopped_services: std::cell::RefCell<Vec<String>>,
     /// Tracks every package name passed to `install_package` (in dep.name form).
     pub installed_packages: std::cell::RefCell<Vec<String>>,
+    /// The subset of `installed_packages` installed with `allow_unfree` set.
+    pub unfree_packages: std::cell::RefCell<Vec<String>>,
     /// When set, `resolved_version` returns this value instead of Ok(None).
     pub version: Option<String>,
     /// When true, `validate_config` returns an error.
@@ -184,6 +186,7 @@ impl Default for MockPackageManager {
             started_launches: std::cell::RefCell::new(Vec::new()),
             stopped_services: std::cell::RefCell::new(Vec::new()),
             installed_packages: std::cell::RefCell::new(Vec::new()),
+            unfree_packages: std::cell::RefCell::new(Vec::new()),
             version: None,
             validate_config_fails: false,
             path_prepends_result: Vec::new(),
@@ -211,6 +214,9 @@ impl PackageManager for MockPackageManager {
     }
     fn install_package(&self, dep: &Dependency) -> Result<()> {
         self.installed_packages.borrow_mut().push(dep.name.clone());
+        if dep.allow_unfree {
+            self.unfree_packages.borrow_mut().push(dep.name.clone());
+        }
         if self.install_fails {
             anyhow::bail!("mock install failure")
         } else {

@@ -159,6 +159,9 @@ pub struct Dependency {
     /// True when `version` was pinned from devy.lock rather than written in devy.yml.
     /// Never read from or written to any file.
     pub version_from_lock: bool,
+    /// True when the nix backend must allow unfree packages for this install. Set by
+    /// `pkg_dep` from `Module::nix_unfree`; never read from or written to any file.
+    pub allow_unfree: bool,
 }
 
 impl Dependency {
@@ -171,6 +174,7 @@ impl Dependency {
             shell: None,
             extra: HashMap::new(),
             version_from_lock: false,
+            allow_unfree: false,
         }
     }
 
@@ -271,6 +275,7 @@ impl DevyConfig {
                             shell: cfg.shell,
                             extra: cfg.extra,
                             version_from_lock: false,
+                            allow_unfree: false,
                         });
                     }
                 }
@@ -342,6 +347,7 @@ mod tests {
             shell: None,
             extra: HashMap::new(),
             version_from_lock: false,
+            allow_unfree: false,
         };
         assert_eq!(dep.versioned_name(), "node@20");
     }

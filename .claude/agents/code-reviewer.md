@@ -19,7 +19,7 @@ Review the diff you're pointed at (default: `git diff main...HEAD` plus uncommit
 4. **Tests** — missing coverage for new behavior, tests that don't actually assert anything, platform-dependent tests without gates.
 5. **Simplicity & idiom** — duplication with existing helpers (`src/modules/helpers.rs`, `src/commands/shared.rs`), unnecessary clones/allocations, non-idiomatic Rust.
 
-You may run `cargo check`, `cargo clippy -- -D warnings`, and `cargo test` to support findings. Do not edit files.
+You may run `cargo check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` to support findings. Do not edit files.
 
 ## Output
 

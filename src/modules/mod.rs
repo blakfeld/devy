@@ -178,7 +178,7 @@ pub(crate) fn nix_install_attr(module: &dyn Module, dep: &Dependency, unversione
 }
 
 /// `pm_dep` for `name`, except that under nix the versioned attribute is installed when
-/// `dep.version` maps to one.
+/// `dep.version` maps to one, and unfree is allowed when the module declares it.
 pub(crate) fn pkg_dep(
     module: &dyn Module,
     pm: &dyn PackageManager,
@@ -186,7 +186,10 @@ pub(crate) fn pkg_dep(
     name: &str,
 ) -> Dependency {
     if pm.name() == "nix" {
-        pm_dep(dep, &nix_install_attr(module, dep, name))
+        Dependency {
+            allow_unfree: module.nix_unfree(),
+            ..pm_dep(dep, &nix_install_attr(module, dep, name))
+        }
     } else {
         pm_dep(dep, name)
     }
@@ -328,6 +331,12 @@ pub trait Module: Sync {
     /// Returns `None` for modules with no known nixpkgs equivalent.
     fn nix_attr(&self, _dep: &Dependency) -> Option<String> {
         None
+    }
+
+    /// Whether this module's nixpkgs package is unfree. The nix backend then allows
+    /// unfree packages for that one install, and `devy export` allowlists it.
+    fn nix_unfree(&self) -> bool {
+        false
     }
 
     fn is_running(&self, _pm: &dyn PackageManager, _dep: &Dependency) -> Result<bool> {
@@ -515,6 +524,7 @@ static GO: PackageModule = PackageModule {
     winget: "GoLang.Go",
     nix: "go",
     nix_versioned: go_nix_versioned,
+    nix_unfree: false,
 };
 
 /// `1.26` or `1.26.3` → `go_1_26`, for Go releases nixpkgs carries.
@@ -529,6 +539,7 @@ static SCALA: PackageModule = PackageModule {
     winget: "EPFL.Scala",
     nix: "scala",
     nix_versioned: helpers::no_nix_versions,
+    nix_unfree: false,
 };
 static PHP: PackageModule = PackageModule {
     default: "php",
@@ -536,6 +547,7 @@ static PHP: PackageModule = PackageModule {
     winget: "PHP.PHP",
     nix: "php",
     nix_versioned: helpers::no_nix_versions,
+    nix_unfree: false,
 };
 static AWSCLI: PackageModule = PackageModule {
     default: "awscli",
@@ -543,6 +555,7 @@ static AWSCLI: PackageModule = PackageModule {
     winget: "Amazon.AWSCLI",
     nix: "awscli2",
     nix_versioned: helpers::no_nix_versions,
+    nix_unfree: false,
 };
 static GH: PackageModule = PackageModule {
     default: "gh",
@@ -550,6 +563,7 @@ static GH: PackageModule = PackageModule {
     winget: "GitHub.cli",
     nix: "gh",
     nix_versioned: helpers::no_nix_versions,
+    nix_unfree: false,
 };
 static KUBECTL: PackageModule = PackageModule {
     default: "kubectl",
@@ -557,6 +571,7 @@ static KUBECTL: PackageModule = PackageModule {
     winget: "Kubernetes.kubectl",
     nix: "kubectl",
     nix_versioned: helpers::no_nix_versions,
+    nix_unfree: false,
 };
 static HELM: PackageModule = PackageModule {
     default: "helm",
@@ -564,6 +579,7 @@ static HELM: PackageModule = PackageModule {
     winget: "Helm.Helm",
     nix: "kubernetes-helm",
     nix_versioned: helpers::no_nix_versions,
+    nix_unfree: false,
 };
 static TERRAFORM: PackageModule = PackageModule {
     default: "terraform",
@@ -571,6 +587,7 @@ static TERRAFORM: PackageModule = PackageModule {
     winget: "Hashicorp.Terraform",
     nix: "terraform",
     nix_versioned: helpers::no_nix_versions,
+    nix_unfree: true,
 };
 static AZURE_CLI: PackageModule = PackageModule {
     default: "azure-cli",
@@ -578,6 +595,7 @@ static AZURE_CLI: PackageModule = PackageModule {
     winget: "Microsoft.AzureCLI",
     nix: "azure-cli",
     nix_versioned: helpers::no_nix_versions,
+    nix_unfree: false,
 };
 static SWIFT: PackageModule = PackageModule {
     default: "swift",
@@ -585,6 +603,7 @@ static SWIFT: PackageModule = PackageModule {
     winget: "Swift.Toolchain",
     nix: "swift",
     nix_versioned: helpers::no_nix_versions,
+    nix_unfree: false,
 };
 
 /// Canonical-name → module registry. One entry per canonical name.
@@ -1272,8 +1291,58 @@ mod tests {
         Dependency {
             version: Some(version.into()),
             version_from_lock: from_lock,
+            allow_unfree: false,
             ..Dependency::simple(name)
         }
+    }
+
+    // ── unfree nix packages ───────────────────────────────────────────────────
+
+    #[test]
+    fn exactly_four_modules_are_nix_unfree() {
+        let mut unfree: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|(_, m)| m.nix_unfree())
+            .map(|(n, _)| *n)
+            .collect();
+        unfree.sort_unstable();
+        assert_eq!(unfree, ["elasticsearch", "mongodb", "terraform", "vault"]);
+        assert!(
+            !get("jq").nix_unfree(),
+            "the generic module is never unfree"
+        );
+    }
+
+    #[test]
+    fn nix_install_dep_allows_unfree_only_for_unfree_modules() {
+        use crate::package_manager::MockPackageManager;
+        let nix = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        for name in [
+            "mongodb",
+            "redis",
+            "vault",
+            "terraform",
+            "elasticsearch",
+            "node",
+        ] {
+            get(name).install(&nix, &Dependency::simple(name)).unwrap();
+        }
+        assert_eq!(
+            *nix.unfree_packages.borrow(),
+            vec!["mongodb-ce", "vault", "terraform", "elasticsearch"]
+        );
+
+        let brew = MockPackageManager {
+            name: "brew",
+            ..Default::default()
+        };
+        get("vault")
+            .install(&brew, &Dependency::simple("vault"))
+            .unwrap();
+        assert!(brew.unfree_packages.borrow().is_empty(), "nix only");
     }
 
     #[test]
@@ -1949,6 +2018,7 @@ mod tests {
             shell: None,
             extra,
             version_from_lock: false,
+            allow_unfree: false,
         };
         let pkgs = extra_strs(&dep, "global_packages");
         assert_eq!(pkgs, vec!["typescript", "eslint"]);
@@ -1969,6 +2039,7 @@ mod tests {
             shell: None,
             extra,
             version_from_lock: false,
+            allow_unfree: false,
         };
         assert!(extra_strs(&dep, "global_packages").is_empty());
     }
@@ -1985,6 +2056,7 @@ mod tests {
             shell: None,
             extra: HashMap::new(),
             version_from_lock: false,
+            allow_unfree: false,
         };
         let remapped = pm_dep(&dep, "ruby@3.2");
         assert_eq!(remapped.name, "ruby@3.2");
@@ -2437,6 +2509,7 @@ mod tests {
             winget: "GoLang.Go",
             nix: "go",
             nix_versioned: helpers::no_nix_versions,
+            nix_unfree: false,
         };
         let pm = crate::package_manager::MockPackageManager {
             name: "apt",
@@ -2453,6 +2526,7 @@ mod tests {
             winget: "GoLang.Go",
             nix: "go",
             nix_versioned: helpers::no_nix_versions,
+            nix_unfree: false,
         };
         let pm = crate::package_manager::MockPackageManager {
             name: "winget",
@@ -2469,6 +2543,7 @@ mod tests {
             winget: "GoLang.Go",
             nix: "go",
             nix_versioned: helpers::no_nix_versions,
+            nix_unfree: false,
         };
         let pm = crate::package_manager::MockPackageManager {
             name: "brew",
@@ -2485,6 +2560,7 @@ mod tests {
             winget: "GoLang.Go",
             nix: "go",
             nix_versioned: helpers::no_nix_versions,
+            nix_unfree: false,
         };
         let pm = crate::package_manager::MockPackageManager {
             name: "nix",
@@ -2501,6 +2577,7 @@ mod tests {
             winget: "GoLang.Go",
             nix: "go",
             nix_versioned: helpers::no_nix_versions,
+            nix_unfree: false,
         };
         let pm = crate::package_manager::MockPackageManager {
             installed: true,
@@ -2518,6 +2595,7 @@ mod tests {
             winget: "GoLang.Go",
             nix: "go",
             nix_versioned: helpers::no_nix_versions,
+            nix_unfree: false,
         };
         let pm = crate::package_manager::MockPackageManager::default();
         let dep = Dependency::simple("go");
@@ -2532,6 +2610,7 @@ mod tests {
             winget: "GoLang.Go",
             nix: "go",
             nix_versioned: helpers::no_nix_versions,
+            nix_unfree: false,
         };
         let pm = crate::package_manager::MockPackageManager {
             install_fails: true,

@@ -14,7 +14,7 @@ context: |
   per dependency; aliases map to canonical names; unknown names fall back to a generic
   module), src/package_manager/ (nix, brew, apt, winget), src/env_manager/ (shadowenv).
   Testing: unit tests live in each module; tests/cli.rs runs the real binary in a temp dir
-  containing a `.git` marker. CI runs cargo test, cargo clippy -- -D warnings and
+  containing a `.git` marker. CI runs cargo test, cargo clippy --all-targets -- -D warnings and
   cargo fmt --check on Linux x86_64/arm64, macOS and Windows.
   Specs: openspec/specs/ describe current user-visible behavior (commands, files written,
   messages, exit codes), not internal Rust types.

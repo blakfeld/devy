@@ -18,6 +18,8 @@ pub(super) struct PackageModule {
     pub(super) nix: &'static str,
     /// Maps a version to a versioned nixpkgs attribute (see `Module::nix_versioned_attr`).
     pub(super) nix_versioned: fn(&str) -> Option<String>,
+    /// Whether the nixpkgs package is unfree (see `Module::nix_unfree`).
+    pub(super) nix_unfree: bool,
 }
 
 /// `PackageModule::nix_versioned` for packages without versioned nixpkgs attributes.
@@ -51,6 +53,10 @@ impl Module for PackageModule {
 
     fn nix_attr(&self, dep: &Dependency) -> Option<String> {
         Some(super::nix_install_attr(self, dep, self.nix))
+    }
+
+    fn nix_unfree(&self) -> bool {
+        self.nix_unfree
     }
 }
 
@@ -235,6 +241,7 @@ pub(super) fn pm_dep(dep: &Dependency, name: &str) -> Dependency {
         shell: None,
         extra: HashMap::new(),
         version_from_lock: dep.version_from_lock,
+        allow_unfree: false,
     }
 }
 

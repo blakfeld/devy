@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn brew_bin_returns_non_empty_path() {
-        let b = Homebrew::default().brew_bin();
+        let b = Homebrew.brew_bin();
         assert!(!b.as_os_str().is_empty(), "brew_bin must not be empty");
         assert!(
             b.to_string_lossy().contains("brew"),
@@ -276,7 +276,7 @@ mod tests {
         let prev = std::env::var("HOMEBREW_PREFIX").ok();
         // SAFETY: serialised by ENV_LOCK; HOMEBREW_PREFIX is only read by brew_bin().
         unsafe { std::env::set_var("HOMEBREW_PREFIX", "/bogus/homebrew") };
-        let result = Homebrew::default().brew_bin();
+        let result = Homebrew.brew_bin();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("HOMEBREW_PREFIX", v),
@@ -302,7 +302,7 @@ mod tests {
         let prev = std::env::var("HOMEBREW_PREFIX").ok();
         // SAFETY: serialised by ENV_LOCK; HOMEBREW_PREFIX is only read by brew_bin().
         unsafe { std::env::set_var("HOMEBREW_PREFIX", "/custom/homebrew") };
-        let result = Homebrew::default().brew_bin();
+        let result = Homebrew.brew_bin();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("HOMEBREW_PREFIX", v),
@@ -320,7 +320,7 @@ mod tests {
         let prev = std::env::var("HOMEBREW_PREFIX").ok();
         // SAFETY: serialised by ENV_LOCK; HOMEBREW_PREFIX is only read by brew_bin().
         unsafe { std::env::remove_var("HOMEBREW_PREFIX") };
-        let result = Homebrew::default().brew_bin();
+        let result = Homebrew.brew_bin();
         unsafe {
             match prev {
                 Some(v) => std::env::set_var("HOMEBREW_PREFIX", v),
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn brew_name_is_brew() {
-        assert_eq!(Homebrew::default().name(), "brew");
+        assert_eq!(Homebrew.name(), "brew");
     }
 
     // ── parse_brew_service_info_json ─────────────────────────────────────────
@@ -392,7 +392,7 @@ mod tests {
         // Homebrew is not installed in CI; ensure_available(false) must return an error
         // mentioning --bootstrap rather than running the installer.
         // If Homebrew happens to be installed in the test environment, skip the assertion.
-        let pm = Homebrew::default();
+        let pm = Homebrew;
         if pm.is_available() {
             return;
         }

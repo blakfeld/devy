@@ -82,6 +82,10 @@ impl Module for VaultModule {
         Some("vault".to_string())
     }
 
+    fn nix_unfree(&self) -> bool {
+        true
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(8200)
     }
@@ -94,7 +98,7 @@ impl Module for VaultModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&pm_dep(dep, package_name(pm)))
+        pm.install_package(&super::pkg_dep(self, pm, dep, package_name(pm)))
     }
 
     fn is_running(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {

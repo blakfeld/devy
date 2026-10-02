@@ -64,13 +64,28 @@ The flake export SHALL set `description = "<name> development environment"`, tak
 - **WHEN** `devy.yml` has no `name` and the user runs `devy export`
 - **THEN** the flake description is `project development environment` and the shellHook echoes `Entered project dev shell`
 
-### Requirement: Generated files end with stray closing braces
-Both export formats SHALL currently emit extra closing braces at the end of the file, so neither output is valid Nix. `shell.nix` ends with `}}` (one stray `}`) after the `shellHook`. `flake.nix` ends with `};`, `}});`, `}};` and `}}`, three more `}` than the expression opens.
+### Requirement: Generated files are valid Nix
+Both export formats SHALL emit balanced braces, so each file parses as a Nix expression. `shell.nix` ends with a single `}` after the `shellHook`. `flake.nix` ends with the lines `          };`, `        });`, `    };` and `}`.
 
-#### Scenario: shell.nix trailing braces
+#### Scenario: shell.nix parses
 - **WHEN** the user runs `devy export --format shell`
-- **THEN** the last line of `shell.nix` is `}}`
+- **THEN** the last line of `shell.nix` is `}`, and `nix-instantiate --parse shell.nix` succeeds
 
-#### Scenario: flake.nix trailing braces
+#### Scenario: flake.nix parses
 - **WHEN** the user runs `devy export`
-- **THEN** `flake.nix` ends with the lines `          };`, `        }});`, `    }};` and `}}`
+- **THEN** `flake.nix` ends with the lines `          };`, `        });`, `    };` and `}`, and `nix-instantiate --parse flake.nix` succeeds
+
+### Requirement: Unfree packages allowed in exports
+When the export lists packages whose modules declare them unfree, the generated file SHALL import nixpkgs with an `allowUnfreePredicate` that permits exactly those packages by name, so the shell evaluates without global configuration. In `flake.nix` this means importing nixpkgs per system, instead of using `legacyPackages`. In `shell.nix` it means the default `pkgs` argument. When no listed package is unfree, the output MUST be unchanged.
+
+#### Scenario: Flake with MongoDB
+- **WHEN** `dependencies` contains `mongodb` and the user runs `devy export`
+- **THEN** `flake.nix` imports nixpkgs with an `allowUnfreePredicate` that allows `mongodb-ce` and no other unfree package, and `nix flake check` can evaluate the dev shell
+
+#### Scenario: shell.nix with Vault
+- **WHEN** `dependencies` contains `vault` and the user runs `devy export --format shell`
+- **THEN** `shell.nix` begins with a `pkgs ? import <nixpkgs> { config.allowUnfreePredicate = … }` argument that allows `vault`
+
+#### Scenario: No unfree packages
+- **WHEN** `dependencies` contains only `redis` and `node`
+- **THEN** the export is identical to the output without this requirement
