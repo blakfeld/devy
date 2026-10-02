@@ -257,6 +257,7 @@ pub(crate) fn apply_lock(dep: &Dependency, lock: Option<&LockFile>) -> Dependenc
         return Dependency {
             version: locked.resolved_version.clone(),
             version_from_lock: true,
+            allow_unfree: false,
             ..dep.clone()
         };
     }
@@ -595,6 +596,7 @@ mod tests {
             shell: Some("not-a-shell".into()),
             extra: HashMap::new(),
             version_from_lock: false,
+            allow_unfree: false,
         };
         let result = install_binary(&pm, &dep, &dir);
         assert!(
@@ -616,6 +618,7 @@ mod tests {
             shell: Some("sh".into()),
             extra: HashMap::new(),
             version_from_lock: false,
+            allow_unfree: false,
         };
         install_binary(&pm, &dep, &dir).unwrap();
         assert!(

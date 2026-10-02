@@ -392,6 +392,7 @@ mod tests {
             shell: None,
             extra: std::collections::HashMap::new(),
             version_from_lock: false,
+            allow_unfree: false,
         };
         let pm = MockPackageManager::default();
         // Only assert if the version is actually installed — this is an environment check.
@@ -419,6 +420,7 @@ mod tests {
             shell: None,
             extra: std::collections::HashMap::new(),
             version_from_lock: false,
+            allow_unfree: false,
         };
         assert_eq!(winget_package_id(&dep), "RubyInstallerTeam.Ruby.4");
     }
@@ -446,6 +448,7 @@ mod tests {
             shell: None,
             extra: std::collections::HashMap::new(),
             version_from_lock: false,
+            allow_unfree: false,
         };
         let ver = RubyModule.resolved_version(&pm, &dep).unwrap();
         assert_eq!(

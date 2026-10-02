@@ -12,7 +12,7 @@ pub struct MongodbModule;
 
 // brew requires the mongodb/brew tap; users should add `tap: mongodb/brew` in devy.yml.
 // nix: mongodb-ce is the prebuilt binary package (mongodb builds from source). Both are
-// unfree, so installing needs NIXPKGS_ALLOW_UNFREE=1.
+// unfree; `nix_unfree` lets the nix backend allow that for this install.
 fn package_name(pm: &dyn PackageManager) -> &'static str {
     match pm.name() {
         "apt" => "mongodb-org",
@@ -33,6 +33,10 @@ impl Module for MongodbModule {
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
         Some("mongodb-ce".to_string())
+    }
+
+    fn nix_unfree(&self) -> bool {
+        true
     }
 
     fn nix_launch(
@@ -66,7 +70,7 @@ impl Module for MongodbModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&pm_dep(dep, package_name(pm)))
+        pm.install_package(&super::pkg_dep(self, pm, dep, package_name(pm)))
     }
 
     fn service_name<'a>(&self, _dep: &'a Dependency) -> Cow<'a, str> {

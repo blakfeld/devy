@@ -183,6 +183,7 @@ mod tests {
             shell: None,
             extra,
             version_from_lock: false,
+            allow_unfree: false,
         }
     }
 

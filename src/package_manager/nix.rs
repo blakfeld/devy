@@ -181,6 +181,46 @@ fn install_priority(attr: &str) -> Option<u32> {
     (attr == "mariadb" || attr.starts_with("mariadb_")).then_some(4)
 }
 
+/// The arguments (after the binary) and extra environment for installing `attr`.
+/// `allow_unfree` sets `NIXPKGS_ALLOW_UNFREE=1` on this one child; flake references
+/// evaluate purely, so the profile style also needs `--impure` to see it.
+#[derive(Debug, PartialEq, Eq)]
+struct InstallCmd {
+    args: Vec<String>,
+    env: Vec<(&'static str, &'static str)>,
+}
+
+fn install_cmd(style: NixStyle, profile: &Path, attr: &str, allow_unfree: bool) -> InstallCmd {
+    let profile = profile.to_string_lossy().into_owned();
+    let mut args = match style {
+        NixStyle::Profile => vec![
+            "profile".into(),
+            "install".into(),
+            "--profile".into(),
+            profile,
+        ],
+        NixStyle::Env => vec!["--profile".into(), profile],
+    };
+    if style == NixStyle::Profile {
+        if let Some(p) = install_priority(attr) {
+            args.extend(["--priority".into(), p.to_string()]);
+        }
+        if allow_unfree {
+            args.push("--impure".into());
+        }
+    }
+    match style {
+        NixStyle::Profile => args.push(format!("nixpkgs#{attr}")),
+        NixStyle::Env => args.extend(["-iA".into(), format!("nixpkgs.{attr}")]),
+    }
+    let env = if allow_unfree {
+        vec![("NIXPKGS_ALLOW_UNFREE", "1")]
+    } else {
+        Vec::new()
+    };
+    InstallCmd { args, env }
+}
+
 // ── nix-env (legacy) helpers ──────────────────────────────────────────────────
 
 fn env_list_json(nix_env_bin: &Path, profile_path: &Path) -> Result<serde_json::Value> {
@@ -666,53 +706,38 @@ impl PackageManager for NixPackageManager {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
-        match self.effective_style() {
-            NixStyle::Profile => {
-                let attr = format!("nixpkgs#{}", dep.name);
-                let priority = install_priority(&dep.name);
-                let priority_args = match priority {
-                    Some(p) => vec!["--priority".to_string(), p.to_string()],
-                    None => vec![],
-                };
-                output::step(&format!(
-                    "nix profile install {attr}{}",
-                    priority_args
-                        .iter()
-                        .fold(String::new(), |acc, a| format!("{acc} {a}"))
-                ));
-                let status = Command::new(self.nix_bin())
-                    .args(["profile", "install", "--profile"])
-                    .arg(&self.profile_path)
-                    .args(&priority_args)
-                    .arg(&attr)
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status()
-                    .with_context(|| format!("Failed to run: nix profile install {attr}"))?;
-                if !status.success() {
-                    bail!("`nix profile install {attr}` failed — check output above");
-                }
-                Ok(())
-            }
-            NixStyle::Env => {
-                let attr = format!("nixpkgs.{}", dep.name);
-                output::step(&format!("nix-env -iA {attr}"));
-                let status = Command::new(self.nix_env_bin())
-                    .args(["--profile"])
-                    .arg(&self.profile_path)
-                    .args(["-iA", &attr])
-                    .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status()
-                    .with_context(|| format!("Failed to run: nix-env -iA {attr}"))?;
-                if !status.success() {
-                    bail!("`nix-env -iA {attr}` failed — check output above");
-                }
-                Ok(())
-            }
+        let style = self.effective_style();
+        let cmd = install_cmd(style, &self.profile_path, &dep.name, dep.allow_unfree);
+        // The step line omits `--profile <path>`, which is the same for every install.
+        let (bin, shown) = match style {
+            NixStyle::Profile => (
+                self.nix_bin(),
+                format!("nix profile install {}", cmd.args[4..].join(" ")),
+            ),
+            NixStyle::Env => (
+                self.nix_env_bin(),
+                format!("nix-env {}", cmd.args[2..].join(" ")),
+            ),
+        };
+        if dep.allow_unfree {
+            output::info(&format!(
+                "{0}: nixpkgs#{0} is unfree — allowing unfree packages for this install",
+                dep.name
+            ));
         }
+        output::step(&shown);
+        let status = Command::new(bin)
+            .args(&cmd.args)
+            .envs(cmd.env.iter().copied())
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("Failed to run: {shown}"))?;
+        if !status.success() {
+            bail!("`{shown}` failed — check output above");
+        }
+        Ok(())
     }
 
     fn is_service_running(&self, name: &str) -> Result<bool> {
@@ -1116,6 +1141,65 @@ mod tests {
         assert_eq!(install_priority("mariadb_114"), Some(4));
         assert_eq!(install_priority("mysql84"), None);
         assert_eq!(install_priority("redis"), None);
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn install_cmd_profile_style() {
+        let p = Path::new("/p/.devy/nix-profile");
+        assert_eq!(
+            install_cmd(NixStyle::Profile, p, "redis", false),
+            InstallCmd {
+                args: strs(&[
+                    "profile",
+                    "install",
+                    "--profile",
+                    "/p/.devy/nix-profile",
+                    "nixpkgs#redis"
+                ]),
+                env: vec![],
+            }
+        );
+        assert_eq!(
+            install_cmd(NixStyle::Profile, p, "mongodb-ce", true),
+            InstallCmd {
+                args: strs(&[
+                    "profile",
+                    "install",
+                    "--profile",
+                    "/p/.devy/nix-profile",
+                    "--impure",
+                    "nixpkgs#mongodb-ce",
+                ]),
+                env: vec![("NIXPKGS_ALLOW_UNFREE", "1")],
+            }
+        );
+        assert_eq!(
+            install_cmd(NixStyle::Profile, p, "mariadb", false).args[4..],
+            strs(&["--priority", "4", "nixpkgs#mariadb"])
+        );
+    }
+
+    #[test]
+    fn install_cmd_env_style() {
+        let p = Path::new("/p/.devy/nix-profile");
+        assert_eq!(
+            install_cmd(NixStyle::Env, p, "redis", false),
+            InstallCmd {
+                args: strs(&["--profile", "/p/.devy/nix-profile", "-iA", "nixpkgs.redis"]),
+                env: vec![],
+            }
+        );
+        assert_eq!(
+            install_cmd(NixStyle::Env, p, "vault", true),
+            InstallCmd {
+                args: strs(&["--profile", "/p/.devy/nix-profile", "-iA", "nixpkgs.vault"]),
+                env: vec![("NIXPKGS_ALLOW_UNFREE", "1")],
+            }
+        );
     }
 
     #[test]

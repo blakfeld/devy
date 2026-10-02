@@ -42,6 +42,10 @@ impl Module for ElasticsearchModule {
         Some("elasticsearch".to_string())
     }
 
+    fn nix_unfree(&self) -> bool {
+        true
+    }
+
     fn default_port(&self) -> Option<u16> {
         Some(9200)
     }
@@ -54,7 +58,7 @@ impl Module for ElasticsearchModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&pm_dep(dep, package_name(pm)))
+        pm.install_package(&super::pkg_dep(self, pm, dep, package_name(pm)))
     }
 
     fn is_running(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
@@ -133,6 +137,7 @@ mod tests {
             shell: None,
             extra,
             version_from_lock: false,
+            allow_unfree: false,
         }
     }
 
