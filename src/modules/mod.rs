@@ -273,9 +273,11 @@ pub(crate) fn pkg_dep(
     }
 }
 
-/// Installed check for `pkg_dep`. A version pinned from devy.lock is also satisfied by
-/// the unversioned attribute already installed at exactly that version, so the package
-/// an earlier `devy up` installed isn't reinstalled under its versioned name.
+/// Installed check for `pkg_dep`. Nix installs attributes, not exact versions, so a
+/// version pinned from devy.lock is also satisfied by the unversioned attribute when its
+/// installed version maps to the same versioned attribute. The package an earlier
+/// `devy up` installed (or a teammate's newer patch) then isn't reinstalled under its
+/// versioned name.
 pub(crate) fn pkg_installed(
     module: &dyn Module,
     pm: &dyn PackageManager,
@@ -288,9 +290,31 @@ pub(crate) fn pkg_installed(
     }
     if dep.version_from_lock && target.name != name {
         let installed = pm.resolved_version(&pm_dep(dep, name))?;
-        return Ok(installed.is_some() && installed == dep.version);
+        return Ok(installed
+            .and_then(|v| module.nix_versioned_attr(&v))
+            .is_some_and(|attr| attr == target.name));
     }
     Ok(false)
+}
+
+/// Resolved version for `pkg_dep`, recorded in devy.lock. Under nix this is the version of
+/// the attribute devy installs, falling back to the unversioned `name`; other backends
+/// query the `devy.yml` name.
+pub(crate) fn pkg_resolved_version(
+    module: &dyn Module,
+    pm: &dyn PackageManager,
+    dep: &Dependency,
+    name: &str,
+) -> Result<Option<String>> {
+    if pm.name() != "nix" {
+        return pm.resolved_version(dep);
+    }
+    let target = pkg_dep(module, pm, dep, name);
+    match pm.resolved_version(&target)? {
+        Some(v) => Ok(Some(v)),
+        None if target.name != name => pm.resolved_version(&pm_dep(dep, name)),
+        None => Ok(None),
+    }
 }
 
 /// Warning for a `devy.yml` version the nix backend can't honor. Versions pinned from
@@ -1572,6 +1596,109 @@ mod tests {
                 .unwrap(),
             "a different locked version is not satisfied"
         );
+    }
+
+    #[test]
+    fn lock_pinned_version_satisfied_at_attribute_granularity() {
+        use crate::package_manager::MockPackageManager;
+        // A teammate on newer nixpkgs locked 24.21.0; this profile has nodejs 24.20.0.
+        let pm = MockPackageManager {
+            name: "nix",
+            installed_pkg: Some("nodejs"),
+            version: Some("24.20.0".into()),
+            ..Default::default()
+        };
+        let node = get("node");
+        assert!(
+            node.is_installed(&pm, &versioned("node", "24.21.0", true))
+                .unwrap(),
+            "same versioned attribute (nodejs_24) counts as installed"
+        );
+        assert!(
+            !node
+                .is_installed(&pm, &versioned("node", "22.1.0", true))
+                .unwrap(),
+            "a lock pinned to nodejs_22 is not satisfied by nodejs 24"
+        );
+        assert!(
+            !node
+                .is_installed(&pm, &versioned("node", "24.21.0", false))
+                .unwrap(),
+            "an explicit version still needs the versioned attribute"
+        );
+    }
+
+    #[test]
+    fn nix_resolved_version_queries_install_attr_then_unversioned() {
+        use crate::package_manager::MockPackageManager;
+        let nix = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        let node = get("node");
+        assert_eq!(
+            node.resolved_version(&nix, &versioned("node", "22", false))
+                .unwrap(),
+            None
+        );
+        assert_eq!(*nix.version_queries.borrow(), vec!["nodejs_22", "nodejs"]);
+
+        let nix = MockPackageManager {
+            name: "nix",
+            installed_pkg: Some("nodejs"),
+            version: Some("24.20.0".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            node.resolved_version(&nix, &Dependency::simple("node"))
+                .unwrap(),
+            Some("24.20.0".into())
+        );
+        assert_eq!(*nix.version_queries.borrow(), vec!["nodejs"]);
+
+        let brew = MockPackageManager {
+            name: "brew",
+            ..Default::default()
+        };
+        node.resolved_version(&brew, &versioned("node", "22", false))
+            .unwrap();
+        assert_eq!(*brew.version_queries.borrow(), vec!["node"]);
+
+        let brew = MockPackageManager {
+            name: "brew",
+            ..Default::default()
+        };
+        get("mongodb")
+            .resolved_version(&brew, &Dependency::simple("mongodb"))
+            .unwrap();
+        assert_eq!(*brew.version_queries.borrow(), vec!["mongodb"]);
+    }
+
+    #[test]
+    fn nix_resolved_version_uses_mapped_attrs() {
+        use crate::package_manager::MockPackageManager;
+        for (name, attr) in [
+            ("python", "python3"),
+            ("java", "jdk21"),
+            ("dotnet", "dotnet-sdk_8"),
+            ("mysql", "mysql84"),
+            ("typescript", "nodejs"),
+            ("mongodb", "mongodb-ce"),
+        ] {
+            let nix = MockPackageManager {
+                name: "nix",
+                installed_pkg: Some(attr),
+                version: Some("1.2.3".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                get(name)
+                    .resolved_version(&nix, &Dependency::simple(name))
+                    .unwrap(),
+                Some("1.2.3".into()),
+                "{name} should query {attr}"
+            );
+        }
     }
 
     #[test]

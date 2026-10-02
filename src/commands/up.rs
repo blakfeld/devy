@@ -373,7 +373,13 @@ pub(crate) fn write_lock(
     let mut locked = BTreeMap::new();
     for dep in deps {
         let module = modules::get(&dep.name);
-        let resolved = module.resolved_version(pm, dep)?;
+        // Nix installs attributes, not exact versions: keep a version pinned from the lock so
+        // teammates on different nixpkgs revisions don't rewrite each other's patch versions.
+        let resolved = if pm.name() == "nix" && dep.version_from_lock {
+            dep.version.clone()
+        } else {
+            module.resolved_version(pm, dep)?
+        };
         // Only record ports the backend actually applies; others always use the default.
         let assigned_port = module
             .port_key()
@@ -752,6 +758,97 @@ mod tests {
         );
     }
 
+    /// Sets `path`'s mtime an hour back and returns it, so a later rewrite is detectable.
+    fn backdate(path: &Path) -> std::time::SystemTime {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        std::fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    fn locked_node(version: &str, source: &str) -> LockFile {
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            "node".into(),
+            crate::lock::LockedDep {
+                resolved_version: Some(version.into()),
+                source: source.into(),
+                assigned_port: None,
+            },
+        );
+        LockFile {
+            dependencies: deps,
+            ..Default::default()
+        }
+    }
+
+    fn lock_pinned_node(version: &str) -> Dependency {
+        Dependency {
+            version: Some(version.into()),
+            version_from_lock: true,
+            ..Dependency::simple("node")
+        }
+    }
+
+    fn locked_version(path: &Path, name: &str) -> Option<String> {
+        LockFile::load(path)
+            .unwrap()
+            .unwrap()
+            .get(name)
+            .unwrap()
+            .resolved_version
+            .clone()
+    }
+
+    #[test]
+    fn write_lock_keeps_lock_pinned_version_under_nix() {
+        let path = tmp_path();
+        locked_node("24.20.0", "nix").write(&path).unwrap();
+        let mtime = backdate(&path);
+        let pm = MockPackageManager {
+            name: "nix",
+            version: Some("24.21.0".into()),
+            ..Default::default()
+        };
+        write_lock(&[lock_pinned_node("24.20.0")], &pm, &path).unwrap();
+        assert_eq!(locked_version(&path, "node").as_deref(), Some("24.20.0"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime,
+            "the lock must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn write_lock_records_installed_version_for_other_backends() {
+        let path = tmp_path();
+        let pm = MockPackageManager {
+            name: "brew",
+            version: Some("24.21.0".into()),
+            ..Default::default()
+        };
+        write_lock(&[lock_pinned_node("24.20.0")], &pm, &path).unwrap();
+        assert_eq!(locked_version(&path, "node").as_deref(), Some("24.21.0"));
+    }
+
+    #[test]
+    fn write_lock_records_installed_version_without_pin_under_nix() {
+        // `--update` skips the lock, so nothing is pinned.
+        let path = tmp_path();
+        locked_node("24.20.0", "nix").write(&path).unwrap();
+        let pm = MockPackageManager {
+            name: "nix",
+            version: Some("24.21.0".into()),
+            ..Default::default()
+        };
+        write_lock(&[Dependency::simple("node")], &pm, &path).unwrap();
+        assert_eq!(locked_version(&path, "node").as_deref(), Some("24.21.0"));
+    }
+
     // ── merge_env ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -1052,6 +1149,51 @@ mod tests {
         );
         // Suppress unused-variable warning for warn_count; we just want the run to succeed.
         let _ = warn_count;
+    }
+
+    #[test]
+    fn up_impl_twice_under_nix_installs_nothing_and_keeps_lock() {
+        let dir = crate::test_support::tmp_dir();
+        let lock = tmp_path();
+        let config = make_config(&["node"], HashMap::new());
+        // The profile has the unversioned `nodejs` attribute, reporting its version.
+        let pm = MockPackageManager {
+            name: "nix",
+            installed_pkg: Some("nodejs"),
+            version: Some("24.20.0".into()),
+            ..Default::default()
+        };
+        let env_mgr = MockEnvManager::default();
+        let run = || {
+            up_impl(
+                &config,
+                &pm,
+                &env_mgr,
+                UpOptions {
+                    update: false,
+                    bootstrap: false,
+                },
+                &dir,
+                &lock,
+            )
+            .unwrap()
+        };
+
+        run();
+        assert_eq!(locked_version(&lock, "node").as_deref(), Some("24.20.0"));
+        let mtime = backdate(&lock);
+
+        run();
+        assert!(
+            pm.installed_packages.borrow().is_empty(),
+            "nothing must be installed: {:?}",
+            pm.installed_packages.borrow()
+        );
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().modified().unwrap(),
+            mtime,
+            "the second run must not rewrite the lock"
+        );
     }
 
     #[test]

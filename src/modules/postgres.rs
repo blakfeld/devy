@@ -52,6 +52,14 @@ impl Module for PostgresModule {
         super::pkg_installed(self, pm, dep, package_name(pm))
     }
 
+    fn resolved_version(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+    ) -> Result<Option<String>> {
+        super::pkg_resolved_version(self, pm, dep, package_name(pm))
+    }
+
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
         pm.install_package(&super::pkg_dep(self, pm, dep, package_name(pm)))
     }

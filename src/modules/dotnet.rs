@@ -68,6 +68,14 @@ impl Module for DotnetModule {
         pm.is_package_installed(&pm_dep(dep, &name))
     }
 
+    fn resolved_version(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+    ) -> Result<Option<String>> {
+        super::pkg_resolved_version(self, pm, dep, NIX_DEFAULT_SDK)
+    }
+
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
         let name = package_name(pm, dep);
         pm.install_package(&pm_dep(dep, &name))

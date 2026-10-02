@@ -113,21 +113,48 @@ fn profile_list_json(nix_bin: &Path, profile_path: &Path) -> Result<serde_json::
     serde_json::from_slice(&out.stdout).context("Failed to parse `nix profile list --json` output")
 }
 
-/// Finds the profile entry for nixpkgs attribute `attr` and returns its version
-/// (`"unknown"` when the entry doesn't record one).
+/// Finds the profile entry for nixpkgs attribute `attr`: `Some` when it's installed,
+/// holding its version when one is known.
 ///
 /// Entries are matched on the exact attribute devy installed (the last component of
 /// `attrPath`), so `nodejs_22` and `nodejs` are different packages, and mapped names like
 /// `mysql84` (pname `mysql`) or `jdk21` (pname `openjdk`) are recognized. Entries without
 /// an `attrPath` fall back to `pname`, then to the element name.
-fn profile_find_pkg(json: &serde_json::Value, attr: &str) -> Option<String> {
+///
+/// The version is the entry's `version` field, or (Nix ≥ 2.20 records none) the one
+/// derived from its store paths.
+fn profile_find_pkg(json: &serde_json::Value, attr: &str) -> Option<Option<String>> {
     profile_find_entry(json, attr).map(|entry| {
-        entry
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string()
+        if let Some(v) = entry.get("version").and_then(|v| v.as_str()) {
+            return Some(v.to_string());
+        }
+        let paths: Vec<&str> = entry
+            .get("storePaths")
+            .and_then(|p| p.as_array())
+            .map(|a| a.iter().filter_map(|p| p.as_str()).collect())
+            .unwrap_or_default();
+        version_from_store_paths(&paths)
     })
+}
+
+/// The version in the name of an entry's main output store path, split the way Nix's
+/// `parseDrvName` does: at the first `-` followed by a digit. The main output is the
+/// name that prefixes every other output's name (`mysql-8.4.11`, not
+/// `mysql-8.4.11-man`). `None` when there's no main output or its name has no version.
+fn version_from_store_paths(paths: &[&str]) -> Option<String> {
+    // `/nix/store/<hash>-<name>`; hashes never contain `-`.
+    let names: Vec<&str> = paths
+        .iter()
+        .filter_map(|p| p.rsplit('/').next()?.split_once('-').map(|(_, n)| n))
+        .collect();
+    let main = names
+        .iter()
+        .find(|n| names.iter().all(|other| other.starts_with(**n)))?;
+    let split = main
+        .char_indices()
+        .find(|&(i, c)| c == '-' && main[i + 1..].starts_with(|d: char| d.is_ascii_digit()))?
+        .0;
+    Some(main[split + 1..].to_string())
 }
 
 /// The profile entry for nixpkgs attribute `attr` (see `profile_find_pkg` for matching).
@@ -757,7 +784,9 @@ impl NixPackageManager {
             .find(|bin| bin.is_dir())
     }
 
-    fn query_version(&self, dep: &Dependency) -> Result<Option<String>> {
+    /// `Some` when `dep` is installed in the project profile, holding its version when
+    /// one is known.
+    fn query_version(&self, dep: &Dependency) -> Result<Option<Option<String>>> {
         // Profile symlink doesn't exist yet → nothing installed in it. Guard here
         // to prevent Nix from falling back to the user's global profile, which would
         // cause packages installed globally (but not in this project) to appear installed.
@@ -771,7 +800,7 @@ impl NixPackageManager {
             }
             NixStyle::Env => {
                 let json = env_list_json(&self.nix_env_bin(), &self.profile_path)?;
-                Ok(env_find_pkg(&json, &dep.name))
+                Ok(env_find_pkg(&json, &dep.name).map(Some))
             }
         }
     }
@@ -926,7 +955,7 @@ impl PackageManager for NixPackageManager {
     }
 
     fn resolved_version(&self, dep: &Dependency) -> Result<Option<String>> {
-        self.query_version(dep)
+        self.query_version(dep).map(Option::flatten)
     }
 
     /// Advertises the project-local Nix profile bin dir so shadowenv adds it to PATH.
@@ -1370,7 +1399,7 @@ mod tests {
             {"pname": "git", "version": "2.44.0"},
             {"pname": "redis", "version": "7.2.4"},
         ]);
-        assert_eq!(profile_find_pkg(&json, "redis"), Some("7.2.4".into()));
+        assert_eq!(profile_find_pkg(&json, "redis"), Some(Some("7.2.4".into())));
         assert_eq!(profile_find_pkg(&json, "curl"), None);
     }
 
@@ -1388,7 +1417,7 @@ mod tests {
                 }
             }
         });
-        assert_eq!(profile_find_pkg(&json, "redis"), Some("7.2.4".into()));
+        assert_eq!(profile_find_pkg(&json, "redis"), Some(Some("7.2.4".into())));
         assert_eq!(profile_find_pkg(&json, "curl"), None);
     }
 
@@ -1404,7 +1433,8 @@ mod tests {
                 }
             }
         });
-        assert_eq!(profile_find_pkg(&json, "redis"), Some("unknown".into()));
+        // Installed, but with no version and no store paths to derive one from.
+        assert_eq!(profile_find_pkg(&json, "redis"), Some(None));
         assert_eq!(profile_find_pkg(&json, "curl"), None);
     }
 
@@ -1425,6 +1455,90 @@ mod tests {
             })
             .collect();
         serde_json::json!({ "version": 3, "elements": elements })
+    }
+
+    #[test]
+    fn profile_find_pkg_derives_version_from_v3_store_path() {
+        let json = serde_json::json!({
+            "version": 3,
+            "elements": {
+                "redis": {
+                    "attrPath": "legacyPackages.aarch64-darwin.redis",
+                    "storePaths": ["/nix/store/0123456789abcdfghijklmnpqrsvwxyz-redis-8.6.3"]
+                }
+            }
+        });
+        assert_eq!(profile_find_pkg(&json, "redis"), Some(Some("8.6.3".into())));
+    }
+
+    #[test]
+    fn profile_find_pkg_prefers_explicit_version() {
+        let json = serde_json::json!({
+            "version": 2,
+            "elements": {
+                "redis": {
+                    "attrPath": "legacyPackages.x86_64-linux.redis",
+                    "version": "7.2.4",
+                    "storePaths": ["/nix/store/abc-redis-8.6.3"]
+                }
+            }
+        });
+        assert_eq!(profile_find_pkg(&json, "redis"), Some(Some("7.2.4".into())));
+    }
+
+    #[test]
+    fn resolved_version_is_absent_not_unknown() {
+        // What `resolved_version` reports for an installed entry with no derivable version.
+        let json = serde_json::json!({
+            "version": 3,
+            "elements": {
+                "hello": {
+                    "attrPath": "legacyPackages.x86_64-linux.hello",
+                    "storePaths": ["/nix/store/abc-hello-world"]
+                }
+            }
+        });
+        assert_eq!(profile_find_pkg(&json, "hello"), Some(None));
+        assert_eq!(profile_find_pkg(&json, "hello").flatten(), None);
+    }
+
+    fn store_version(names: &[&str]) -> Option<String> {
+        let paths: Vec<String> = names
+            .iter()
+            .map(|n| format!("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-{n}"))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        version_from_store_paths(&refs)
+    }
+
+    #[test]
+    fn version_from_store_paths_splits_like_parse_drv_name() {
+        assert_eq!(store_version(&["redis-8.6.3"]), Some("8.6.3".into()));
+        assert_eq!(
+            store_version(&["apache-kafka-2.13-4.3.1"]),
+            Some("2.13-4.3.1".into())
+        );
+        assert_eq!(store_version(&["python3-3.14.7"]), Some("3.14.7".into()));
+        assert_eq!(store_version(&["mongodb-ce-8.2.12"]), Some("8.2.12".into()));
+        assert_eq!(store_version(&["awscli2-2.31.5"]), Some("2.31.5".into()));
+    }
+
+    #[test]
+    fn version_from_store_paths_picks_main_output() {
+        assert_eq!(
+            store_version(&["mysql-8.4.11-man", "mysql-8.4.11"]),
+            Some("8.4.11".into())
+        );
+        assert_eq!(
+            store_version(&["python3-3.14.7", "python3-3.14.7-debug"]),
+            Some("3.14.7".into())
+        );
+    }
+
+    #[test]
+    fn version_from_store_paths_without_version_is_none() {
+        assert_eq!(store_version(&["hello-world"]), None);
+        assert_eq!(store_version(&[]), None);
     }
 
     #[test]
@@ -1466,8 +1580,14 @@ mod tests {
                 }
             }
         });
-        assert_eq!(profile_find_pkg(&json, "mysql84"), Some("8.4.11".into()));
-        assert_eq!(profile_find_pkg(&json, "jdk21"), Some("21.0.11".into()));
+        assert_eq!(
+            profile_find_pkg(&json, "mysql84"),
+            Some(Some("8.4.11".into()))
+        );
+        assert_eq!(
+            profile_find_pkg(&json, "jdk21"),
+            Some(Some("21.0.11".into()))
+        );
         assert_eq!(profile_find_pkg(&json, "mysql"), None);
     }
 

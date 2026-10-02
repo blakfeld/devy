@@ -163,8 +163,11 @@ pub struct MockPackageManager {
     pub unfree_packages: std::cell::RefCell<Vec<String>>,
     /// The subset of `installed_packages` installed with `allow_insecure` set.
     pub insecure_packages: std::cell::RefCell<Vec<String>>,
-    /// When set, `resolved_version` returns this value instead of Ok(None).
+    /// When set, `resolved_version` returns this value instead of Ok(None) (only for
+    /// `installed_pkg` when that is set).
     pub version: Option<String>,
+    /// Tracks every package name passed to `resolved_version`.
+    pub version_queries: std::cell::RefCell<Vec<String>>,
     /// When true, `validate_config` returns an error.
     pub validate_config_fails: bool,
     /// Paths returned by `path_prepends`. Defaults to empty.
@@ -191,6 +194,7 @@ impl Default for MockPackageManager {
             unfree_packages: std::cell::RefCell::new(Vec::new()),
             insecure_packages: std::cell::RefCell::new(Vec::new()),
             version: None,
+            version_queries: std::cell::RefCell::new(Vec::new()),
             validate_config_fails: false,
             path_prepends_result: Vec::new(),
         }
@@ -256,7 +260,11 @@ impl PackageManager for MockPackageManager {
             Ok(())
         }
     }
-    fn resolved_version(&self, _: &Dependency) -> Result<Option<String>> {
+    fn resolved_version(&self, dep: &Dependency) -> Result<Option<String>> {
+        self.version_queries.borrow_mut().push(dep.name.clone());
+        if self.installed_pkg.is_some_and(|pkg| dep.name != pkg) {
+            return Ok(None);
+        }
         Ok(self.version.clone())
     }
     fn service_config_dir(&self, _: &str) -> Option<std::path::PathBuf> {
