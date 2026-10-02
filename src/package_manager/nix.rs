@@ -83,6 +83,11 @@ impl NixPackageManager {
     fn effective_style(&self) -> NixStyle {
         *self.style.get_or_init(|| detect_style(&self.nix_bin()))
     }
+
+    /// `<project_root>/.devy/nix-env-attrs.json`, beside the profile.
+    fn env_manifest_path(&self) -> PathBuf {
+        self.profile_path.with_file_name("nix-env-attrs.json")
+    }
 }
 
 /// Probe whether the installed Nix supports `nix profile` (flakes-era CLI).
@@ -269,15 +274,101 @@ fn env_list_json(nix_env_bin: &Path, profile_path: &Path) -> Result<serde_json::
     serde_json::from_slice(&out.stdout).context("Failed to parse `nix-env -q --json` output")
 }
 
-fn env_find_pkg(json: &serde_json::Value, pname: &str) -> Option<String> {
-    json.as_object()?.values().find_map(|entry| {
-        let ep = entry.get("pname")?.as_str()?;
-        if ep == pname {
-            entry.get("version")?.as_str().map(String::from)
-        } else {
-            None
-        }
-    })
+/// Maps each nixpkgs attribute devy installed with `nix-env` to the derivation name that
+/// install produced (`{"mysql84": "mysql-8.4.11"}`). `nix-env -q` doesn't record the
+/// attribute an installed package came from, so this is the only link back to it.
+type EnvManifest = std::collections::BTreeMap<String, String>;
+
+/// A missing, unreadable or malformed manifest reads as empty: lookups then fall back to
+/// matching package names.
+fn read_env_manifest(path: &Path) -> EnvManifest {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Writes `manifest` to a temp file beside `path`, then renames it into place.
+fn write_env_manifest(path: &Path, manifest: &EnvManifest) -> Result<()> {
+    let body = serde_json::to_vec_pretty(manifest).context("Failed to serialize nix-env attrs")?;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    std::fs::write(&tmp, body).with_context(|| format!("Failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("Failed to write {}", path.display()))
+}
+
+/// Finds the `nix-env -q --json` entry for nixpkgs attribute `attr`: `Some` when it's
+/// installed, holding its version when one is known.
+///
+/// When the manifest records `attr`, only an entry with exactly that derivation name
+/// matches. Attributes without a record (profiles from before the manifest) fall back to
+/// matching `pname`, skipping entries another attribute's record claims, so `nodejs_22`'s
+/// install never satisfies `nodejs`.
+fn env_find_attr(
+    json: &serde_json::Value,
+    manifest: &EnvManifest,
+    attr: &str,
+) -> Option<Option<String>> {
+    let entries = json.as_object()?;
+    fn name_of<'a>(key: &'a str, e: &'a serde_json::Value) -> &'a str {
+        e.get("name").and_then(|n| n.as_str()).unwrap_or(key)
+    }
+    let entry = match manifest.get(attr) {
+        Some(name) => entries
+            .iter()
+            .find_map(|(key, e)| (name_of(key, e) == name).then_some(e)),
+        None => entries.iter().find_map(|(key, e)| {
+            let claimed = manifest.values().any(|n| n == name_of(key, e));
+            let pname_matches = e.get("pname").and_then(|p| p.as_str()) == Some(attr);
+            (pname_matches && !claimed).then_some(e)
+        }),
+    }?;
+    Some(
+        entry
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+    )
+}
+
+/// Arguments (after `nix-env`) that print the derivation `attr` would install. They
+/// resolve `nixpkgs.<attr>` exactly as `-iA` does: `<nixpkgs>` from `NIX_PATH` may be a
+/// different revision, whose name would never show up in the profile.
+fn env_query_name_args(attr: &str) -> Vec<String> {
+    vec!["-qaA".into(), format!("nixpkgs.{attr}"), "--json".into()]
+}
+
+/// The derivation name in `nix-env -qaA nixpkgs.<attr> --json` output
+/// (`{"nixpkgs.<attr>": {"name": …}}`).
+fn env_drv_name(json: &serde_json::Value) -> Option<String> {
+    let mut entries = json.as_object()?.values();
+    let entry = entries.next()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    entry.get("name")?.as_str().map(String::from)
+}
+
+/// Runs `install` and, once it succeeds, records `attr` as `name` in the manifest. With
+/// no name (the query failed) any stale record is dropped instead, so later lookups fall
+/// back to matching package names rather than reinstalling forever.
+fn env_install_and_record(
+    manifest_path: &Path,
+    attr: &str,
+    name: Option<String>,
+    install: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    install()?;
+    let mut manifest = read_env_manifest(manifest_path);
+    let changed = match name {
+        Some(name) => manifest.insert(attr.to_string(), name.clone()) != Some(name),
+        None => manifest.remove(attr).is_some(),
+    };
+    if changed {
+        write_env_manifest(manifest_path, &manifest)?;
+    }
+    Ok(())
 }
 
 // ── Service management — shared ───────────────────────────────────────────────
@@ -800,9 +891,25 @@ impl NixPackageManager {
             }
             NixStyle::Env => {
                 let json = env_list_json(&self.nix_env_bin(), &self.profile_path)?;
-                Ok(env_find_pkg(&json, &dep.name).map(Some))
+                let manifest = read_env_manifest(&self.env_manifest_path());
+                Ok(env_find_attr(&json, &manifest, &dep.name))
             }
         }
+    }
+
+    /// The derivation name `nix-env -iA nixpkgs.<attr>` will install, or `None` when the
+    /// query fails (the install then reports the real error).
+    fn env_query_drv_name(&self, attr: &str, env: &[(&str, &str)]) -> Option<String> {
+        let out = Command::new(self.nix_env_bin())
+            .args(env_query_name_args(attr))
+            .envs(env.iter().copied())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        env_drv_name(&serde_json::from_slice(&out.stdout).ok()?)
     }
 }
 
@@ -886,19 +993,28 @@ impl PackageManager for NixPackageManager {
                 dep.name
             ));
         }
-        output::step(&shown);
-        let status = Command::new(bin)
-            .args(&cmd.args)
-            .envs(cmd.env.iter().copied())
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("Failed to run: {shown}"))?;
-        if !status.success() {
-            bail!("`{shown}` failed — check output above");
+        let install = || {
+            output::step(&shown);
+            let status = Command::new(bin)
+                .args(&cmd.args)
+                .envs(cmd.env.iter().copied())
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .with_context(|| format!("Failed to run: {shown}"))?;
+            if !status.success() {
+                bail!("`{shown}` failed — check output above");
+            }
+            Ok(())
+        };
+        match style {
+            NixStyle::Profile => install(),
+            NixStyle::Env => {
+                let name = self.env_query_drv_name(&dep.name, &cmd.env);
+                env_install_and_record(&self.env_manifest_path(), &dep.name, name, install)
+            }
         }
-        Ok(())
     }
 
     fn is_service_running(&self, name: &str) -> Result<bool> {
@@ -1757,13 +1873,174 @@ mod tests {
         );
     }
 
-    #[test]
-    fn env_find_pkg_matches_pname() {
-        let json = serde_json::json!({
-            "redis-7.2.4": {"pname": "redis", "version": "7.2.4"},
-            "git-2.44.0": {"pname": "git", "version": "2.44.0"},
+    // ── nix-env (legacy) style ──
+
+    /// `nix-env -q --json` output for installed packages named `<pname>-<version>`.
+    fn env_profile(names: &[&str]) -> serde_json::Value {
+        let entries = names.iter().map(|name| {
+            let (pname, version) = name.rsplit_once('-').unwrap();
+            let entry = serde_json::json!({"name": name, "pname": pname, "version": version});
+            (name.to_string(), entry)
         });
-        assert_eq!(env_find_pkg(&json, "redis"), Some("7.2.4".into()));
-        assert_eq!(env_find_pkg(&json, "curl"), None);
+        serde_json::Value::Object(entries.collect())
+    }
+
+    fn manifest(pairs: &[(&str, &str)]) -> EnvManifest {
+        pairs
+            .iter()
+            .map(|(a, n)| (a.to_string(), n.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn env_manifest_round_trips() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("nix-env-attrs.json");
+        let m = manifest(&[("mysql84", "mysql-8.4.11"), ("jq", "jq-1.7.1")]);
+        write_env_manifest(&path, &m).unwrap();
+        assert_eq!(read_env_manifest(&path), m);
+    }
+
+    #[test]
+    fn env_manifest_missing_or_malformed_reads_empty() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("nix-env-attrs.json");
+        assert!(read_env_manifest(&path).is_empty());
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(read_env_manifest(&path).is_empty());
+        std::fs::write(&path, r#"["mysql84"]"#).unwrap();
+        assert!(read_env_manifest(&path).is_empty());
+    }
+
+    #[test]
+    fn env_manifest_write_replaces_atomically() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("nix-env-attrs.json");
+        write_env_manifest(&path, &manifest(&[("redis", "redis-7.2.4")])).unwrap();
+        let m = manifest(&[("jq", "jq-1.7.1")]);
+        write_env_manifest(&path, &m).unwrap();
+        assert_eq!(read_env_manifest(&path), m);
+        // Only the manifest is left behind; the temp file was renamed over it.
+        let files: Vec<_> = std::fs::read_dir(&*dir).unwrap().collect();
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn env_find_attr_matches_recorded_renamed_attr() {
+        let json = env_profile(&["mysql-8.4.11"]);
+        let m = manifest(&[("mysql84", "mysql-8.4.11")]);
+        assert_eq!(
+            env_find_attr(&json, &m, "mysql84"),
+            Some(Some("8.4.11".into()))
+        );
+    }
+
+    #[test]
+    fn env_find_attr_versioned_record_does_not_satisfy_unversioned() {
+        let json = env_profile(&["nodejs-22.11.0"]);
+        let m = manifest(&[("nodejs_22", "nodejs-22.11.0")]);
+        assert_eq!(env_find_attr(&json, &m, "nodejs"), None);
+    }
+
+    #[test]
+    fn env_find_attr_falls_back_to_pname_without_record() {
+        let json = env_profile(&["jq-1.7.1", "git-2.44.0"]);
+        let m = EnvManifest::new();
+        assert_eq!(env_find_attr(&json, &m, "jq"), Some(Some("1.7.1".into())));
+        assert_eq!(env_find_attr(&json, &m, "curl"), None);
+    }
+
+    #[test]
+    fn env_find_attr_recorded_name_absent_is_not_installed() {
+        // Recorded, then removed with `nix-env -e redis` (or upgraded by hand).
+        let m = manifest(&[("redis", "redis-7.2.4")]);
+        assert_eq!(
+            env_find_attr(&env_profile(&["jq-1.7.1"]), &m, "redis"),
+            None
+        );
+        // A record pins the exact name: a different redis doesn't fall back to pname.
+        assert_eq!(
+            env_find_attr(&env_profile(&["redis-7.4.0"]), &m, "redis"),
+            None
+        );
+    }
+
+    #[test]
+    fn env_find_attr_version_comes_from_the_recorded_entry() {
+        let json = env_profile(&["python3-3.13.1", "python3-3.12.8"]);
+        let m = manifest(&[("python312", "python3-3.12.8")]);
+        assert_eq!(
+            env_find_attr(&json, &m, "python312"),
+            Some(Some("3.12.8".into()))
+        );
+    }
+
+    #[test]
+    fn env_query_name_args_query_the_attr_from_nixpkgs() {
+        assert_eq!(
+            env_query_name_args("mysql84"),
+            strs(&["-qaA", "nixpkgs.mysql84", "--json"])
+        );
+    }
+
+    #[test]
+    fn env_drv_name_reads_the_single_entry() {
+        let json = serde_json::json!({"mysql84": {"name": "mysql-8.4.11", "pname": "mysql"}});
+        assert_eq!(env_drv_name(&json), Some("mysql-8.4.11".into()));
+        assert_eq!(env_drv_name(&serde_json::json!({})), None);
+        let two = serde_json::json!({"a": {"name": "a-1"}, "b": {"name": "b-1"}});
+        assert_eq!(env_drv_name(&two), None);
+    }
+
+    #[test]
+    fn env_install_records_name_after_success() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("nix-env-attrs.json");
+        env_install_and_record(&path, "mysql84", Some("mysql-8.4.11".into()), || Ok(())).unwrap();
+        assert_eq!(
+            read_env_manifest(&path),
+            manifest(&[("mysql84", "mysql-8.4.11")])
+        );
+    }
+
+    #[test]
+    fn env_install_failure_records_nothing() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("nix-env-attrs.json");
+        let err = env_install_and_record(&path, "mysql84", Some("mysql-8.4.11".into()), || {
+            bail!("install failed")
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "install failed");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn env_install_without_name_drops_stale_record() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("nix-env-attrs.json");
+        let m = manifest(&[("redis", "redis-7.2.4"), ("jq", "jq-1.7.1")]);
+        write_env_manifest(&path, &m).unwrap();
+        env_install_and_record(&path, "redis", None, || Ok(())).unwrap();
+        assert_eq!(read_env_manifest(&path), manifest(&[("jq", "jq-1.7.1")]));
+    }
+
+    #[test]
+    fn env_style_lookup_uses_manifest_and_profile() {
+        // What `query_version` does in the Env style: the manifest file plus the
+        // profile listing decide `is_package_installed` and `resolved_version`.
+        let dir = crate::test_support::tmp_dir();
+        let pm = NixPackageManager::for_project(&dir);
+        let path = pm.env_manifest_path();
+        assert_eq!(path, dir.join(".devy").join("nix-env-attrs.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_env_manifest(&path, &manifest(&[("nodejs_22", "nodejs-22.11.0")])).unwrap();
+
+        let json = env_profile(&["nodejs-22.11.0", "jq-1.7.1"]);
+        let lookup = |attr| env_find_attr(&json, &read_env_manifest(&path), attr);
+        assert!(lookup("nodejs_22").is_some());
+        assert_eq!(lookup("nodejs_22").flatten(), Some("22.11.0".into()));
+        assert!(lookup("nodejs").is_none());
+        assert_eq!(lookup("jq").flatten(), Some("1.7.1".into()));
     }
 }
