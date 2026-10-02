@@ -189,8 +189,10 @@ dependencies:
       version: \"22\"
   - postgresql:
       version: \"16\"
+      service_manager: docker
   - redis:
       version: \"7\"
+      service_manager: docker
 
 environment:
   DATABASE_URL: \"postgres://${POSTGRESQL_HOST}:${POSTGRESQL_PORT}/app\"
@@ -203,8 +205,29 @@ commands:
     let check = proj.run(&["check"]);
     let stderr = String::from_utf8_lossy(&check.stderr);
     assert!(
-        !stderr.contains("unrecognized config key") && !stderr.contains("Failed to parse"),
+        !stderr.contains("unrecognized config key")
+            && !stderr.contains("Failed to parse")
+            && !stderr.contains("apply only to built-in services"),
         "devy check must find no config errors in the generated file; got: {stderr}"
+    );
+}
+
+#[test]
+fn init_detect_keeps_compose_services_native_in_nix_projects() {
+    let proj = node_compose_project();
+    proj.write("flake.nix", "{}\n");
+    assert!(proj.run(&["init", "--detect"]).status.success());
+    let content = std::fs::read_to_string(proj.file("devy.yml")).unwrap();
+    assert!(!content.contains("      service_manager:"), "{content}");
+    assert!(
+        content.contains(
+            "# TODO: compose services are left on the package manager because of `flake.nix`"
+        ),
+        "{content}"
+    );
+    assert!(
+        content.contains("  - postgresql:\n      version: \"16\"\n"),
+        "{content}"
     );
 }
 

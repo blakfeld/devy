@@ -334,10 +334,15 @@ Reads well-known files in the current directory and writes a draft config that s
 | `.ruby-version`, `.python-version` | `ruby` / `python` with its version |
 | `rust-toolchain.toml`, `rust-toolchain` | `rust` (with a version when the channel is one) |
 | `go.mod` `go` directive | `go` with its version |
-| `compose.yaml`, `docker-compose.yml` images | service dependencies (`postgres:16` → `postgresql` version `16`) |
+| `compose.yaml`, `docker-compose.yml` images | service dependencies run as containers (`postgres:16` → `postgresql` version `16`, `service_manager: docker`) |
 | `package.json` `scripts` | `commands`, as `<npm\|yarn\|pnpm\|bun> run <script>` depending on the lockfile |
 | `.env.example`, `.env.sample`, `.env.template` | `environment` |
 | `package.json` `name` | `name` (otherwise the directory name) |
+
+Services found in a compose file get `service_manager: docker`, so they keep running as containers the way the project already runs them (see [Running services with Docker or Podman](#running-services-with-docker-or-podman)). They stay on the package manager instead when:
+
+- the project already manages tools natively, shown by `flake.nix`, `shell.nix`, `default.nix`, `devbox.json`, `Brewfile`, or `use nix` / `use flake` in `.envrc`. A `# TODO:` then points out that `service_manager: docker` is available.
+- the same service was already detected from a version file such as `.tool-versions`.
 
 In `environment`, a value pointing at a detected service on `localhost` / `127.0.0.1` and its default port is rewritten to devy's injected variables, so `DATABASE_URL=postgres://localhost:5432/app` becomes `postgres://${POSTGRESQL_HOST}:${POSTGRESQL_PORT}/app`. Secret-looking values (see [AI features](#ai-features)) are left empty with a `# TODO: set` comment. `.env` and other real dotenv files are never read.
 

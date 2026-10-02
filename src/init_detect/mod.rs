@@ -22,6 +22,8 @@ pub const PLAIN_INIT: &str = "name: my-project\n\ndependencies: []\n";
 pub struct DraftDep {
     pub name: String,
     pub version: Option<String>,
+    /// Rendered as `service_manager: docker`.
+    pub docker: bool,
 }
 
 /// A `devy.yml` under construction. Every list keeps detection order so output is stable.
@@ -49,6 +51,7 @@ impl Draft {
             None => self.deps.push(DraftDep {
                 name: canonical,
                 version,
+                docker: false,
             }),
         }
     }
@@ -102,13 +105,17 @@ impl Draft {
         } else {
             out.push_str("dependencies:\n");
             for dep in &self.deps {
-                match &dep.version {
-                    Some(v) => out.push_str(&format!(
-                        "  - {}:\n      version: {}\n",
-                        scalar(&dep.name),
-                        quoted(v)
-                    )),
-                    None => out.push_str(&format!("  - {}\n", scalar(&dep.name))),
+                let mut keys = Vec::new();
+                if let Some(v) = &dep.version {
+                    keys.push(format!("      version: {}\n", quoted(v)));
+                }
+                if dep.docker {
+                    keys.push("      service_manager: docker\n".to_string());
+                }
+                if keys.is_empty() {
+                    out.push_str(&format!("  - {}\n", scalar(&dep.name)));
+                } else {
+                    out.push_str(&format!("  - {}:\n{}", scalar(&dep.name), keys.concat()));
                 }
             }
         }
@@ -249,6 +256,31 @@ mod tests {
     fn empty_directory_detects_nothing() {
         let dir = fixture(&[]);
         assert_eq!(detect(&dir), Draft::default());
+    }
+
+    #[test]
+    fn docker_flag_renders_service_manager() {
+        let mut draft = Draft::default();
+        draft.add_dep("postgres", Some("16".into()));
+        draft.add_dep("redis", None);
+        for dep in &mut draft.deps {
+            dep.docker = true;
+        }
+        let out = draft.render(DETECT_HEADER);
+        assert!(
+            out.contains(
+                "  - postgresql:\n      version: \"16\"\n      service_manager: docker\n  - redis:\n      service_manager: docker\n"
+            ),
+            "{out}"
+        );
+        let config = parse(&out);
+        let deps = config.normalized_dependencies().unwrap();
+        assert!(deps.iter().all(|d| d.docker), "{deps:?}");
+        assert!(
+            crate::commands::check::static_issues(&config)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
