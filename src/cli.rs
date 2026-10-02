@@ -30,11 +30,20 @@ enum Commands {
         #[arg(long)]
         bootstrap: bool,
     },
-    /// Create an empty devy.yml in the current directory
+    /// Create a devy.yml in the current directory
     Init {
         /// Overwrite an existing devy.yml
         #[arg(long)]
         force: bool,
+        /// Draft devy.yml from project files (version files, compose, package.json, .env.example) without network access
+        #[arg(long, conflicts_with = "ai")]
+        detect: bool,
+        /// Draft devy.yml with Claude from a redacted summary of project files (needs the claude CLI)
+        #[arg(long)]
+        ai: bool,
+        /// With --ai: print exactly what would be sent to the model, then exit without sending it
+        #[arg(long, requires = "ai")]
+        show_context: bool,
     },
     /// List services from devy.yml and their current running status
     Services,
@@ -84,6 +93,16 @@ enum Commands {
     External(Vec<String>),
 }
 
+/// Names of devy's own subcommands, which a `commands:` entry cannot shadow.
+pub(crate) fn builtin_subcommands() -> Vec<String> {
+    use clap::CommandFactory;
+    Cli::command()
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .chain(["help".to_string()])
+        .collect()
+}
+
 impl Cli {
     pub fn run(&self) -> Result<()> {
         match &self.command {
@@ -105,8 +124,20 @@ impl Cli {
                 dry_run: false,
                 bootstrap,
             } => commands::up::run(*update, *bootstrap),
-            Commands::Init { force } => {
-                commands::init::run(*force, std::path::Path::new("devy.yml"))
+            Commands::Init {
+                force,
+                detect,
+                ai,
+                show_context,
+            } => {
+                let mode = match (detect, ai) {
+                    (_, true) => commands::init::Mode::Ai {
+                        show_context: *show_context,
+                    },
+                    (true, false) => commands::init::Mode::Detect,
+                    (false, false) => commands::init::Mode::Plain,
+                };
+                commands::init::run(mode, *force, std::path::Path::new("devy.yml"))
             }
             Commands::Services => commands::service::list(),
             Commands::Start { name } => commands::service::start(name),

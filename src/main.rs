@@ -1,8 +1,10 @@
+mod ai;
 mod cli;
 mod commands;
 mod config;
 mod env_manager;
 mod error;
+mod init_detect;
 mod lock;
 mod modules;
 mod output;
