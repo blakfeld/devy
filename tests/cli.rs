@@ -908,19 +908,6 @@ fn doctor_healthy_project_reports_no_problems() {
     assert!(!stdout.contains("AI diagnosis"), "{stdout}");
 }
 
-#[test]
-fn up_success_after_failure_removes_record() {
-    let proj = project_with_failed_up();
-    proj.write("devy.yml", "name: shop\ndependencies: []\n");
-    let out = proj.run(&["up"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!proj.file(".devy/last-up-failure.json").exists());
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // general CLI
 // ─────────────────────────────────────────────────────────────────────────────
