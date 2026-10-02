@@ -61,6 +61,43 @@ pub struct LaunchSpec {
     /// of the merged profile `bin/`. Needed when another package in the profile wins a
     /// name conflict (mariadb's `bin/mysqld` is a symlink to `mariadbd`).
     pub exec_package: Option<String>,
+    /// Directories copied, once, from the `exec_package`'s store path before init and
+    /// launch, so servers that write into their config dir get a writable copy.
+    pub seed_dirs: Vec<SeedDir>,
+    /// Arguments appended only when a path exists in the `exec_package`'s store path,
+    /// for settings the server rejects when the feature they configure isn't bundled.
+    pub conditional_args: Vec<ConditionalArgs>,
+    /// `(name, path)`: environment variables the nix backend sets to `path` inside the
+    /// `exec_package`'s store path (the store path itself when `path` is empty).
+    pub package_env: Vec<(String, String)>,
+}
+
+/// A package directory the nix backend copies into the project before first launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedDir {
+    /// Path relative to the package's store root (e.g. `config`).
+    pub from_package: String,
+    /// Destination; copied only while it doesn't exist, so user edits are kept.
+    pub to: PathBuf,
+    /// Applied to the copy when it's first made, never on later starts.
+    pub rewrites: Vec<SeedRewrite>,
+}
+
+/// A plain text replacement in one copied file; skipped when the file doesn't exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedRewrite {
+    /// Path relative to the seeded directory (e.g. `jvm.options`).
+    pub file: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// Launch arguments that apply only when `package_path` exists in the package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionalArgs {
+    /// Path relative to the package's store root (e.g. `plugins/opensearch-security`).
+    pub package_path: String,
+    pub args: Vec<String>,
 }
 
 impl LaunchSpec {
@@ -72,6 +109,9 @@ impl LaunchSpec {
             init: None,
             working_dir: None,
             exec_package: None,
+            seed_dirs: Vec::new(),
+            conditional_args: Vec::new(),
+            package_env: Vec::new(),
         }
     }
 }
@@ -146,20 +186,56 @@ pub(crate) fn start_via_pm(
 }
 
 /// Launch spec shared by Elasticsearch and OpenSearch, which take the same `-E` settings.
-pub(crate) fn search_server_launch(exec: &str, port: u16, data_dir: &Path) -> LaunchSpec {
-    LaunchSpec::new(
-        exec,
-        [
-            "-E".to_string(),
-            "http.host=127.0.0.1".to_string(),
-            "-E".to_string(),
-            format!("http.port={port}"),
-            "-E".to_string(),
-            format!("path.data={}", path_arg(&data_dir.join("data"))),
-            "-E".to_string(),
-            format!("path.logs={}", path_arg(&data_dir.join("logs"))),
-        ],
-    )
+/// Both write into their config dir (keystore, generated settings), so the nix backend
+/// seeds a writable copy of the package's `config/` at `<data_dir>/config`, named by
+/// `conf_env` (`ES_PATH_CONF` / `OPENSEARCH_PATH_CONF`). Creates `<data_dir>/logs`.
+pub(crate) fn search_server_launch(
+    exec: &str,
+    attr: String,
+    conf_env: &str,
+    port: u16,
+    data_dir: &Path,
+) -> Result<LaunchSpec> {
+    let config_dir = data_dir.join("config");
+    let data = path_arg(&data_dir.join("data"));
+    let logs_dir = data_dir.join("logs");
+    let logs = path_arg(&logs_dir);
+    // The JVM opens its GC log before the server creates `path.logs`.
+    std::fs::create_dir_all(&logs_dir)
+        .with_context(|| format!("Failed to create {}", logs_dir.display()))?;
+    // The package's start script runs from its store directory, so the stock
+    // `jvm.options` paths relative to it (GC log, error file, heap dump) are read-only.
+    let jvm_rewrite = |from: &str, to: String| SeedRewrite {
+        file: "jvm.options".into(),
+        from: from.into(),
+        to,
+    };
+    Ok(LaunchSpec {
+        env: vec![(conf_env.to_string(), path_arg(&config_dir))],
+        exec_package: Some(attr),
+        seed_dirs: vec![SeedDir {
+            from_package: "config".into(),
+            to: config_dir,
+            rewrites: vec![
+                jvm_rewrite("=logs/", format!("={logs}/")),
+                jvm_rewrite(":logs/", format!(":{logs}/")),
+                jvm_rewrite("-XX:HeapDumpPath=data", format!("-XX:HeapDumpPath={data}")),
+            ],
+        }],
+        ..LaunchSpec::new(
+            exec,
+            [
+                "-E".to_string(),
+                "http.host=127.0.0.1".to_string(),
+                "-E".to_string(),
+                format!("http.port={port}"),
+                "-E".to_string(),
+                format!("path.data={data}"),
+                "-E".to_string(),
+                format!("path.logs={logs}"),
+            ],
+        )
+    })
 }
 
 /// A path as a double-quoted string for nginx/HCL-style config files.
@@ -178,7 +254,8 @@ pub(crate) fn nix_install_attr(module: &dyn Module, dep: &Dependency, unversione
 }
 
 /// `pm_dep` for `name`, except that under nix the versioned attribute is installed when
-/// `dep.version` maps to one, and unfree is allowed when the module declares it.
+/// `dep.version` maps to one, and unfree or insecure packages are allowed when the module
+/// declares them.
 pub(crate) fn pkg_dep(
     module: &dyn Module,
     pm: &dyn PackageManager,
@@ -188,6 +265,7 @@ pub(crate) fn pkg_dep(
     if pm.name() == "nix" {
         Dependency {
             allow_unfree: module.nix_unfree(),
+            allow_insecure: module.nix_insecure(),
             ..pm_dep(dep, &nix_install_attr(module, dep, name))
         }
     } else {
@@ -336,6 +414,12 @@ pub trait Module: Sync {
     /// Whether this module's nixpkgs package is unfree. The nix backend then allows
     /// unfree packages for that one install, and `devy export` allowlists it.
     fn nix_unfree(&self) -> bool {
+        false
+    }
+
+    /// Whether nixpkgs marks this module's package insecure. The nix backend then
+    /// allows insecure packages for that one install, and `devy export` allowlists it.
+    fn nix_insecure(&self) -> bool {
         false
     }
 
@@ -1040,24 +1124,67 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn search_servers_launch_with_settings() {
-        for name in ["elasticsearch", "opensearch"] {
-            let d = Path::new("/p/d");
-            let spec = launch(name, &with_extra(name, &[("port", num(51005))]), d);
+        for (name, conf_env, extra) in [
+            (
+                "elasticsearch",
+                "ES_PATH_CONF",
+                &["-E", "xpack.ml.enabled=false"][..],
+            ),
+            ("opensearch", "OPENSEARCH_PATH_CONF", &[][..]),
+        ] {
+            let dir = crate::test_support::tmp_dir();
+            let d = path_arg(&dir);
+            let spec = launch(name, &with_extra(name, &[("port", num(51005))]), &dir);
             assert_eq!(spec.exec, name);
+            let mut args = s(&[
+                "-E",
+                "http.host=127.0.0.1",
+                "-E",
+                "http.port=51005",
+                "-E",
+                &format!("path.data={d}/data"),
+                "-E",
+                &format!("path.logs={d}/logs"),
+            ]);
+            args.extend(s(extra));
+            assert_eq!(spec.args, args, "{name}");
+            assert_eq!(spec.exec_package.as_deref(), Some(name));
+            let rewrite = |from: &str, to: String| SeedRewrite {
+                file: "jvm.options".into(),
+                from: from.into(),
+                to,
+            };
             assert_eq!(
-                spec.args,
-                s(&[
-                    "-E",
-                    "http.host=127.0.0.1",
-                    "-E",
-                    "http.port=51005",
-                    "-E",
-                    "path.data=/p/d/data",
-                    "-E",
-                    "path.logs=/p/d/logs",
-                ])
+                spec.seed_dirs,
+                [SeedDir {
+                    from_package: "config".into(),
+                    to: dir.join("config"),
+                    rewrites: vec![
+                        rewrite("=logs/", format!("={d}/logs/")),
+                        rewrite(":logs/", format!(":{d}/logs/")),
+                        rewrite(
+                            "-XX:HeapDumpPath=data",
+                            format!("-XX:HeapDumpPath={d}/data")
+                        ),
+                    ],
+                }]
             );
+            assert_eq!(spec.env, [(conf_env.into(), format!("{d}/config"))]);
+            assert!(dir.join("logs").is_dir(), "{name} must create the logs dir");
         }
+        let dir = crate::test_support::tmp_dir();
+        let es = launch("elasticsearch", &Dependency::simple("elasticsearch"), &dir);
+        assert!(es.conditional_args.is_empty());
+        assert_eq!(es.package_env, [("ES_HOME".into(), String::new())]);
+        let os = launch("opensearch", &Dependency::simple("opensearch"), &dir);
+        assert!(os.package_env.is_empty());
+        assert_eq!(
+            os.conditional_args,
+            [ConditionalArgs {
+                package_path: "plugins/opensearch-security".into(),
+                args: s(&["-E", "plugins.security.disabled=true"]),
+            }]
+        );
     }
 
     #[test]
@@ -1292,6 +1419,7 @@ mod tests {
             version: Some(version.into()),
             version_from_lock: from_lock,
             allow_unfree: false,
+            allow_insecure: false,
             ..Dependency::simple(name)
         }
     }
@@ -1343,6 +1471,39 @@ mod tests {
             .install(&brew, &Dependency::simple("vault"))
             .unwrap();
         assert!(brew.unfree_packages.borrow().is_empty(), "nix only");
+    }
+
+    #[test]
+    fn only_elasticsearch_is_nix_insecure() {
+        let insecure: Vec<&str> = REGISTRY
+            .iter()
+            .filter(|(_, m)| m.nix_insecure())
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(insecure, ["elasticsearch"]);
+        assert!(!get("jq").nix_insecure());
+    }
+
+    #[test]
+    fn nix_install_dep_allows_insecure_only_for_insecure_modules() {
+        use crate::package_manager::MockPackageManager;
+        let nix = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        for name in ["elasticsearch", "mongodb", "redis", "opensearch"] {
+            get(name).install(&nix, &Dependency::simple(name)).unwrap();
+        }
+        assert_eq!(*nix.insecure_packages.borrow(), vec!["elasticsearch"]);
+
+        let brew = MockPackageManager {
+            name: "brew",
+            ..Default::default()
+        };
+        get("elasticsearch")
+            .install(&brew, &Dependency::simple("elasticsearch"))
+            .unwrap();
+        assert!(brew.insecure_packages.borrow().is_empty(), "nix only");
     }
 
     #[test]
@@ -2019,6 +2180,7 @@ mod tests {
             extra,
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         };
         let pkgs = extra_strs(&dep, "global_packages");
         assert_eq!(pkgs, vec!["typescript", "eslint"]);
@@ -2040,6 +2202,7 @@ mod tests {
             extra,
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         };
         assert!(extra_strs(&dep, "global_packages").is_empty());
     }
@@ -2057,6 +2220,7 @@ mod tests {
             extra: HashMap::new(),
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         };
         let remapped = pm_dep(&dep, "ruby@3.2");
         assert_eq!(remapped.name, "ruby@3.2");

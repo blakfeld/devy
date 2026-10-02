@@ -162,6 +162,9 @@ pub struct Dependency {
     /// True when the nix backend must allow unfree packages for this install. Set by
     /// `pkg_dep` from `Module::nix_unfree`; never read from or written to any file.
     pub allow_unfree: bool,
+    /// True when the nix backend must allow insecure packages for this install. Set by
+    /// `pkg_dep` from `Module::nix_insecure`; never read from or written to any file.
+    pub allow_insecure: bool,
 }
 
 impl Dependency {
@@ -175,6 +178,7 @@ impl Dependency {
             extra: HashMap::new(),
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         }
     }
 
@@ -276,6 +280,7 @@ impl DevyConfig {
                             extra: cfg.extra,
                             version_from_lock: false,
                             allow_unfree: false,
+                            allow_insecure: false,
                         });
                     }
                 }
@@ -348,6 +353,7 @@ mod tests {
             extra: HashMap::new(),
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         };
         assert_eq!(dep.versioned_name(), "node@20");
     }

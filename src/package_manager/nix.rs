@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 
 use super::PackageManager;
 use crate::config::Dependency;
-use crate::modules::LaunchSpec;
+use crate::modules::{LaunchSpec, SeedDir};
 use crate::output;
 
 pub struct NixPackageManager {
@@ -182,15 +182,22 @@ fn install_priority(attr: &str) -> Option<u32> {
 }
 
 /// The arguments (after the binary) and extra environment for installing `attr`.
-/// `allow_unfree` sets `NIXPKGS_ALLOW_UNFREE=1` on this one child; flake references
-/// evaluate purely, so the profile style also needs `--impure` to see it.
+/// `allow_unfree` sets `NIXPKGS_ALLOW_UNFREE=1` and `allow_insecure` sets
+/// `NIXPKGS_ALLOW_INSECURE=1` on this one child; flake references evaluate purely, so
+/// the profile style also needs `--impure` to see them.
 #[derive(Debug, PartialEq, Eq)]
 struct InstallCmd {
     args: Vec<String>,
     env: Vec<(&'static str, &'static str)>,
 }
 
-fn install_cmd(style: NixStyle, profile: &Path, attr: &str, allow_unfree: bool) -> InstallCmd {
+fn install_cmd(
+    style: NixStyle,
+    profile: &Path,
+    attr: &str,
+    allow_unfree: bool,
+    allow_insecure: bool,
+) -> InstallCmd {
     let profile = profile.to_string_lossy().into_owned();
     let mut args = match style {
         NixStyle::Profile => vec![
@@ -205,7 +212,7 @@ fn install_cmd(style: NixStyle, profile: &Path, attr: &str, allow_unfree: bool) 
         if let Some(p) = install_priority(attr) {
             args.extend(["--priority".into(), p.to_string()]);
         }
-        if allow_unfree {
+        if allow_unfree || allow_insecure {
             args.push("--impure".into());
         }
     }
@@ -213,11 +220,13 @@ fn install_cmd(style: NixStyle, profile: &Path, attr: &str, allow_unfree: bool) 
         NixStyle::Profile => args.push(format!("nixpkgs#{attr}")),
         NixStyle::Env => args.extend(["-iA".into(), format!("nixpkgs.{attr}")]),
     }
-    let env = if allow_unfree {
-        vec![("NIXPKGS_ALLOW_UNFREE", "1")]
-    } else {
-        Vec::new()
-    };
+    let mut env = Vec::new();
+    if allow_unfree {
+        env.push(("NIXPKGS_ALLOW_UNFREE", "1"));
+    }
+    if allow_insecure {
+        env.push(("NIXPKGS_ALLOW_INSECURE", "1"));
+    }
     InstallCmd { args, env }
 }
 
@@ -306,6 +315,117 @@ fn run_init(name: &str, launch: &LaunchSpec, exec_dir: &Path, profile_bin: &Path
             out.status,
             stderr.trim_end()
         );
+    }
+    Ok(())
+}
+
+/// Applies the launch spec's package-dependent parts against `package_root` (the
+/// `exec_package`'s store path): seeds each missing `seed_dirs` destination, appends
+/// the `conditional_args` whose package path exists, and sets `package_env`. Returns
+/// the spec to launch.
+fn prepare_package_files(
+    name: &str,
+    launch: &LaunchSpec,
+    package_root: Option<&Path>,
+) -> Result<LaunchSpec> {
+    let mut launch = launch.clone();
+    if launch.seed_dirs.is_empty()
+        && launch.conditional_args.is_empty()
+        && launch.package_env.is_empty()
+    {
+        return Ok(launch);
+    }
+    let Some(root) = package_root else {
+        bail!("Failed to prepare {name} config: could not locate the package's config directory");
+    };
+    for seed in &launch.seed_dirs {
+        if seed.to.exists() {
+            continue;
+        }
+        let from = root.join(&seed.from_package);
+        if !from.is_dir() {
+            bail!(
+                "Failed to prepare {name} config: could not locate the package's config directory"
+            );
+        }
+        output::step(&format!(
+            "Copying {name} {} to {}",
+            seed.from_package,
+            seed.to.display()
+        ));
+        seed_dir(&from, seed).with_context(|| format!("Failed to prepare {name} config"))?;
+    }
+    let extra: Vec<String> = launch
+        .conditional_args
+        .iter()
+        .filter(|c| root.join(&c.package_path).exists())
+        .flat_map(|c| c.args.iter().cloned())
+        .collect();
+    launch.args.extend(extra);
+    let env: Vec<(String, String)> = launch
+        .package_env
+        .iter()
+        .map(|(var, path)| {
+            let value = if path.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(path)
+            };
+            (var.clone(), value.to_string_lossy().into_owned())
+        })
+        .collect();
+    launch.env.extend(env);
+    Ok(launch)
+}
+
+/// Copies `from` to `seed.to` and applies `seed.rewrites`, through a sibling staging
+/// directory, so an interrupted seed is redone on the next start instead of leaving a
+/// partial copy behind.
+fn seed_dir(from: &Path, seed: &SeedDir) -> Result<()> {
+    let to = seed.to.as_path();
+    let parent = to.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("could not create {}", parent.display()))?;
+    let file_name = to.file_name().unwrap_or_default().to_string_lossy();
+    let staging = parent.join(format!(".{file_name}.seeding"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("could not remove {}", staging.display()))?;
+    }
+    copy_writable(from, &staging)?;
+    for rewrite in &seed.rewrites {
+        let file = staging.join(&rewrite.file);
+        if !file.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("could not read {}", file.display()))?;
+        std::fs::write(&file, text.replace(&rewrite.from, &rewrite.to))
+            .with_context(|| format!("could not write {}", file.display()))?;
+    }
+    std::fs::rename(&staging, to)
+        .with_context(|| format!("could not move {} to {}", staging.display(), to.display()))
+}
+
+/// Recursively copies `from` (following symlinks) to `to`, adding owner-write to every
+/// copied entry: Nix store files are read-only.
+fn copy_writable(from: &Path, to: &Path) -> Result<()> {
+    let copy_err = || format!("could not copy {} to {}", from.display(), to.display());
+    if std::fs::metadata(from).with_context(copy_err)?.is_dir() {
+        std::fs::create_dir(to).with_context(copy_err)?;
+        for entry in std::fs::read_dir(from).with_context(copy_err)? {
+            let entry = entry.with_context(copy_err)?;
+            copy_writable(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(from, to).with_context(copy_err)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(to).with_context(copy_err)?.permissions();
+        perms.set_mode(perms.mode() | 0o200);
+        std::fs::set_permissions(to, perms).with_context(copy_err)?;
     }
     Ok(())
 }
@@ -707,7 +827,13 @@ impl PackageManager for NixPackageManager {
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
         let style = self.effective_style();
-        let cmd = install_cmd(style, &self.profile_path, &dep.name, dep.allow_unfree);
+        let cmd = install_cmd(
+            style,
+            &self.profile_path,
+            &dep.name,
+            dep.allow_unfree,
+            dep.allow_insecure,
+        );
         // The step line omits `--profile <path>`, which is the same for every install.
         let (bin, shown) = match style {
             NixStyle::Profile => (
@@ -722,6 +848,12 @@ impl PackageManager for NixPackageManager {
         if dep.allow_unfree {
             output::info(&format!(
                 "{0}: nixpkgs#{0} is unfree — allowing unfree packages for this install",
+                dep.name
+            ));
+        }
+        if dep.allow_insecure {
+            output::warn(&format!(
+                "{0}: nixpkgs#{0} is marked insecure by nixpkgs — allowing insecure packages for this install",
                 dep.name
             ));
         }
@@ -754,12 +886,22 @@ impl PackageManager for NixPackageManager {
     fn start_service(&self, name: &str, launch: Option<&LaunchSpec>) -> Result<()> {
         let launch = launch.ok_or_else(|| unsupported_service(name))?;
         let profile_bin = self.profile_bin();
-        let exec_dir = match &launch.exec_package {
-            Some(attr) => self
-                .package_bin(attr)
-                .unwrap_or_else(|| profile_bin.clone()),
-            None => profile_bin.clone(),
-        };
+        let package_bin = launch
+            .exec_package
+            .as_deref()
+            .and_then(|attr| self.package_bin(attr));
+        let exec_dir = package_bin.clone().unwrap_or_else(|| profile_bin.clone());
+        let package_root = package_bin.as_deref().and_then(Path::parent);
+        let needs_root = !launch.seed_dirs.is_empty()
+            || !launch.conditional_args.is_empty()
+            || !launch.package_env.is_empty();
+        if needs_root && package_root.is_none() && self.effective_style() == NixStyle::Env {
+            bail!(
+                "Failed to prepare {name} config: devy can only locate the package's files \
+                 with flakes-era Nix (`nix profile`), not legacy `nix-env`"
+            );
+        }
+        let launch = &prepare_package_files(name, launch, package_root)?;
         run_init(name, launch, &exec_dir, &profile_bin)?;
 
         #[cfg(target_os = "macos")]
@@ -942,6 +1084,200 @@ mod tests {
         );
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WorkingDirectory=/p/data 100%%\n"), "{unit}");
+    }
+
+    /// A fake store package whose read-only directories are made writable again on
+    /// drop, so its `TempDir` can be removed.
+    #[cfg(unix)]
+    struct FakeStore(crate::test_support::TempDir);
+
+    #[cfg(unix)]
+    impl std::ops::Deref for FakeStore {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeStore {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            for d in ["config", "config/jvm.options.d"] {
+                let _ = std::fs::set_permissions(
+                    self.0.join(d),
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+        }
+    }
+
+    /// A fake read-only store package with `config/` (a nested dir included) and an
+    /// optional security plugin, like nixpkgs' opensearch.
+    #[cfg(unix)]
+    fn fake_store_package(with_security: bool) -> FakeStore {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::tmp_dir();
+        let config = root.join("config");
+        std::fs::create_dir_all(config.join("jvm.options.d")).unwrap();
+        std::fs::write(config.join("jvm.options"), "-Xms1g\n").unwrap();
+        std::fs::write(config.join("jvm.options.d/heap.options"), "-Xmx1g\n").unwrap();
+        if with_security {
+            std::fs::create_dir_all(root.join("plugins/opensearch-security")).unwrap();
+        }
+        for f in ["config/jvm.options", "config/jvm.options.d/heap.options"] {
+            std::fs::set_permissions(root.join(f), std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        for d in ["config/jvm.options.d", "config"] {
+            std::fs::set_permissions(root.join(d), std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        FakeStore(root)
+    }
+
+    fn search_launch(data: &Path) -> LaunchSpec {
+        LaunchSpec {
+            seed_dirs: vec![crate::modules::SeedDir {
+                from_package: "config".into(),
+                to: data.join("config"),
+                rewrites: vec![
+                    crate::modules::SeedRewrite {
+                        file: "jvm.options".into(),
+                        from: "-Xms1g".into(),
+                        to: "-Xms2g".into(),
+                    },
+                    crate::modules::SeedRewrite {
+                        file: "no-such.options".into(),
+                        from: "a".into(),
+                        to: "b".into(),
+                    },
+                ],
+            }],
+            conditional_args: vec![crate::modules::ConditionalArgs {
+                package_path: "plugins/opensearch-security".into(),
+                args: vec!["-E".into(), "plugins.security.disabled=true".into()],
+            }],
+            ..redis_launch()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_seeds_missing_config_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = fake_store_package(false);
+        let data = crate::test_support::tmp_dir();
+        prepare_package_files("opensearch", &search_launch(&data), Some(&root)).unwrap();
+        for f in ["config/jvm.options", "config/jvm.options.d/heap.options"] {
+            let path = data.join(f);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert!(mode & 0o200 != 0, "{f} must be owner-writable: {mode:o}");
+            std::fs::write(&path, "edited").unwrap();
+        }
+        // The server creates its keystore in the copied config dir.
+        std::fs::write(data.join("config/opensearch.keystore"), "").unwrap();
+        assert!(!data.join(".config.seeding").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_applies_rewrites_on_first_seed_skipping_missing_files() {
+        let root = fake_store_package(false);
+        let data = crate::test_support::tmp_dir();
+        prepare_package_files("opensearch", &search_launch(&data), Some(&root)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(data.join("config/jvm.options")).unwrap(),
+            "-Xms2g\n"
+        );
+        assert!(!data.join("config/no-such.options").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("config/jvm.options")).unwrap(),
+            "-Xms1g\n",
+            "the package's own file must not change"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_leaves_existing_config_untouched() {
+        let root = fake_store_package(false);
+        let data = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(data.join("config")).unwrap();
+        // Matches the rewrite's `from`; an existing seed must not be rewritten.
+        std::fs::write(data.join("config/jvm.options"), "-Xms1g\n").unwrap();
+        prepare_package_files("opensearch", &search_launch(&data), Some(&root)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(data.join("config/jvm.options")).unwrap(),
+            "-Xms1g\n"
+        );
+        assert!(!data.join("config/jvm.options.d").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_adds_conditional_args_only_when_path_exists() {
+        let data = crate::test_support::tmp_dir();
+        let launch = search_launch(&data);
+        let without = fake_store_package(false);
+        let spec = prepare_package_files("opensearch", &launch, Some(&without)).unwrap();
+        assert_eq!(spec.args, redis_launch().args);
+
+        let data = crate::test_support::tmp_dir();
+        let launch = search_launch(&data);
+        let with = fake_store_package(true);
+        let spec = prepare_package_files("opensearch", &launch, Some(&with)).unwrap();
+        assert_eq!(
+            spec.args[spec.args.len() - 2..],
+            ["-E", "plugins.security.disabled=true"]
+        );
+    }
+
+    #[test]
+    fn prepare_without_package_root_errors() {
+        let data = crate::test_support::tmp_dir();
+        let err = prepare_package_files("elasticsearch", &search_launch(&data), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("Failed to prepare elasticsearch config"),
+            "{err}"
+        );
+        assert!(!data.join("config").exists());
+    }
+
+    #[test]
+    fn prepare_sets_package_env_from_root() {
+        let root = crate::test_support::tmp_dir();
+        let launch = LaunchSpec {
+            package_env: vec![
+                ("ES_HOME".into(), String::new()),
+                ("ES_LIB".into(), "lib".into()),
+            ],
+            ..redis_launch()
+        };
+        let spec = prepare_package_files("elasticsearch", &launch, Some(&root)).unwrap();
+        assert_eq!(
+            spec.env,
+            [
+                ("ES_HOME".into(), root.to_string_lossy().into_owned()),
+                (
+                    "ES_LIB".into(),
+                    root.join("lib").to_string_lossy().into_owned()
+                ),
+            ]
+        );
+        let err = prepare_package_files("elasticsearch", &launch, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("Failed to prepare elasticsearch config"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn prepare_without_package_parts_needs_no_root() {
+        let spec = prepare_package_files("redis", &redis_launch(), None).unwrap();
+        assert_eq!(spec, redis_launch());
     }
 
     #[test]
@@ -1151,7 +1487,7 @@ mod tests {
     fn install_cmd_profile_style() {
         let p = Path::new("/p/.devy/nix-profile");
         assert_eq!(
-            install_cmd(NixStyle::Profile, p, "redis", false),
+            install_cmd(NixStyle::Profile, p, "redis", false, false),
             InstallCmd {
                 args: strs(&[
                     "profile",
@@ -1164,7 +1500,7 @@ mod tests {
             }
         );
         assert_eq!(
-            install_cmd(NixStyle::Profile, p, "mongodb-ce", true),
+            install_cmd(NixStyle::Profile, p, "mongodb-ce", true, false),
             InstallCmd {
                 args: strs(&[
                     "profile",
@@ -1178,8 +1514,32 @@ mod tests {
             }
         );
         assert_eq!(
-            install_cmd(NixStyle::Profile, p, "mariadb", false).args[4..],
+            install_cmd(NixStyle::Profile, p, "mariadb", false, false).args[4..],
             strs(&["--priority", "4", "nixpkgs#mariadb"])
+        );
+    }
+
+    #[test]
+    fn install_cmd_allows_insecure_alone_and_with_unfree() {
+        let p = Path::new("/p/.devy/nix-profile");
+        let insecure = install_cmd(NixStyle::Profile, p, "pkg", false, true);
+        assert_eq!(insecure.args[4..], strs(&["--impure", "nixpkgs#pkg"]));
+        assert_eq!(insecure.env, [("NIXPKGS_ALLOW_INSECURE", "1")]);
+        let both = install_cmd(NixStyle::Profile, p, "elasticsearch", true, true);
+        assert_eq!(both.args[4..], strs(&["--impure", "nixpkgs#elasticsearch"]));
+        assert_eq!(
+            both.env,
+            [
+                ("NIXPKGS_ALLOW_UNFREE", "1"),
+                ("NIXPKGS_ALLOW_INSECURE", "1")
+            ]
+        );
+        assert_eq!(
+            install_cmd(NixStyle::Env, p, "elasticsearch", true, true).env,
+            [
+                ("NIXPKGS_ALLOW_UNFREE", "1"),
+                ("NIXPKGS_ALLOW_INSECURE", "1")
+            ]
         );
     }
 
@@ -1187,14 +1547,14 @@ mod tests {
     fn install_cmd_env_style() {
         let p = Path::new("/p/.devy/nix-profile");
         assert_eq!(
-            install_cmd(NixStyle::Env, p, "redis", false),
+            install_cmd(NixStyle::Env, p, "redis", false, false),
             InstallCmd {
                 args: strs(&["--profile", "/p/.devy/nix-profile", "-iA", "nixpkgs.redis"]),
                 env: vec![],
             }
         );
         assert_eq!(
-            install_cmd(NixStyle::Env, p, "vault", true),
+            install_cmd(NixStyle::Env, p, "vault", true, false),
             InstallCmd {
                 args: strs(&["--profile", "/p/.devy/nix-profile", "-iA", "nixpkgs.vault"]),
                 env: vec![("NIXPKGS_ALLOW_UNFREE", "1")],

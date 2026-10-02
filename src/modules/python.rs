@@ -307,6 +307,7 @@ mod tests {
             extra,
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         };
         assert_eq!(venv_path(&dep), "venv");
     }
@@ -357,6 +358,7 @@ mod tests {
             extra,
             version_from_lock: false,
             allow_unfree: false,
+            allow_insecure: false,
         };
         let dir = std::env::temp_dir();
         let venv = dir.join(".venv");
