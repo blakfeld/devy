@@ -27,7 +27,7 @@ On macOS and Linux you can opt into your system package manager instead by setti
 
 - A supported platform (see above)
 - **macOS / Linux:** Nix is required. Run `devy up --bootstrap` to install it automatically via the [Determinate Installer](https://install.determinate.systems), or install Nix manually first.
-- **`devy init`:** the [Claude Code](https://claude.com/claude-code) CLI (`claude`), signed in. Only `init` uses it; `devy init --detect` works without it.
+- **`devy init` and `devy doctor`:** the [Claude Code](https://claude.com/claude-code) CLI (`claude`), signed in. Only these two commands use it; `devy init --detect` works without it, and `devy doctor` falls back to devy's own checks.
 
 ## Installation
 
@@ -270,6 +270,8 @@ devy up --update      # Re-resolve all versions and rewrite devy.lock
 devy up --dry-run     # Check status without making any changes
 ```
 
+When `devy up` fails, it records what it was doing in `.devy/last-up-failure.json` and suggests `devy doctor`. The record holds the error, the step that failed (for example `install` or `start services`), the dependency involved, the platform, the package manager, the devy version and a UTC timestamp. Each failure replaces the previous record, and a successful `devy up` deletes it. The file is owner-readable only and never leaves your machine unless you run `devy doctor` with AI. `devy up --dry-run` never writes it.
+
 ### `devy down`
 
 Stops all managed services.
@@ -307,6 +309,31 @@ Validates that everything matches `devy.yml` and exits non-zero if any issues ar
 ```sh
 devy check
 ```
+
+### `devy doctor`
+
+Diagnoses the environment and the most recent failed `devy up`.
+
+```sh
+devy doctor                  # Checks, the last failure, and a diagnosis from Claude
+devy doctor --no-ai          # Only devy's own checks; no network access
+devy doctor --yes            # Apply a suggested devy.yml fix without asking
+devy doctor --show-context   # Print what would be sent to Claude, then exit
+```
+
+It always runs the same checks as `devy check`, under a `Checks` header. Problems that make `devy check` stop, such as invalid YAML or a port conflict, are reported as findings instead. If `.devy/last-up-failure.json` exists, it prints that failure under `Last devy up failure`. When there is nothing wrong, it prints `✓ no problems found` and stops without contacting Claude.
+
+Otherwise, if `claude` is available (see [AI features](#ai-features)), devy asks Claude for a diagnosis and prints a summary, the likely cause and numbered steps, labelled with the model that wrote them. Commands in the steps are for you to run; devy never runs them. Without `claude`, or with `--no-ai`, devy prints its findings and `· AI diagnosis unavailable — <reason>`. If the AI request fails, devy warns `AI diagnosis failed: <cause>`. Both cases still exit 0.
+
+**Suggested fixes.** When Claude proposes a change to `devy.yml`, devy validates it first. The proposal must parse and pass the checks that `devy check` treats as errors: dependency entries, backend validation, known keys, shells and port conflicts. An invalid proposal is dropped with a warning. A valid one is shown as a diff under `Suggested fix`, and then:
+
+- with `--yes`, devy writes it
+- at an interactive terminal, devy asks `Apply this change to devy.yml? [y/N]`, defaulting to no
+- otherwise (for example in CI), devy prints `· not applied — re-run with --yes to apply` and changes nothing
+
+An accepted fix replaces `devy.yml` atomically, keeping its permissions, and devy prints `✓ updated devy.yml — run devy up to apply it`. devy never runs `devy up` itself, and `devy.yml` is the only file doctor writes. Since `devy.yml` is committed, use git to undo a fix.
+
+`devy doctor` exits 0 whenever it completes, even when it finds problems. It exits 1 only when it can't run at all: outside a devy project, or when writing an accepted fix fails.
 
 ### `devy init`
 
@@ -396,13 +423,19 @@ devy hook fish
 The snippet does two things:
 
 1. **Shadowenv activation** — wraps `devy up` so the new environment is activated in your current shell session immediately after installation.
-2. **Tab completion** — registers completion for all built-in subcommands (`up`, `down`, `start`, `stop`, `restart`, `services`, `status`, `check`, `init`, `hook`, `pr`, `export`) and flags. Commands you define under `commands:` in `devy.yml` are completed **dynamically** — the completion function calls `devy _commands` at tab-press time so new commands appear without reloading your shell.
+2. **Tab completion** — registers completion for all built-in subcommands (`up`, `down`, `start`, `stop`, `restart`, `services`, `status`, `check`, `doctor`, `init`, `hook`, `pr`, `export`) and flags. Commands you define under `commands:` in `devy.yml` are completed **dynamically** — the completion function calls `devy _commands` at tab-press time so new commands appear without reloading your shell.
 
 ## Lock file
 
 `devy up` writes `devy.lock` recording the exact version of every dependency that was installed, and the port assigned to every service whose port devy applies (see [Service environment variables](#service-environment-variables)). On subsequent runs without `--update`, devy pins each versionless dependency to its locked version and reuses its locked port, so the environment is reproducible across machines.
 
 Commit `devy.lock` to version control. Run `devy up --update` when you want to upgrade.
+
+Don't commit `.devy/`. It holds machine-local state: the Nix profile, service data and the last `devy up` failure record. Add it to `.gitignore`:
+
+```gitignore
+.devy/
+```
 
 Docker-managed services record `source: docker`, their image tag and `image_digest`, the digest of the pulled image, so every machine runs the same image (see [Running services with Docker or Podman](#running-services-with-docker-or-podman)).
 
@@ -519,7 +552,7 @@ Each module knows the correct package name for each package manager — you alwa
 
 ## AI features
 
-Only `devy init` uses AI (and not with `--detect`); no other command looks for or runs `claude`.
+Only `devy init` (not with `--detect`) and `devy doctor` (not with `--no-ai` or `--show-context`) use AI. No other command looks for or runs `claude`. A failed `devy up` only suggests `devy doctor`; it never contacts Claude.
 
 They run through your own [Claude Code](https://claude.com/claude-code) CLI, so devy needs no API key of its own: install `claude`, sign in once, and devy uses whatever account and default model `claude` is set up with. devy runs `claude -p` with all tools, MCP servers and slash commands disabled, without saving the session, and from an empty temporary directory, so the project's own `.claude/` settings, hooks and `CLAUDE.md` are not loaded.
 
@@ -534,6 +567,16 @@ DEVY_AI_MODEL=opus devy init
 
 The header of a generated file names the model `claude` reports having used.
 
+**What `devy doctor` sends.** Only these, after redaction:
+
+- the last `devy up` failure record
+- the findings from devy's checks
+- `devy.yml` and `devy.lock`
+- the platform, package manager and devy version
+- up to the last 50 log lines of each service that is named in the failure record or reported stopped
+
+Services with no logs available are listed as `no logs available`. devy never sends the environment file (`.shadowenv.d/`), dotenv files or any other file. The request also includes devy's `devy.yml` reference and module catalog.
+
 **What is redacted.** Before anything is sent, devy replaces with `<redacted>`:
 
 - the value of any `KEY=value` or `key: value` entry whose key contains `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `PRIVATE` (case-insensitive)
@@ -545,7 +588,7 @@ devy never reads `.env`, `.env.local` or other real dotenv files, `.git`, SSH ke
 
 Redaction is pattern-based. A secret stored under an innocuous name — for example a password pasted into `README.md` — would be sent. Use `--show-context` to check before sending.
 
-**Failures.** If `claude` is not on `PATH`, devy says so and suggests `devy init --detect`. A request is stopped after 5 minutes. When `claude` fails or reports an error (for example, not signed in), devy prints `AI request failed: <reason>` and exits 1 without writing files. Retries on rate limits are left to `claude`.
+**Failures.** If `claude` is not on `PATH`, `devy init` says so and suggests `devy init --detect`; `devy doctor` prints its own findings and exits 0 (see [`devy doctor`](#devy-doctor)). A request is stopped after 5 minutes. When `claude` fails or reports an error (for example, not signed in), devy prints `AI request failed: <reason>` and exits 1 without writing files. Retries on rate limits are left to `claude`.
 
 ## Security
 

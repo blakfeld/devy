@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::config::{Dependency, DevyConfig};
@@ -41,8 +42,169 @@ pub(crate) fn check_with_runtime(
     let project_name = config.name.as_deref().unwrap_or("project");
     output::header(&format!("devy check · {}", project_name));
 
-    let mut issues: usize = 0;
+    let findings = collect_findings(config, pm, runtime, env_mgr, project_root);
+    let issues = findings.print()?;
+    if let Some(e) = findings.hard_error {
+        return Err(e);
+    }
 
+    output::blank_line();
+    if issues == 0 {
+        output::success("all checks passed");
+        Ok(())
+    } else {
+        let noun = issue_noun(issues);
+        eprintln!("  {}  {} {} found", "✗".red().bold(), issues, noun);
+        Err(SilentExit(1).into())
+    }
+}
+
+/// A config-level message from the checks, in the order `devy check` prints them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Note {
+    /// Counts toward the issue total.
+    Issue(String),
+    /// Printed, but not counted as an issue.
+    Warning(String),
+}
+
+/// The environment-file state the checks compare against.
+#[derive(Debug, Clone)]
+pub(crate) struct EnvState {
+    pub vars: HashMap<String, String>,
+    pub written_vars: Option<HashMap<String, String>>,
+    pub path_prepends: Vec<String>,
+    /// Read only when `path_prepends` is non-empty.
+    pub written_paths: Option<Vec<String>>,
+}
+
+/// Everything `devy check` evaluates, as data. Evaluation stops at the first hard error
+/// (an unloadable config, a port conflict, a failed backend query), which is kept in
+/// `hard_error`; the findings gathered before it are kept too.
+#[derive(Debug, Default)]
+pub(crate) struct Findings {
+    pub notes: Vec<Note>,
+    /// Dependency table rows; `None` when there are no dependencies or a hard error
+    /// came first.
+    pub deps: Option<Vec<shared::DepRow>>,
+    /// `None` when devy.yml has no environment and no module adds PATH entries.
+    pub env: Option<EnvState>,
+    pub hard_error: Option<anyhow::Error>,
+}
+
+impl Findings {
+    /// Findings for a project whose checks could not start, e.g. an unparseable devy.yml.
+    pub fn from_error(e: anyhow::Error) -> Self {
+        Self {
+            hard_error: Some(e),
+            ..Default::default()
+        }
+    }
+
+    /// Every counted issue as one line, hard error last.
+    pub fn issues(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .notes
+            .iter()
+            .filter_map(|n| match n {
+                Note::Issue(s) => Some(s.clone()),
+                Note::Warning(_) => None,
+            })
+            .collect();
+        out.extend(self.deps.iter().flatten().filter_map(shared::DepRow::issue));
+        if let Some(env) = &self.env {
+            let mut keys: Vec<&String> = env.vars.keys().collect();
+            keys.sort();
+            for key in keys {
+                if !env
+                    .written_vars
+                    .as_ref()
+                    .is_some_and(|w| w.contains_key(key))
+                {
+                    out.push(format!(
+                        "environment variable {key} is missing from the environment file"
+                    ));
+                }
+            }
+            for entry in &env.path_prepends {
+                if !env
+                    .written_paths
+                    .as_ref()
+                    .is_some_and(|w| w.contains(entry))
+                {
+                    out.push(format!(
+                        "PATH entry {entry} is missing from the environment file"
+                    ));
+                }
+            }
+        }
+        out.extend(self.hard_error.iter().map(|e| format!("{e:#}")));
+        out
+    }
+
+    pub fn warnings(&self) -> Vec<String> {
+        self.notes
+            .iter()
+            .filter_map(|n| match n {
+                Note::Warning(s) => Some(s.clone()),
+                Note::Issue(_) => None,
+            })
+            .collect()
+    }
+
+    /// Prints the findings as `devy check` does and returns the number of issues,
+    /// not counting `hard_error`, which the caller reports.
+    pub fn print(&self) -> Result<usize> {
+        let mut issues = 0usize;
+        for note in &self.notes {
+            match note {
+                Note::Issue(s) => {
+                    issues += 1;
+                    output::warn(s);
+                }
+                Note::Warning(s) => output::warn(s),
+            }
+        }
+        if let Some(rows) = &self.deps {
+            output::header("Dependencies");
+            issues += shared::render_dep_rows(rows, true);
+        }
+        if let Some(env) = &self.env {
+            output::header("Environment");
+            issues += shared::print_env_table(&env.vars, env.written_vars.clone(), true)?;
+            if !env.path_prepends.is_empty() {
+                issues +=
+                    shared::print_path_table(&env.path_prepends, env.written_paths.clone(), true);
+            }
+        }
+        Ok(issues)
+    }
+}
+
+/// Evaluates the checks without printing. Read-only: nothing is installed, started or
+/// written.
+pub(crate) fn collect_findings(
+    config: &DevyConfig,
+    pm: &dyn PackageManager,
+    runtime: ContainerRuntime<'_>,
+    env_mgr: &dyn EnvManager,
+    project_root: &Path,
+) -> Findings {
+    let mut findings = Findings::default();
+    if let Err(e) = collect_into(&mut findings, config, pm, runtime, env_mgr, project_root) {
+        findings.hard_error = Some(e);
+    }
+    findings
+}
+
+fn collect_into(
+    findings: &mut Findings,
+    config: &DevyConfig,
+    pm: &dyn PackageManager,
+    runtime: ContainerRuntime<'_>,
+    env_mgr: &dyn EnvManager,
+    project_root: &Path,
+) -> Result<()> {
     let deps = config.normalized_dependencies()?;
     // Resolve ports exactly as `up` would, without assigning new ones or writing the lock.
     let lock = ports::load_lock(project_root)?;
@@ -57,10 +219,9 @@ pub(crate) fn check_with_runtime(
                     .with_context(|| format!("{}: config validation failed", dep.name))?;
             }
             let module = modules::get(&dep.name);
-            for issue in extra_key_issues(dep) {
-                issues += 1;
-                output::warn(&issue);
-            }
+            findings
+                .notes
+                .extend(extra_key_issues(dep).into_iter().map(Note::Issue));
             let warnings = module
                 .config_warnings(dep)
                 .into_iter()
@@ -68,15 +229,17 @@ pub(crate) fn check_with_runtime(
                 .chain(modules::nix_version_warning(dep, pm))
                 .chain(service_runner::docker_warnings(dep));
             for warning in warnings {
-                output::warn(&format!("{}: {}", dep.name, warning));
+                findings
+                    .notes
+                    .push(Note::Warning(format!("{}: {}", dep.name, warning)));
             }
-            if let Some(issue) = shell_issue(dep) {
-                issues += 1;
-                output::warn(&issue);
-            }
+            findings.notes.extend(shell_issue(dep).map(Note::Issue));
         }
-        output::header("Dependencies");
-        issues += shared::print_dep_table(&resolved_deps, &runners, true)?;
+        let (rows, err) = shared::dep_rows(&resolved_deps, &runners);
+        findings.deps = Some(rows);
+        if let Some(e) = err {
+            return Err(e);
+        }
     }
 
     // Collect PATH prepends from all modules.
@@ -86,25 +249,19 @@ pub(crate) fn check_with_runtime(
         .collect();
 
     if !config.environment.is_empty() || !path_prepends.is_empty() {
-        output::header("Environment");
-        let written_vars = env_mgr.read_vars(project_root);
-        issues += shared::print_env_table(&config.environment, written_vars, true)?;
-
-        if !path_prepends.is_empty() {
-            let written_paths = env_mgr.read_path_prepends(project_root);
-            issues += shared::print_path_table(&path_prepends, written_paths, true);
-        }
+        let written_paths = if path_prepends.is_empty() {
+            None
+        } else {
+            env_mgr.read_path_prepends(project_root)
+        };
+        findings.env = Some(EnvState {
+            vars: config.environment.clone(),
+            written_vars: env_mgr.read_vars(project_root),
+            path_prepends,
+            written_paths,
+        });
     }
-
-    output::blank_line();
-    if issues == 0 {
-        output::success("all checks passed");
-        Ok(())
-    } else {
-        let noun = issue_noun(issues);
-        eprintln!("  {}  {} {} found", "✗".red().bold(), issues, noun);
-        Err(SilentExit(1).into())
-    }
+    Ok(())
 }
 
 /// Problems in `config` that are detectable without a package manager, env manager or
@@ -592,6 +749,103 @@ mod tests {
             result.unwrap().is_ok(),
             "a warning must not count as an issue"
         );
+    }
+
+    fn collect(config: &DevyConfig, pm: &MockPackageManager) -> Findings {
+        let dir = crate::test_support::tmp_dir();
+        collect_findings(
+            config,
+            pm,
+            ContainerRuntime::system(config.container_cli),
+            &MockEnvManager::default(),
+            &dir,
+        )
+    }
+
+    #[test]
+    fn collect_findings_keeps_port_conflict_as_hard_error() {
+        let config = make_config(&["mysql", "mariadb"], HashMap::new());
+        let pm = MockPackageManager {
+            installed: true,
+            service_running: true,
+            ..Default::default()
+        };
+        let findings = collect(&config, &pm);
+        let err = findings
+            .hard_error
+            .as_ref()
+            .expect("port conflict is a hard error");
+        assert!(format!("{err:#}").contains("port conflict"), "{err:#}");
+        assert!(
+            findings.issues().last().unwrap().contains("port conflict"),
+            "the hard error is listed as the last issue"
+        );
+    }
+
+    #[test]
+    fn collect_findings_keeps_multi_key_dependency_as_hard_error() {
+        let yaml = "dependencies:\n  - node: {}\n    redis: {}\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let findings = collect(&config, &MockPackageManager::default());
+        let err = findings
+            .hard_error
+            .as_ref()
+            .expect("multi-key entry is a hard error");
+        assert!(err.to_string().contains("multiple keys"), "{err}");
+        assert!(findings.deps.is_none(), "no table after a hard error");
+    }
+
+    #[test]
+    fn collect_findings_lists_issues_and_warnings_as_data() {
+        let yaml = "dependencies:\n  - ruby: { vrsion: \"3\" }\n  - mysql\n  - minio: { access_key: me }\nenvironment:\n  FOO: bar\n";
+        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let pm = MockPackageManager {
+            installed: true,
+            service_running: false,
+            ..Default::default()
+        };
+        let mut findings = None;
+        let warned = crate::output::with_warn_capture(|| findings = Some(collect(&config, &pm)));
+        let findings = findings.unwrap();
+        assert_eq!(warned, 0, "collecting must not print");
+        assert!(findings.hard_error.is_none());
+        let issues = findings.issues();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.contains("unrecognized config key `vrsion`")),
+            "{issues:?}"
+        );
+        assert!(
+            issues.contains(&"mysql: service stopped".to_string()),
+            "{issues:?}"
+        );
+        assert!(
+            issues.contains(&"minio: service stopped".to_string()),
+            "{issues:?}"
+        );
+        assert!(
+            issues.contains(
+                &"environment variable FOO is missing from the environment file".to_string()
+            ),
+            "{issues:?}"
+        );
+        assert!(
+            findings.warnings().iter().any(|w| w.starts_with("minio:")),
+            "{:?}",
+            findings.warnings()
+        );
+    }
+
+    #[test]
+    fn findings_print_counts_the_same_issues_as_issues() {
+        let config = make_config(
+            &["node", "mysql"],
+            HashMap::from([("A".into(), "b".into())]),
+        );
+        let findings = collect(&config, &MockPackageManager::default());
+        let printed = findings.print().unwrap();
+        assert_eq!(printed, findings.issues().len());
     }
 
     #[test]

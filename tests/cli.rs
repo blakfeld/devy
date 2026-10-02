@@ -686,6 +686,241 @@ fn up_dry_run_does_not_write_lock_file() {
     );
 }
 
+#[test]
+fn up_dry_run_writes_no_failure_record_and_keeps_an_existing_one() {
+    let proj = TempProject::with_yaml("name: test\nenvironment:\n  FOO: bar\n");
+    let out = proj.run(&["up", "--dry-run"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the missing env var is an issue"
+    );
+    assert!(!proj.file(".devy/last-up-failure.json").exists());
+
+    std::fs::create_dir_all(proj.file(".devy")).unwrap();
+    proj.write(".devy/last-up-failure.json", "{\"kept\": true}");
+    proj.run(&["up", "--dry-run"]);
+    assert_eq!(
+        std::fs::read_to_string(proj.file(".devy/last-up-failure.json")).unwrap(),
+        "{\"kept\": true}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// up failure record
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FAILING_HOOK_YAML: &str = "name: shop\nhooks:\n  before_up: \"exit 1\"\ndependencies: []\n";
+
+#[test]
+fn up_failure_writes_record_and_prints_doctor_hint_after_error() {
+    let proj = TempProject::with_yaml(FAILING_HOOK_YAML);
+    let out = proj.run_without_claude(&["up"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let error_at = stderr.find("error: ").expect("error line");
+    let hint_at = stderr
+        .find("  · run devy doctor to diagnose this failure")
+        .expect("doctor hint");
+    assert!(hint_at > error_at, "hint must follow the error: {stderr}");
+
+    let record = std::fs::read_to_string(proj.file(".devy/last-up-failure.json")).unwrap();
+    let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    assert_eq!(record["step"], "before_up hook");
+    assert!(
+        record["error_chain"]
+            .as_str()
+            .unwrap()
+            .contains("before_up"),
+        "{record}"
+    );
+    assert_eq!(record["devy_version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn up_without_devy_yml_writes_no_record_and_no_hint() {
+    let proj = TempProject::new();
+    let out = proj.run(&["up"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("devy doctor"));
+    assert!(!proj.file(".devy").exists());
+}
+
+#[test]
+fn up_records_invalid_yaml_as_load_config_failure() {
+    let proj = TempProject::with_yaml("name: [unclosed\n");
+    let out = proj.run(&["up"]);
+    assert_eq!(out.status.code(), Some(1));
+    let record = std::fs::read_to_string(proj.file(".devy/last-up-failure.json")).unwrap();
+    assert!(record.contains("\"step\": \"load config\""), "{record}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// doctor
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A project whose only problem is a recorded `devy up` failure, so doctor has something
+/// to diagnose without depending on what is installed on this machine.
+fn project_with_failed_up() -> TempProject {
+    let proj = TempProject::with_yaml(FAILING_HOOK_YAML);
+    let out = proj.run(&["up"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(proj.file(".devy/last-up-failure.json").exists());
+    proj
+}
+
+#[test]
+fn doctor_prints_header_checks_and_recorded_failure() {
+    let proj = project_with_failed_up();
+    let out = proj.run_without_claude(&["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim_start().starts_with("devy doctor · shop"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Checks"), "{stdout}");
+    assert!(stdout.contains("Last devy up failure"), "{stdout}");
+    assert!(stdout.contains("step: before_up hook"), "{stdout}");
+}
+
+#[test]
+fn doctor_outside_project_exits_one() {
+    let proj = TempProject::new();
+    let out = proj.run(&["doctor"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("devy.yml"));
+}
+
+#[test]
+fn doctor_without_claude_explains_and_exits_zero() {
+    let proj = project_with_failed_up();
+    let out = proj.run_without_claude(&["doctor"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("· AI diagnosis unavailable — the `claude` CLI was not found on PATH"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_no_ai_never_runs_claude() {
+    let proj = project_with_failed_up();
+    let out = proj.run_with_fake_claude(&["doctor", "--no-ai"], "{}");
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("· AI diagnosis unavailable — disabled with --no-ai"),
+        "{stdout}"
+    );
+    assert!(
+        !proj.file(".fake-bin/args.txt").exists(),
+        "claude must not run with --no-ai"
+    );
+}
+
+#[test]
+fn doctor_reports_invalid_yaml_as_finding() {
+    let proj = TempProject::with_yaml("name: [unclosed\n");
+    let out = proj.run_without_claude(&["doctor", "--no-ai"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Failed to parse"), "{stderr}");
+    assert!(!stderr.contains("error:"), "{stderr}");
+}
+
+#[test]
+fn doctor_show_context_prints_request_without_claude() {
+    let proj = project_with_failed_up();
+    let out = proj.run_without_claude(&["doctor", "--show-context"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("=== system ==="), "{stdout}");
+    assert!(stdout.contains("=== last devy up failure ==="), "{stdout}");
+    assert!(stdout.contains("=== devy.yml ===\nname: shop"), "{stdout}");
+}
+
+#[test]
+fn doctor_show_context_conflicts_with_no_ai() {
+    let proj = TempProject::with_yaml("name: x\n");
+    let out = proj.run(&["doctor", "--show-context", "--no-ai"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_diagnoses_with_claude_and_never_applies_fix_without_tty() {
+    let proj = project_with_failed_up();
+    let fixed = "name: shop\ndependencies: []\n";
+    let result = serde_json::json!({
+        "summary": "The before_up hook exits 1.",
+        "likely_cause": "The hook command always fails.",
+        "steps": ["Remove the hook", "Run `devy up`"],
+        "devy_yml": fixed,
+    })
+    .to_string();
+    let reply = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": result,
+        "modelUsage": {"claude-test-model": {"outputTokens": 10}},
+    })
+    .to_string();
+    let out = proj.run_with_fake_claude(&["doctor"], &reply);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Diagnosis (AI-generated with claude-test-model"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1. Remove the hook"), "{stdout}");
+    assert!(stdout.contains("-  before_up: \"exit 1\""), "{stdout}");
+    assert!(
+        stdout.contains("· not applied — re-run with --yes to apply"),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.file("devy.yml")).unwrap(),
+        FAILING_HOOK_YAML
+    );
+
+    let out = proj.run_with_fake_claude(&["doctor", "--yes"], &reply);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("✓ updated devy.yml — run devy up to apply it")
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.file("devy.yml")).unwrap(),
+        fixed
+    );
+}
+
+#[test]
+fn doctor_healthy_project_reports_no_problems() {
+    let proj = TempProject::with_yaml("name: ok\ndependencies: []\n");
+    let out = proj.run_without_claude(&["doctor"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("✓ no problems found"), "{stdout}");
+    assert!(!stdout.contains("AI diagnosis"), "{stdout}");
+}
+
+#[test]
+fn up_success_after_failure_removes_record() {
+    let proj = project_with_failed_up();
+    proj.write("devy.yml", "name: shop\ndependencies: []\n");
+    let out = proj.run(&["up"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!proj.file(".devy/last-up-failure.json").exists());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // general CLI
 // ─────────────────────────────────────────────────────────────────────────────
@@ -706,7 +941,7 @@ fn help_flag_exits_zero() {
 fn help_output_lists_key_subcommands() {
     let out = Command::new(binary()).arg("--help").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for cmd in &["up", "down", "check", "init", "hook", "status"] {
+    for cmd in &["up", "down", "check", "doctor", "init", "hook", "status"] {
         assert!(
             stdout.contains(cmd),
             "--help output must list the '{cmd}' subcommand"

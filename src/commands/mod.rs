@@ -1,7 +1,9 @@
 pub mod check;
+pub mod doctor;
 pub mod down;
 pub mod exec;
 pub mod export;
+pub mod failure_record;
 pub mod hook;
 pub mod init;
 pub mod list_commands;

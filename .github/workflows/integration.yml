@@ -53,6 +53,9 @@ jobs:
           test -x .devy/nix-profile/bin/jq
           .devy/nix-profile/bin/jq --version
 
+      - name: Doctor — failed up is recorded, diagnosed offline and cleared by a fixed up
+        run: .github/scripts/doctor-e2e.sh "$GITHUB_WORKSPACE/target/release/devy"
+
       # systemd --user needs a user manager; lingering starts one for the runner user.
       - name: Enable systemd user session
         run: |
@@ -143,6 +146,9 @@ jobs:
 
           test -x .devy/nix-profile/bin/jq
           .devy/nix-profile/bin/jq --version
+
+      - name: Doctor — failed up is recorded, diagnosed offline and cleared by a fixed up
+        run: .github/scripts/doctor-e2e.sh "$GITHUB_WORKSPACE/target/release/devy"
 
       - name: Services — redis and postgresql via Nix listen on their assigned ports
         run: |

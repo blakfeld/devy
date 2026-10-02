@@ -53,6 +53,7 @@ _{bin}() {
     'restart:Restart a named service'
     'status:Show install and environment status'
     'check:Validate the environment without making changes'
+    'doctor:Diagnose the environment and the last failed up'
     'init:Create an empty {bin}.yml'
     'hook:Print shell integration snippet'
     'pr:Open a GitHub pull request for the current branch'
@@ -77,6 +78,12 @@ _{bin}() {
       ;;
     down)
       _arguments '--volumes[Also remove docker-managed containers and volumes]'
+      ;;
+    doctor)
+      _arguments \
+        '--yes[Apply a suggested {bin}.yml fix without asking]' \
+        '--no-ai[Skip the AI diagnosis]' \
+        '--show-context[Print the AI request without sending it]'
       ;;
     start|stop|restart)
       _arguments '1:service name'
@@ -109,7 +116,7 @@ const BASH_SNIPPET_TEMPLATE: &str = r#"
 
 _{bin}_completions() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
-  local subcmds="up down services start stop restart status check init hook pr export"
+  local subcmds="up down services start stop restart status check doctor init hook pr export"
   local user_cmds
   user_cmds=$(command {bin} _commands 2>/dev/null)
   [ -n "$user_cmds" ] && subcmds="$subcmds $user_cmds"
@@ -125,6 +132,9 @@ _{bin}_completions() {
       ;;
     down)
       COMPREPLY=($(compgen -W "--volumes" -- "$cur"))
+      ;;
+    doctor)
+      COMPREPLY=($(compgen -W "--yes --no-ai --show-context" -- "$cur"))
       ;;
     init)
       COMPREPLY=($(compgen -W "--force" -- "$cur"))
@@ -161,7 +171,7 @@ function __{bin}_user_commands
 end
 
 function __{bin}_no_subcommand
-  not __fish_seen_subcommand_from up down services start stop restart status check init hook pr export
+  not __fish_seen_subcommand_from up down services start stop restart status check doctor init hook pr export
 end
 
 complete -c {bin} -f
@@ -173,6 +183,7 @@ complete -c {bin} -n __{bin}_no_subcommand -a stop     -d "Stop a named service"
 complete -c {bin} -n __{bin}_no_subcommand -a restart  -d "Restart a named service"
 complete -c {bin} -n __{bin}_no_subcommand -a status   -d "Show install and environment status"
 complete -c {bin} -n __{bin}_no_subcommand -a check    -d "Validate the environment"
+complete -c {bin} -n __{bin}_no_subcommand -a doctor   -d "Diagnose the environment and the last failed up"
 complete -c {bin} -n __{bin}_no_subcommand -a init     -d "Scaffold a {bin}.yml"
 complete -c {bin} -n __{bin}_no_subcommand -a hook     -d "Print shell integration snippet"
 complete -c {bin} -n __{bin}_no_subcommand -a pr       -d "Open a GitHub pull request"
@@ -183,6 +194,9 @@ complete -c {bin} -n "__fish_seen_subcommand_from up" -l update  -d "Re-resolve 
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l dry-run -d "Check without making changes"
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l bootstrap -d "Install the package manager if missing"
 complete -c {bin} -n "__fish_seen_subcommand_from down" -l volumes -d "Also remove docker containers and volumes"
+complete -c {bin} -n "__fish_seen_subcommand_from doctor" -l yes -d "Apply a suggested {bin}.yml fix without asking"
+complete -c {bin} -n "__fish_seen_subcommand_from doctor" -l no-ai -d "Skip the AI diagnosis"
+complete -c {bin} -n "__fish_seen_subcommand_from doctor" -l show-context -d "Print the AI request without sending it"
 complete -c {bin} -n "__fish_seen_subcommand_from export" -l format -x -a "shell flake" -d "Output format"
 complete -c {bin} -n "__fish_seen_subcommand_from init" -l force -d "Overwrite existing {bin}.yml"
 "#;
@@ -269,8 +283,8 @@ mod tests {
     fn all_builtin_subcommands_appear_in_zsh_snippet() {
         let s = zsh_snippet();
         for cmd in &[
-            "up", "down", "services", "start", "stop", "restart", "status", "check", "init",
-            "hook", "pr", "export",
+            "up", "down", "services", "start", "stop", "restart", "status", "check", "doctor",
+            "init", "hook", "pr", "export",
         ] {
             assert!(s.contains(cmd), "zsh snippet missing '{}'", cmd);
         }
@@ -280,8 +294,8 @@ mod tests {
     fn all_builtin_subcommands_appear_in_bash_snippet() {
         let s = bash_snippet();
         for cmd in &[
-            "up", "down", "services", "start", "stop", "restart", "status", "check", "init",
-            "hook", "pr", "export",
+            "up", "down", "services", "start", "stop", "restart", "status", "check", "doctor",
+            "init", "hook", "pr", "export",
         ] {
             assert!(s.contains(cmd), "bash snippet missing '{}'", cmd);
         }
@@ -291,8 +305,8 @@ mod tests {
     fn all_builtin_subcommands_appear_in_fish_snippet() {
         let s = fish_snippet();
         for cmd in &[
-            "up", "down", "services", "start", "stop", "restart", "status", "check", "init",
-            "hook", "pr", "export",
+            "up", "down", "services", "start", "stop", "restart", "status", "check", "doctor",
+            "init", "hook", "pr", "export",
         ] {
             assert!(s.contains(cmd), "fish snippet missing '{}'", cmd);
         }
@@ -343,5 +357,28 @@ mod tests {
         assert!(zsh_snippet().contains("    down)\n      _arguments '--volumes["));
         assert!(bash_snippet().contains("    down)\n      COMPREPLY=($(compgen -W \"--volumes\""));
         assert!(fish_snippet().contains("-n \"__fish_seen_subcommand_from down\" -l volumes"));
+    }
+
+    #[test]
+    fn snippets_complete_doctor_flags() {
+        let zsh = zsh_snippet();
+        assert!(zsh.contains("'doctor:"), "{zsh}");
+        assert!(zsh.contains("    doctor)\n      _arguments \\\n        '--yes["));
+        for flag in ["'--no-ai[", "'--show-context["] {
+            assert!(zsh.contains(flag), "zsh missing {flag}");
+        }
+        assert!(bash_snippet().contains(
+            "    doctor)\n      COMPREPLY=($(compgen -W \"--yes --no-ai --show-context\""
+        ));
+        let fish = fish_snippet();
+        assert!(fish.contains("-a doctor"), "{fish}");
+        for flag in ["yes", "no-ai", "show-context"] {
+            assert!(
+                fish.contains(&format!(
+                    "-n \"__fish_seen_subcommand_from doctor\" -l {flag} "
+                )),
+                "fish missing --{flag}"
+            );
+        }
     }
 }
