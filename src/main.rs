@@ -22,6 +22,11 @@ fn main() {
         if let Some(silent) = err.downcast_ref::<error::SilentExit>() {
             std::process::exit(silent.0);
         }
+        if let Some(hinted) = err.downcast_ref::<error::HintedError>() {
+            eprintln!("error: {:#}", hinted.inner);
+            eprintln!("{}", hinted.hint);
+            std::process::exit(1);
+        }
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }

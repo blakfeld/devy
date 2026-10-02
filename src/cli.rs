@@ -69,6 +69,18 @@ enum Commands {
     Status,
     /// Validate the environment matches devy.yml without making changes
     Check,
+    /// Diagnose the environment and the last failed `devy up`, with Claude when available
+    Doctor {
+        /// Apply a suggested devy.yml fix without asking
+        #[arg(long)]
+        yes: bool,
+        /// Skip the AI diagnosis and show only devy's own checks (no network access)
+        #[arg(long)]
+        no_ai: bool,
+        /// Print exactly what would be sent to Claude, then exit without sending it
+        #[arg(long, conflicts_with_all = ["yes", "no_ai"])]
+        show_context: bool,
+    },
     /// Print a shell integration snippet to eval in your rc file
     Hook {
         /// Shell to generate the snippet for (zsh, bash, fish)
@@ -142,6 +154,11 @@ impl Cli {
             Commands::Down { volumes } => commands::down::run(*volumes),
             Commands::Status => commands::status::run(),
             Commands::Check => commands::check::run(),
+            Commands::Doctor {
+                yes,
+                no_ai,
+                show_context,
+            } => commands::doctor::run(*yes, *no_ai, *show_context),
             Commands::Pr => commands::pr::run(),
             Commands::Export { format } => commands::export::run(*format),
             Commands::Hook { shell } => commands::hook::run(shell),

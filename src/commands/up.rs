@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::commands::exec::{run_hook, spawn_cmd};
-use crate::commands::ports;
+use crate::commands::{failure_record, ports};
 use crate::config::{Dependency, DevyCommand, DevyConfig};
 use crate::env_manager::{EnvManager, Shadowenv};
+use crate::error::HintedError;
 use crate::lock::{LockFile, LockedDep};
 use crate::modules;
 use crate::output;
@@ -16,8 +17,80 @@ use crate::service_runner::{self, Runners, ServiceRunner};
 
 #[cfg_attr(test, mutants::skip)] // thin delegation — reads process env and disk; not unit-testable
 pub fn run(update: bool, bootstrap: bool) -> Result<()> {
-    let (config, project_root) = DevyConfig::load_with_root()?;
-    let pm = package_manager::detect(&config, &project_root)?;
+    // Located separately from parsing so that a devy.yml that fails to load is still
+    // recorded: only a missing devy.yml leaves nowhere to write the failure record.
+    let start = std::env::current_dir().context("Failed to get current directory")?;
+    let config_path = DevyConfig::find_config(&start)
+        .ok_or_else(|| anyhow::anyhow!("devy.yml not found — are you inside a devy project?"))?;
+    let project_root = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("devy.yml has no parent directory"))?
+        .to_path_buf();
+    let mut progress = UpProgress::default();
+    let result = run_located(
+        &config_path,
+        &project_root,
+        update,
+        bootstrap,
+        &mut progress,
+    );
+    record_outcome(&project_root, result, &progress)
+}
+
+/// The line printed after `error:` when a failure was recorded.
+pub(crate) fn doctor_hint() -> String {
+    format!(
+        "  {} run devy doctor to diagnose this failure",
+        colored::Colorize::cyan("·")
+    )
+}
+
+/// Writes the failure record for `Err` (returning the error with the doctor hint) and
+/// clears it for `Ok`. Problems with the record itself are a single warning and never
+/// change the outcome.
+pub(crate) fn record_outcome(
+    project_root: &Path,
+    result: Result<()>,
+    progress: &UpProgress,
+) -> Result<()> {
+    match result {
+        Ok(()) => {
+            if let Err(e) = failure_record::remove(project_root) {
+                output::warn(&format!("{e:#}"));
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let record = failure_record::FailureRecord::new(&err, progress);
+            match failure_record::write(project_root, &record) {
+                Ok(()) => Err(HintedError {
+                    inner: err,
+                    hint: doctor_hint(),
+                }
+                .into()),
+                Err(e) => {
+                    output::warn(&format!("could not record this failure: {e:#}"));
+                    Err(err)
+                }
+            }
+        }
+    }
+}
+
+#[cfg_attr(test, mutants::skip)] // process lock and real backends; logic is in up_tracked
+fn run_located(
+    config_path: &Path,
+    project_root: &Path,
+    update: bool,
+    bootstrap: bool,
+    progress: &mut UpProgress,
+) -> Result<()> {
+    progress.enter("load config");
+    let config = DevyConfig::load(config_path)?;
+    progress.enter("detect package manager");
+    let pm = package_manager::detect(&config, project_root)?;
+    progress.backend = Some(pm.name().to_string());
+    progress.enter("acquire process lock");
 
     // Acquire an exclusive advisory lock so concurrent `devy up` invocations
     // (e.g. two devs on the same machine, parallel CI jobs) queue rather than race.
@@ -34,13 +107,15 @@ pub fn run(update: bool, bootstrap: bool) -> Result<()> {
         .lock_exclusive()
         .context("Failed to acquire process lock (is another devy process running?)")?;
 
-    up_impl(
+    up_tracked(
         &config,
         pm.as_ref(),
+        ContainerRuntime::system(config.container_cli),
         &Shadowenv,
         UpOptions { update, bootstrap },
-        &project_root,
+        project_root,
         &project_root.join(crate::lock::PATH),
+        progress,
     )
     // _guard dropped here → lock released
 }
@@ -50,7 +125,25 @@ pub(crate) struct UpOptions {
     pub bootstrap: bool,
 }
 
+/// Where `devy up` is, so a failure can be recorded with the step and dependency it
+/// happened in.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct UpProgress {
+    pub step: Option<&'static str>,
+    pub dependency: Option<String>,
+    /// The selected package manager, once known.
+    pub backend: Option<String>,
+}
+
+impl UpProgress {
+    fn enter(&mut self, step: &'static str) {
+        self.step = Some(step);
+        self.dependency = None;
+    }
+}
+
 /// `up_with_runtime` with the real container CLI selected by `container_cli`.
+#[cfg(test)]
 pub(crate) fn up_impl(
     config: &DevyConfig,
     pm: &dyn package_manager::PackageManager,
@@ -70,6 +163,7 @@ pub(crate) fn up_impl(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn up_with_runtime(
     config: &DevyConfig,
     pm: &dyn package_manager::PackageManager,
@@ -79,18 +173,46 @@ pub(crate) fn up_with_runtime(
     project_root: &Path,
     lock_path: &Path,
 ) -> Result<()> {
+    up_tracked(
+        config,
+        pm,
+        runtime,
+        env_mgr,
+        opts,
+        project_root,
+        lock_path,
+        &mut UpProgress::default(),
+    )
+}
+
+/// `up_with_runtime`, recording the current step and dependency in `progress`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn up_tracked(
+    config: &DevyConfig,
+    pm: &dyn package_manager::PackageManager,
+    runtime: ContainerRuntime<'_>,
+    env_mgr: &dyn EnvManager,
+    opts: UpOptions,
+    project_root: &Path,
+    lock_path: &Path,
+    progress: &mut UpProgress,
+) -> Result<()> {
+    progress.backend = Some(pm.name().to_string());
     let project_name = config.name.as_deref().unwrap_or("project");
     output::header(&format!("devy up · {}", project_name));
 
     if let Some(ref hook) = config.hooks.before_up {
+        progress.enter("before_up hook");
         output::header("Hooks");
         run_hook("before_up", hook)?;
     }
 
+    progress.enter("read dependencies");
     let deps = config.normalized_dependencies()?;
 
     // The package manager is needed only to install a dependency or shadowenv, so a
     // project of docker-managed services runs without Nix, brew or apt.
+    progress.enter("check package manager");
     if deps.iter().any(|d| !d.docker) || !env_mgr.is_available() {
         output::step(&format!("Checking for {}", pm.name()));
         pm.ensure_available(opts.bootstrap)
@@ -99,6 +221,7 @@ pub(crate) fn up_with_runtime(
     }
 
     // Load the existing lock for orphan comparison regardless of --update.
+    progress.enter("read lock");
     let existing_lock = LockFile::load(lock_path).context("Failed to read devy.lock")?;
 
     // Docker-managed services pin images by the locked digest; --update re-resolves tags.
@@ -111,6 +234,7 @@ pub(crate) fn up_with_runtime(
         opts.update,
     );
     if deps.iter().any(|d| d.docker) {
+        progress.enter("check container runtime");
         let cli = runners.docker.runtime().cli_name();
         output::step(&format!("Checking for {cli}"));
         runners.ensure_docker_available(&deps)?;
@@ -127,7 +251,9 @@ pub(crate) fn up_with_runtime(
         existing_lock.clone()
     };
 
+    progress.enter("validate config");
     for dep in deps.iter().filter(|d| !d.docker) {
+        progress.dependency = Some(dep.name.clone());
         pm.validate_config(dep)
             .with_context(|| format!("{}: config validation failed", dep.name))?;
     }
@@ -150,6 +276,7 @@ pub(crate) fn up_with_runtime(
 
     // Assign stable ports to service deps before conflict detection.
     // Uses the existing lock (not the version-pinning lock) so ports survive --update.
+    progress.enter("resolve ports");
     ports::resolve_and_check(
         &mut effective_deps,
         existing_lock.as_ref(),
@@ -165,9 +292,11 @@ pub(crate) fn up_with_runtime(
     let mut module_path_prepends: Vec<String> = pm.path_prepends(project_root);
 
     // Phase 1: install all binaries (no services started yet).
+    progress.enter("install");
     if !effective_deps.is_empty() {
         output::header("Dependencies");
         for effective in &effective_deps {
+            progress.dependency = Some(effective.name.clone());
             install_binary(&runners, effective, project_root)?;
             let m = modules::get(&effective.name);
             module_env.extend(m.env_vars(effective, project_root));
@@ -204,7 +333,10 @@ pub(crate) fn up_with_runtime(
     // Write the lock immediately after all binaries are confirmed installed.
     // Doing this before service start means a service failure doesn't leave the
     // lock stale for the already-installed packages.
+    progress.enter("write lock");
     write_lock(&effective_deps, &runners, lock_path)?;
+
+    progress.enter("configure environment");
 
     let merged_env = merge_env(module_env, &config.environment);
 
@@ -274,11 +406,14 @@ pub(crate) fn up_with_runtime(
     }
 
     // Phase 2: start services (after lock is written).
+    progress.enter("start services");
     for effective in &effective_deps {
+        progress.dependency = Some(effective.name.clone());
         start_service_if_needed(runners.runner_for(effective), effective)?;
     }
 
     if let Some(ref hook) = config.hooks.after_up {
+        progress.enter("after_up hook");
         output::header("Hooks");
         run_hook("after_up", hook)?;
     }
@@ -1408,6 +1543,175 @@ mod tests {
             &lock,
         );
         assert!(result.is_err(), "install failure must propagate as Err");
+    }
+
+    fn tracked(
+        config: &crate::config::DevyConfig,
+        pm: &MockPackageManager,
+    ) -> (Result<()>, UpProgress) {
+        let dir = crate::test_support::tmp_dir();
+        let lock = tmp_path();
+        let mut progress = UpProgress::default();
+        let result = up_tracked(
+            config,
+            pm,
+            ContainerRuntime::system(config.container_cli),
+            &MockEnvManager::default(),
+            UpOptions {
+                update: false,
+                bootstrap: false,
+            },
+            &dir,
+            &lock,
+            &mut progress,
+        );
+        (result, progress)
+    }
+
+    #[test]
+    fn up_tracked_records_install_step_and_dependency_on_install_failure() {
+        let config = make_config(&["jq", "node"], HashMap::new());
+        let pm = MockPackageManager {
+            name: "brew",
+            install_fails: true,
+            ..Default::default()
+        };
+        let (result, progress) = tracked(&config, &pm);
+        assert!(result.is_err());
+        assert_eq!(progress.step, Some("install"));
+        assert_eq!(progress.dependency.as_deref(), Some("jq"));
+        assert_eq!(progress.backend.as_deref(), Some("brew"));
+    }
+
+    #[test]
+    fn up_tracked_records_hook_step_without_dependency() {
+        let yaml = "hooks:\n  before_up: \"exit 3\"\ndependencies:\n  - jq\n";
+        let config: crate::config::DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let (result, progress) = tracked(&config, &MockPackageManager::default());
+        assert!(result.is_err());
+        assert_eq!(progress.step, Some("before_up hook"));
+        assert_eq!(progress.dependency, None);
+    }
+
+    #[test]
+    fn up_tracked_records_port_conflict_step() {
+        let config = make_config(&["redis", "postgresql"], HashMap::new());
+        let dir = crate::test_support::tmp_dir();
+        let lock = dir.join(crate::lock::PATH);
+        std::fs::write(
+            &lock,
+            "version: 1\ndependencies:\n  redis:\n    resolved_version: null\n    source: nix\n    assigned_port: 15432\n  postgresql:\n    resolved_version: null\n    source: nix\n    assigned_port: 15432\n",
+        )
+        .unwrap();
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            ..Default::default()
+        };
+        let mut progress = UpProgress::default();
+        let result = up_tracked(
+            &config,
+            &pm,
+            ContainerRuntime::system(config.container_cli),
+            &MockEnvManager::default(),
+            UpOptions {
+                update: false,
+                bootstrap: false,
+            },
+            &dir,
+            &lock,
+            &mut progress,
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("port conflict"));
+        assert_eq!(progress.step, Some("resolve ports"));
+    }
+
+    // ── failure record ────────────────────────────────────────────────────────
+
+    fn failed_at_install() -> UpProgress {
+        UpProgress {
+            step: Some("install"),
+            dependency: Some("postgres".into()),
+            backend: Some("nix".into()),
+        }
+    }
+
+    #[test]
+    fn record_outcome_writes_record_and_hints_on_failure() {
+        let dir = crate::test_support::tmp_dir();
+        let err = anyhow::anyhow!("exit 1").context("Failed to install postgres");
+        let out = record_outcome(&dir, Err(err), &failed_at_install()).unwrap_err();
+        let hinted = out.downcast_ref::<HintedError>().expect("hinted");
+        assert_eq!(
+            format!("{:#}", hinted.inner),
+            "Failed to install postgres: exit 1"
+        );
+        assert!(
+            hinted
+                .hint
+                .contains("run devy doctor to diagnose this failure")
+        );
+        let record = failure_record::load(&dir).unwrap().unwrap();
+        assert_eq!(record.error_chain, "Failed to install postgres: exit 1");
+        assert_eq!(record.step.as_deref(), Some("install"));
+        assert_eq!(record.dependency.as_deref(), Some("postgres"));
+    }
+
+    #[test]
+    fn record_outcome_replaces_previous_record() {
+        let dir = crate::test_support::tmp_dir();
+        let _ = record_outcome(&dir, Err(anyhow::anyhow!("first")), &failed_at_install());
+        let _ = record_outcome(&dir, Err(anyhow::anyhow!("second")), &UpProgress::default());
+        let record = failure_record::load(&dir).unwrap().unwrap();
+        assert_eq!(record.error_chain, "second");
+        assert_eq!(record.step, None);
+    }
+
+    #[test]
+    fn record_outcome_deletes_record_on_success() {
+        let dir = crate::test_support::tmp_dir();
+        let _ = record_outcome(&dir, Err(anyhow::anyhow!("boom")), &failed_at_install());
+        assert!(failure_record::path(&dir).exists());
+        record_outcome(&dir, Ok(()), &UpProgress::default()).unwrap();
+        assert!(!failure_record::path(&dir).exists());
+    }
+
+    #[test]
+    fn record_outcome_unwritable_devy_dir_warns_once_and_keeps_error() {
+        let dir = crate::test_support::tmp_dir();
+        // A file where the .devy directory should be makes the record unwritable.
+        std::fs::write(dir.join(".devy"), "not a directory").unwrap();
+        let mut result = None;
+        let warnings = crate::output::with_warn_messages(|| {
+            result = Some(record_outcome(
+                &dir,
+                Err(anyhow::anyhow!("boom")),
+                &failed_at_install(),
+            ));
+        });
+        let err = result.unwrap().unwrap_err();
+        assert!(
+            err.downcast_ref::<HintedError>().is_none(),
+            "no hint without a record"
+        );
+        assert_eq!(format!("{err:#}"), "boom");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("could not record this failure"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn record_outcome_success_with_undeletable_record_warns_and_succeeds() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(failure_record::path(&dir)).unwrap();
+        let mut result = None;
+        let warnings = crate::output::with_warn_messages(|| {
+            result = Some(record_outcome(&dir, Ok(()), &UpProgress::default()));
+        });
+        assert!(result.unwrap().is_ok());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

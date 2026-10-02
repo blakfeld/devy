@@ -35,7 +35,7 @@ const FILES: &[&str] = &[
     "README.md",
 ];
 
-const SCHEMA: &str = r#"devy.yml schema:
+pub(crate) const SCHEMA: &str = r#"devy.yml schema:
 
 name: <string>                     # project name
 package_manager: auto|nix|brew|apt # optional; omit unless the project clearly requires one

@@ -6,64 +6,113 @@ use crate::config::Dependency;
 use crate::modules;
 use crate::service_runner::{self, Runners};
 
+/// One row of the dependency status table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepRow {
+    /// The dependency's name as written in devy.yml.
+    pub dep: String,
+    /// The label shown in the table, e.g. `node@22` or `redis (docker)`.
+    pub label: String,
+    pub installed: bool,
+    /// Whether an installed service is running; `None` for non-services and for
+    /// services that are not installed.
+    pub running: Option<bool>,
+}
+
+impl DepRow {
+    /// The problem this row represents: not installed, or a stopped service.
+    pub fn issue(&self) -> Option<String> {
+        if !self.installed {
+            Some(format!("{}: not installed", self.label))
+        } else if self.running == Some(false) {
+            Some(format!("{}: service stopped", self.label))
+        } else {
+            None
+        }
+    }
+}
+
+/// Queries each dependency's install and service state. Docker-managed services are
+/// labeled `(docker)`; for them, a missing image counts as not installed and a missing
+/// container as stopped. Rows gathered before an error are returned alongside it.
+pub fn dep_rows(deps: &[Dependency], runners: &Runners) -> (Vec<DepRow>, Option<anyhow::Error>) {
+    let mut rows = Vec::with_capacity(deps.len());
+    for dep in deps {
+        match dep_row(dep, runners) {
+            Ok(row) => rows.push(row),
+            Err(e) => return (rows, Some(e)),
+        }
+    }
+    (rows, None)
+}
+
+fn dep_row(dep: &Dependency, runners: &Runners) -> Result<DepRow> {
+    let runner = runners.runner_for(dep);
+    let installed = runner.is_installed(dep)?;
+    let running = if installed && modules::get(&dep.name).is_service() {
+        Some(runner.is_running(dep)?)
+    } else {
+        None
+    };
+    Ok(DepRow {
+        dep: dep.name.clone(),
+        label: service_runner::display_name(&dep.versioned_name(), runner),
+        installed,
+        running,
+    })
+}
+
 /// Renders the dependency status table and returns the number of issues found.
 /// Pass `bold_errors = true` when failures should be displayed in bold (check command).
-/// Docker-managed services are labeled `(docker)`; for them, a missing image counts as
-/// not installed and a missing container as stopped.
 pub fn print_dep_table(deps: &[Dependency], runners: &Runners, bold_errors: bool) -> Result<usize> {
-    let names: Vec<String> = deps
-        .iter()
-        .map(|d| service_runner::display_name(&d.versioned_name(), runners.runner_for(d)))
-        .collect();
-    let name_col = names.iter().map(String::len).max().unwrap_or(0);
+    let (rows, err) = dep_rows(deps, runners);
+    let issues = render_dep_rows(&rows, bold_errors);
+    match err {
+        Some(e) => Err(e),
+        None => Ok(issues),
+    }
+}
+
+/// Prints `rows` as the dependency status table and returns the number of issues.
+pub fn render_dep_rows(rows: &[DepRow], bold_errors: bool) -> usize {
+    let name_col = rows.iter().map(|r| r.label.len()).max().unwrap_or(0);
     const STATUS_COL: usize = "not installed".len();
+    let emphasize = |s: &str| {
+        if bold_errors {
+            s.red().bold().to_string()
+        } else {
+            s.red().to_string()
+        }
+    };
     let mut issues = 0usize;
 
-    for (dep, name) in deps.iter().zip(names) {
-        let module = modules::get(&dep.name);
-        let runner = runners.runner_for(dep);
-        let installed = runner.is_installed(dep)?;
-
-        let (icon, status) = if installed {
+    for row in rows {
+        let (icon, status) = if row.installed {
             (
                 "✓".green().bold().to_string(),
                 "installed".green().to_string(),
             )
         } else {
             issues += 1;
-            let txt = if bold_errors {
-                "not installed".red().bold().to_string()
-            } else {
-                "not installed".red().to_string()
-            };
-            ("✗".red().bold().to_string(), txt)
+            ("✗".red().bold().to_string(), emphasize("not installed"))
         };
 
-        let service = if module.is_service() {
-            if !installed {
-                "–".dimmed().to_string()
-            } else if runner.is_running(dep)? {
-                format!("{} {}", "✓".green().bold(), "running".green())
-            } else {
+        let service = match row.running {
+            Some(true) => format!("{} {}", "✓".green().bold(), "running".green()),
+            Some(false) => {
                 issues += 1;
-                let txt = if bold_errors {
-                    "stopped".red().bold().to_string()
-                } else {
-                    "stopped".red().to_string()
-                };
-                format!("{} {}", "✗".red().bold(), txt)
+                format!("{} {}", "✗".red().bold(), emphasize("stopped"))
             }
-        } else {
-            "–".dimmed().to_string()
+            None => "–".dimmed().to_string(),
         };
 
         println!(
             "  {}  {:<name_col$}  {:<STATUS_COL$}  {}",
-            icon, name, status, service
+            icon, row.label, status, service
         );
     }
 
-    Ok(issues)
+    issues
 }
 
 /// Renders the environment variable status table and returns the number of issues found.
