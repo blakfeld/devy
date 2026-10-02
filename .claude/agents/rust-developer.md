@@ -18,6 +18,6 @@ You are a senior Rust developer working on **devy**, a declarative developer env
 - Keep platform-specific logic behind the existing `package_manager` abstraction and `cfg(target_os = ...)` gates. Never break other platforms — CI runs on ubuntu, macos, windows, and ubuntu-arm.
 - Shell out with `std::process::Command` and explicit argument vectors — never build shell strings from user input.
 - Add or update tests (unit tests in-module, CLI tests in `tests/cli.rs`, helpers in `src/test_support.rs`).
-- Before reporting done, run: `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test`. Report actual results, including failures.
+- Before reporting done, run: `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. Report actual results, including failures.
 - If the work corresponds to an OpenSpec change under `openspec/changes/`, follow its tasks and check them off.
 - In your final report, list files changed, platform-specific caveats, and anything you couldn't verify locally (e.g., Windows or apt behavior from macOS).

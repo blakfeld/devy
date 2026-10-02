@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn write_env_file_creates_directory_and_file() {
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("MY_VAR".into(), "hello".into());
 
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn write_env_file_escapes_special_chars_in_value() {
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("K".into(), "back\\slash and \"quote\"".into());
 
@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn write_env_file_escapes_newline_in_value() {
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("K".into(), "line1\nline2".into());
         shadowenv.write_env_file(&dir, &vars, &[]).unwrap();
@@ -326,7 +326,7 @@ mod tests {
     fn read_vars_round_trips_value_with_embedded_quote_space_quote() {
         // Value contains `" "` (quote-space-quote) which previously caused a wrong split.
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("K".into(), "a\" \"b".into());
         shadowenv.write_env_file(&dir, &vars, &[]).unwrap();
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn write_env_file_escapes_carriage_return_in_value() {
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("K".into(), "a\rb".into());
         shadowenv.write_env_file(&dir, &vars, &[]).unwrap();
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn write_env_file_escapes_special_chars_in_key() {
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         // A key with a quote would be a Lisp injection if not escaped.
         vars.insert("KEY_WITH_\"QUOTE\"".into(), "value".into());
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn shadowenv_name_is_shadowenv() {
-        assert_eq!(Shadowenv::default().name(), "shadowenv");
+        assert_eq!(Shadowenv.name(), "shadowenv");
     }
 
     // ── Shadowenv::is_available ───────────────────────────────────────────────
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn shadowenv_is_available_consistent_with_which() {
         let expected = which("shadowenv").is_ok();
-        assert_eq!(Shadowenv::default().is_available(), expected);
+        assert_eq!(Shadowenv.is_available(), expected);
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
             return;
         }
         assert!(
-            Shadowenv::default().is_available(),
+            Shadowenv.is_available(),
             "must be true when shadowenv is on PATH"
         );
     }
@@ -398,7 +398,7 @@ mod tests {
             return;
         }
         assert!(
-            !Shadowenv::default().is_available(),
+            !Shadowenv.is_available(),
             "must be false when shadowenv is absent"
         );
     }
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn shadowenv_setup_writes_env_file() {
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("SETUP_KEY".into(), "setup_val".into());
         shadowenv.write_env_file(&dir, &vars, &[]).unwrap();
@@ -426,7 +426,7 @@ mod tests {
             return;
         }
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("KEY".into(), "val".into());
         let result = shadowenv.setup(&dir, &vars, &[]);
@@ -444,7 +444,7 @@ mod tests {
             return;
         }
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("KEY".into(), "val".into());
         let result = shadowenv.setup(&dir, &vars, &[]);
@@ -459,10 +459,14 @@ mod tests {
     #[test]
     fn read_path_prepends_handles_escaped_quote_in_path() {
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let path_with_quote = "/home/user/\"project\"/bin".to_string();
         shadowenv
-            .write_env_file(&dir, &HashMap::new(), &[path_with_quote.clone()])
+            .write_env_file(
+                &dir,
+                &HashMap::new(),
+                std::slice::from_ref(&path_with_quote),
+            )
             .unwrap();
         let file = dir.join(".shadowenv.d").join("500_devy.lisp");
         let entries = read_path_prepends(&file).unwrap();
@@ -476,7 +480,7 @@ mod tests {
     #[test]
     fn read_path_prepends_round_trips_multiple_entries() {
         let dir = tmp_dir();
-        let shadowenv = Shadowenv::default();
+        let shadowenv = Shadowenv;
         let paths = vec![
             "/usr/local/bin".to_string(),
             "/home/user/.local/bin".to_string(),
