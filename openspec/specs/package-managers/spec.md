@@ -67,7 +67,7 @@ The Nix backend SHALL install packages into the project-local profile `<project_
 - **THEN** devy runs `nix profile install --profile <profile> nixpkgs#nodejs_22`
 
 ### Requirement: Nix installed check is project-scoped
-The Nix backend SHALL treat a package as installed only if it appears in the project-local profile, matching the entry's attribute path against the exact attribute devy would install (versioned or not). When the profile does not exist yet, it MUST report nothing as installed. When the version was pinned from `devy.lock`, the unversioned attribute already installed at exactly that version SHALL also count as installed, so a later `devy up` doesn't reinstall it under its versioned name.
+The Nix backend SHALL treat a package as installed only if it appears in the project-local profile, matching the entry's attribute path against the exact attribute devy would install (versioned or not). When the profile does not exist yet, it MUST report nothing as installed. When the version was pinned from `devy.lock`, nix installs attributes rather than exact versions, so the check works at the attribute's granularity. An installed unversioned attribute SHALL also count as installed when its version maps to the same versioned attribute as the locked version. For a module without versioned attributes, the installed package satisfies any locked version. A later `devy up` therefore never reinstalls a package under its versioned name.
 
 #### Scenario: Globally installed package
 - **WHEN** `jq` is installed in the user's global Nix profile but `.devy/nix-profile` does not exist
@@ -84,6 +84,10 @@ The Nix backend SHALL treat a package as installed only if it appears in the pro
 #### Scenario: Version changed
 - **WHEN** `nodejs_22` is in the project profile and `node` is now declared with `version: "24"`
 - **THEN** devy reports `node` as not installed and installs `nodejs_24`
+
+#### Scenario: Locked patch version from a newer nixpkgs
+- **WHEN** `nodejs` 24.20.0 is in the project profile and `devy.lock` records node `24.21.0`, written by a teammate whose nixpkgs is newer
+- **THEN** devy reports `node` as installed and installs nothing
 
 ### Requirement: Nix profile on PATH first
 When using the Nix backend, devy SHALL put `<project_root>/.devy/nix-profile/bin` ahead of every module-contributed PATH entry in the generated environment.
@@ -195,3 +199,14 @@ Modules whose nixpkgs package nixpkgs marks insecure SHALL declare it: `elastics
 #### Scenario: Other packages stay secure-only
 - **WHEN** `devy up` installs `redis` and `mongodb` with the nix backend
 - **THEN** neither install allows insecure packages, and no insecure warning is printed
+
+### Requirement: Nix reports installed versions
+The Nix backend SHALL report a package's installed version from its profile entry. When the entry records no version, as with Nix ≥ 2.20, the backend SHALL derive the version from the name of the entry's main output store path. It splits at the first `-` that is followed by a digit, as Nix itself does: `redis-8.6.3` gives `8.6.3`, and `apache-kafka-2.13-4.3.1` gives `2.13-4.3.1`. The main output is the store path whose name is a prefix of the entry's other outputs' names (so `mysql-8.4.11` rather than `mysql-8.4.11-man`). When no version can be derived, the reported version SHALL be absent. It MUST NOT be the string `unknown`.
+
+#### Scenario: Version from a v3 profile entry
+- **WHEN** the project profile contains `redis` with store path `/nix/store/<hash>-redis-8.6.3` and no version field
+- **THEN** devy reports redis as installed at `8.6.3`, and `devy up` prints `redis@8.6.3 already installed`
+
+#### Scenario: Multiple outputs
+- **WHEN** the profile entry for `mysql84` lists `<hash>-mysql-8.4.11-man` before `<hash>-mysql-8.4.11`
+- **THEN** devy reports version `8.4.11`

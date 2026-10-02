@@ -73,6 +73,14 @@ impl Module for MongodbModule {
         pm.install_package(&super::pkg_dep(self, pm, dep, package_name(pm)))
     }
 
+    fn resolved_version(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+    ) -> Result<Option<String>> {
+        super::pkg_resolved_version(self, pm, dep, package_name(pm))
+    }
+
     fn service_name<'a>(&self, _dep: &'a Dependency) -> Cow<'a, str> {
         if cfg!(target_os = "linux") {
             Cow::Borrowed("mongod")

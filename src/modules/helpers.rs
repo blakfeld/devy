@@ -43,6 +43,14 @@ impl Module for PackageModule {
         super::pkg_installed(self, pm, dep, self.name_for(pm))
     }
 
+    fn resolved_version(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+    ) -> Result<Option<String>> {
+        super::pkg_resolved_version(self, pm, dep, self.name_for(pm))
+    }
+
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
         pm.install_package(&super::pkg_dep(self, pm, dep, self.name_for(pm)))
     }

@@ -88,6 +88,14 @@ impl Module for JavaModule {
         pm.is_package_installed(&pm_dep(dep, &pkg_name(pm, dep)))
     }
 
+    fn resolved_version(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+    ) -> Result<Option<String>> {
+        super::pkg_resolved_version(self, pm, dep, NIX_DEFAULT_JDK)
+    }
+
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
         pm.install_package(&pm_dep(dep, &pkg_name(pm, dep)))
     }
