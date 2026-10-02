@@ -60,13 +60,9 @@ fn remote_url() -> Result<String> {
 }
 
 fn github_repo_path(url: &str) -> Option<String> {
-    let path = if let Some(rest) = url.strip_prefix("git@github.com:") {
-        rest.to_string()
-    } else if let Some(rest) = url.strip_prefix("https://github.com/") {
-        rest.to_string()
-    } else {
-        return None;
-    };
+    let path = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))?;
     Some(path.trim_end_matches(".git").to_string())
 }
 

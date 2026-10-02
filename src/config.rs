@@ -237,10 +237,7 @@ impl DevyConfig {
             if home.as_deref() == Some(dir.as_path()) {
                 return None;
             }
-            match dir.parent() {
-                Some(parent) => dir = parent.to_path_buf(),
-                None => return None,
-            }
+            dir = dir.parent()?.to_path_buf();
         }
     }
 
