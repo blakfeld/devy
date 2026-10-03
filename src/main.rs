@@ -9,6 +9,7 @@ mod lock;
 mod modules;
 mod output;
 mod package_manager;
+mod project_env;
 mod service_runner;
 #[cfg(test)]
 mod test_support;

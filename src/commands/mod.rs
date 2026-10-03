@@ -1,12 +1,15 @@
+pub mod agent_setup;
 pub mod ask;
 pub mod check;
 pub mod doctor;
 pub mod down;
 pub mod exec;
+pub mod exec_env;
 pub mod export;
 pub mod failure_record;
 pub mod hook;
 pub mod init;
+pub mod json;
 pub mod list_commands;
 pub mod logs;
 pub mod ports;

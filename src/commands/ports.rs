@@ -39,6 +39,17 @@ impl ResolvedPort {
             Self::Unassigned => None,
         }
     }
+
+    /// Where the port came from, as reported by `--json` output. A freshly assigned
+    /// port is reported as `lock`, since `up` records it there.
+    pub(crate) fn source(self) -> &'static str {
+        match self {
+            Self::Explicit(_) => "explicit",
+            Self::Locked(_) | Self::Assigned(_) => "lock",
+            Self::Default(_) => "default",
+            Self::Unassigned => "unassigned",
+        }
+    }
 }
 
 /// Resolves the port of every service dep and writes it into `dep.extra[port_key]` so

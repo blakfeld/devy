@@ -1,10 +1,57 @@
 use anyhow::Result;
 use colored::Colorize;
+use serde::Serialize;
 use std::collections::HashMap;
 
 use crate::config::Dependency;
 use crate::modules;
-use crate::service_runner::{self, Runners};
+use crate::service_runner::{self, Runners, ServiceRunner};
+
+use super::ports::ResolvedPort;
+
+/// What installs and runs a dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    Package,
+    Docker,
+}
+
+impl Backend {
+    pub fn of(runner: &dyn ServiceRunner) -> Self {
+        match runner.label() {
+            Some(_) => Self::Docker,
+            None => Self::Package,
+        }
+    }
+}
+
+/// The address services listen on, as exported in `<SERVICE>_HOST`.
+pub const SERVICE_HOST: &str = "127.0.0.1";
+
+/// A service's backend, running state and port, as reported by `--json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ServiceState {
+    pub backend: Backend,
+    pub running: bool,
+    pub host: &'static str,
+    pub port: Option<u16>,
+    /// `explicit`, `lock`, `default` or `unassigned`; `None` when the service has no
+    /// configurable port.
+    pub port_source: Option<&'static str>,
+}
+
+impl ServiceState {
+    pub fn new(backend: Backend, running: bool, port: Option<ResolvedPort>) -> Self {
+        Self {
+            backend,
+            running,
+            host: SERVICE_HOST,
+            port: port.and_then(ResolvedPort::port),
+            port_source: port.map(ResolvedPort::source),
+        }
+    }
+}
 
 /// One row of the dependency status table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +64,10 @@ pub struct DepRow {
     /// Whether an installed service is running; `None` for non-services and for
     /// services that are not installed.
     pub running: Option<bool>,
+    pub backend: Backend,
+    /// The service's resolved port; `None` for deps without a configurable port and
+    /// when ports were not resolved.
+    pub port: Option<ResolvedPort>,
 }
 
 impl DepRow {
@@ -35,10 +86,17 @@ impl DepRow {
 /// Queries each dependency's install and service state. Docker-managed services are
 /// labeled `(docker)`; for them, a missing image counts as not installed and a missing
 /// container as stopped. Rows gathered before an error are returned alongside it.
-pub fn dep_rows(deps: &[Dependency], runners: &Runners) -> (Vec<DepRow>, Option<anyhow::Error>) {
+///
+/// `ports` holds one entry per dep from `ports::resolve_ports`, or is empty when the
+/// caller did not resolve ports.
+pub fn dep_rows(
+    deps: &[Dependency],
+    ports: &[Option<ResolvedPort>],
+    runners: &Runners,
+) -> (Vec<DepRow>, Option<anyhow::Error>) {
     let mut rows = Vec::with_capacity(deps.len());
-    for dep in deps {
-        match dep_row(dep, runners) {
+    for (i, dep) in deps.iter().enumerate() {
+        match dep_row(dep, ports.get(i).copied().flatten(), runners) {
             Ok(row) => rows.push(row),
             Err(e) => return (rows, Some(e)),
         }
@@ -46,7 +104,7 @@ pub fn dep_rows(deps: &[Dependency], runners: &Runners) -> (Vec<DepRow>, Option<
     (rows, None)
 }
 
-fn dep_row(dep: &Dependency, runners: &Runners) -> Result<DepRow> {
+fn dep_row(dep: &Dependency, port: Option<ResolvedPort>, runners: &Runners) -> Result<DepRow> {
     let runner = runners.runner_for(dep);
     let installed = runner.is_installed(dep)?;
     let running = if installed && modules::get(&dep.name).is_service() {
@@ -59,18 +117,9 @@ fn dep_row(dep: &Dependency, runners: &Runners) -> Result<DepRow> {
         label: service_runner::display_name(&dep.versioned_name(), runner),
         installed,
         running,
+        backend: Backend::of(runner),
+        port,
     })
-}
-
-/// Renders the dependency status table and returns the number of issues found.
-/// Pass `bold_errors = true` when failures should be displayed in bold (check command).
-pub fn print_dep_table(deps: &[Dependency], runners: &Runners, bold_errors: bool) -> Result<usize> {
-    let (rows, err) = dep_rows(deps, runners);
-    let issues = render_dep_rows(&rows, bold_errors);
-    match err {
-        Some(e) => Err(e),
-        None => Ok(issues),
-    }
 }
 
 /// Prints `rows` as the dependency status table and returns the number of issues.
@@ -250,30 +299,35 @@ mod tests {
     use crate::service_runner::package_runners;
     use std::path::Path;
 
+    /// Renders the rows for `deps` and returns the issue count, or the query error.
+    fn rendered_issues(deps: &[Dependency], runners: &Runners) -> Result<usize> {
+        let (rows, err) = dep_rows(deps, &[], runners);
+        let issues = render_dep_rows(&rows, false);
+        err.map_or(Ok(issues), Err)
+    }
+
     #[test]
-    fn print_dep_table_returns_zero_when_all_installed() {
+    fn render_dep_rows_returns_zero_when_all_installed() {
         let pm = MockPackageManager {
             installed: true,
             ..Default::default()
         };
         let deps = vec![Dependency::simple("node"), Dependency::simple("python")];
-        let issues =
-            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
+        let issues = rendered_issues(&deps, &package_runners(&pm, Path::new("/tmp"))).unwrap();
         assert_eq!(issues, 0, "no issues when all deps are installed");
     }
 
     #[test]
-    fn print_dep_table_returns_nonzero_when_dep_missing() {
-        // Kills `replace print_dep_table -> Ok(0)` and `replace -> Ok(1)`.
+    fn render_dep_rows_returns_nonzero_when_dep_missing() {
+        // Kills `replace render_dep_rows -> Ok(0)` and `replace -> Ok(1)`.
         let pm = MockPackageManager::default(); // installed=false
         let deps = vec![Dependency::simple("node"), Dependency::simple("python")];
-        let issues =
-            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
+        let issues = rendered_issues(&deps, &package_runners(&pm, Path::new("/tmp"))).unwrap();
         assert!(issues > 0, "should count missing deps as issues");
     }
 
     #[test]
-    fn print_dep_table_counts_each_missing_dep() {
+    fn render_dep_rows_counts_each_missing_dep() {
         // Kills `replace += with -=` — with subtraction, issues would be negative (wraps to usize::MAX).
         let pm = MockPackageManager::default();
         let deps = vec![
@@ -281,23 +335,22 @@ mod tests {
             Dependency::simple("python"),
             Dependency::simple("ruby"),
         ];
-        let issues =
-            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
+        let issues = rendered_issues(&deps, &package_runners(&pm, Path::new("/tmp"))).unwrap();
         assert_eq!(issues, 3, "each missing dep must add 1 to issues");
     }
 
     #[test]
-    fn print_dep_table_empty_deps_returns_zero() {
-        // Kills `delete ! in print_dep_table at line 48` — with mutation, empty list would
+    fn render_dep_rows_empty_deps_returns_zero() {
+        // Kills `delete ! in render_dep_rows at line 48` — with mutation, empty list would
         // enter the service-running check and panic (service running check on non-service).
         // Actually, empty deps → no iterations → issues = 0.
         let pm = MockPackageManager::default();
-        let issues = print_dep_table(&[], &package_runners(&pm, Path::new("/tmp")), false).unwrap();
+        let issues = rendered_issues(&[], &package_runners(&pm, Path::new("/tmp"))).unwrap();
         assert_eq!(issues, 0);
     }
 
     #[test]
-    fn print_dep_table_counts_stopped_service_as_issue() {
+    fn render_dep_rows_counts_stopped_service_as_issue() {
         // Kills `replace += with -=` at line 53 (service stopped counter).
         let pm = MockPackageManager {
             installed: true,
@@ -305,36 +358,95 @@ mod tests {
             ..Default::default()
         };
         let deps = vec![Dependency::simple("mysql")]; // mysql is a service
-        let issues =
-            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
+        let issues = rendered_issues(&deps, &package_runners(&pm, Path::new("/tmp"))).unwrap();
         assert_eq!(issues, 1, "stopped service must count as one issue");
     }
 
     #[test]
-    fn print_dep_table_running_service_does_not_add_issues() {
+    fn render_dep_rows_running_service_does_not_add_issues() {
         let pm = MockPackageManager {
             installed: true,
             service_running: true,
             ..Default::default()
         };
         let deps = vec![Dependency::simple("mysql")];
-        let issues =
-            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
+        let issues = rendered_issues(&deps, &package_runners(&pm, Path::new("/tmp"))).unwrap();
         assert_eq!(issues, 0, "running service must not add to issues");
     }
 
     #[test]
-    fn print_dep_table_uninstalled_service_counts_only_once() {
-        // Kills `delete ! in print_dep_table` at the `!installed` check for service rendering.
+    fn render_dep_rows_uninstalled_service_counts_only_once() {
+        // Kills `delete ! in render_dep_rows` at the `!installed` check for service rendering.
         // When not installed, service status shows "–" (not checked), so only 1 issue.
         let pm = MockPackageManager::default(); // installed=false, service_running=false
         let deps = vec![Dependency::simple("mysql")];
-        let issues =
-            print_dep_table(&deps, &package_runners(&pm, Path::new("/tmp")), false).unwrap();
+        let issues = rendered_issues(&deps, &package_runners(&pm, Path::new("/tmp"))).unwrap();
         assert_eq!(
             issues, 1,
             "uninstalled service should count as exactly 1 issue"
         );
+    }
+
+    #[test]
+    fn dep_rows_report_docker_backend() {
+        use crate::service_runner::docker::{ContainerRuntime, FakeRunner, ok};
+        let config: crate::config::DevyConfig =
+            serde_yml::from_str("service_manager: docker\ndependencies:\n  - redis\n  - jq\n")
+                .unwrap();
+        let pm = MockPackageManager {
+            installed: true,
+            ..Default::default()
+        };
+        let cli =
+            FakeRunner::new(|_| ok(r#"[{"State":{"Running":false},"Config":{"Labels":{}}}]"#));
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &cli),
+            &config,
+            Path::new("/src/app"),
+            None,
+            false,
+        );
+        let deps = config.normalized_dependencies().unwrap();
+        let (rows, err) = dep_rows(&deps, &[], &runners);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(rows[0].backend, Backend::Docker);
+        assert_eq!(rows[0].label, "redis (docker)");
+        assert_eq!(rows[1].backend, Backend::Package);
+    }
+
+    #[test]
+    fn dep_rows_report_locked_port_source() {
+        use crate::commands::ports::{self, PortMode};
+        use crate::lock::{LockFile, LockedDep};
+        let mut locked = std::collections::BTreeMap::new();
+        locked.insert(
+            "redis".to_string(),
+            LockedDep {
+                resolved_version: None,
+                source: "nix".into(),
+                assigned_port: Some(52113),
+                image_digest: None,
+            },
+        );
+        let lock = LockFile {
+            dependencies: locked,
+            ..Default::default()
+        };
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            service_running: true,
+            ..Default::default()
+        };
+        let mut deps = vec![Dependency::simple("redis"), Dependency::simple("jq")];
+        let resolved =
+            ports::resolve_ports(&mut deps, Some(&lock), &pm, PortMode::ReadOnly).unwrap();
+        let (rows, _) = dep_rows(&deps, &resolved, &package_runners(&pm, Path::new("/tmp")));
+        assert_eq!(rows[0].port, Some(ResolvedPort::Locked(52113)));
+        assert_eq!(rows[0].port.unwrap().source(), "lock");
+        assert_eq!(rows[0].backend, Backend::Package);
+        assert_eq!(rows[1].port, None, "jq has no port");
     }
 
     #[test]

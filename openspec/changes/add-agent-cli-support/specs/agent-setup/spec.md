@@ -37,7 +37,7 @@ When `SKILL.md` already exists and contains devy's generated marker, `devy agent
 - **THEN** `devy agent-setup` exits 1 without changing it, and `devy agent-setup --force` overwrites it
 
 ### Requirement: AGENTS.md block
-When `AGENTS.md` exists at the project root, `devy agent-setup` SHALL make sure it contains exactly one block between `<!-- devy:begin -->` and `<!-- devy:end -->` with a short summary of the same guidance. It SHALL replace an existing block in place, otherwise append the block at the end of the file, and SHALL leave all content outside the markers unchanged. When `AGENTS.md` does not exist, devy SHALL NOT create it unless `--agents-md` is given. `--agents-md` creates the file containing only the block. Each file written SHALL be reported with `✓ updated <path>` or `✓ wrote <path>`.
+When `AGENTS.md` exists at the project root, `devy agent-setup` SHALL make sure it contains exactly one block between `<!-- devy:begin -->` and `<!-- devy:end -->` with a short summary of the same guidance. It SHALL replace an existing block in place, otherwise append the block at the end of the file, and SHALL leave all content outside the markers unchanged. A marker SHALL count only on a line of its own outside fenced code blocks. The block SHALL use the file's line endings. When `AGENTS.md` or `SKILL.md` is a symlink, devy SHALL update the link's target and leave the link in place. When `AGENTS.md` does not exist, devy SHALL NOT create it unless `--agents-md` is given. `--agents-md` creates the file containing only the block. Each file written SHALL be reported with `✓ updated <path>` or `✓ wrote <path>`.
 
 #### Scenario: Existing AGENTS.md gains block
 - **WHEN** `AGENTS.md` contains other guidance and no devy block
@@ -46,6 +46,10 @@ When `AGENTS.md` exists at the project root, `devy agent-setup` SHALL make sure 
 #### Scenario: Block replaced in place
 - **WHEN** `AGENTS.md` already has a devy block followed by other content
 - **THEN** `devy agent-setup` replaces only the text between the markers
+
+#### Scenario: Symlinked AGENTS.md
+- **WHEN** `AGENTS.md` is a symlink to `CLAUDE.md`
+- **THEN** after `devy agent-setup`, `AGENTS.md` is still a symlink and `CLAUDE.md` contains the devy block
 
 #### Scenario: AGENTS.md not created by default
 - **WHEN** no `AGENTS.md` exists and the user runs `devy agent-setup`

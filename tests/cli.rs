@@ -1078,11 +1078,510 @@ fn help_output_lists_key_subcommands() {
     let out = Command::new(binary()).arg("--help").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     for cmd in &[
-        "up", "down", "check", "doctor", "init", "hook", "status", "logs", "ask",
+        "up",
+        "down",
+        "check",
+        "doctor",
+        "init",
+        "hook",
+        "status",
+        "logs",
+        "ask",
+        "exec",
+        "agent-setup",
     ] {
         assert!(
             stdout.contains(cmd),
             "--help output must list the '{cmd}' subcommand"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// exec
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LOCK_WITH_REDIS_PORT: &str = "version: 1\ndependencies:\n  redis:\n    resolved_version: null\n    source: nix\n    assigned_port: 52113\n";
+
+#[cfg(unix)]
+#[test]
+fn exec_env_shows_project_environment() {
+    let proj = TempProject::with_yaml(
+        "package_manager: nix\ndependencies:\n  - redis\nenvironment:\n  LOG_LEVEL: debug\n",
+    );
+    proj.write("devy.lock", LOCK_WITH_REDIS_PORT);
+    let lock_before = std::fs::read(proj.file("devy.lock")).unwrap();
+    let out = proj.run(&["exec", "env"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.contains(&"LOG_LEVEL=debug"), "{stdout}");
+    assert!(lines.contains(&"REDIS_HOST=127.0.0.1"), "{stdout}");
+    assert!(lines.contains(&"REDIS_PORT=52113"), "{stdout}");
+    let path = lines.iter().find_map(|l| l.strip_prefix("PATH=")).unwrap();
+    assert!(
+        path.split(':')
+            .next()
+            .unwrap()
+            .ends_with(".devy/nix-profile/bin"),
+        "project PATH entries come first: {path}"
+    );
+    assert_eq!(std::fs::read(proj.file("devy.lock")).unwrap(), lock_before);
+    assert!(!proj.file(".shadowenv.d").exists());
+    assert!(!proj.file(".devy").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_passes_exit_code_through() {
+    let proj = TempProject::with_yaml("package_manager: nix\n");
+    let out = proj.run(&["exec", "sh", "-c", "exit 3"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("error:"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn exec_missing_program_exits_one() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["exec", "no-such-program"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error:"), "{stderr}");
+    assert!(stderr.contains("no-such-program"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_does_not_interpret_arguments_with_a_shell() {
+    let proj = TempProject::with_yaml("package_manager: nix\n");
+    let out = proj.run(&["exec", "--", "printf", "%s\\n", "$HOME; rm -rf x"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "$HOME; rm -rf x\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_output_is_the_programs_only() {
+    let proj = TempProject::with_yaml("package_manager: nix\n");
+    let out = proj.run(&["exec", "echo", "hi"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+}
+
+#[test]
+fn exec_without_program_is_a_usage_error() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    assert_eq!(proj.run(&["exec"]).status.code(), Some(2));
+}
+
+#[test]
+fn exec_outside_a_project_fails() {
+    let proj = TempProject::new();
+    let out = proj.run(&["exec", "env"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("error: devy.yml not found"));
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_finds_a_program_on_the_project_path_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let proj = TempProject::with_yaml("package_manager: nix\n");
+    let bin = proj.file(".devy/nix-profile/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("devy-test-hello"),
+        "#!/bin/sh\necho project hello\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        bin.join("devy-test-hello"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let out = proj.run(&["exec", "devy-test-hello"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "project hello\n");
+}
+
+#[cfg(windows)]
+#[test]
+fn exec_finds_a_program_on_the_project_path_only() {
+    // Windows has no nix profile; python's venv Scripts directory is a module PATH entry.
+    let proj = TempProject::with_yaml("dependencies:\n  - python\n");
+    let bin = proj.file(".venv\\Scripts");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("devy-test-hello.cmd"), "@echo project hello\r\n").unwrap();
+    let out = proj.run(&["exec", "devy-test-hello"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "project hello");
+}
+
+#[cfg(windows)]
+#[test]
+fn exec_passes_exit_code_through() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["exec", "cmd", "/c", "exit 3"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("error:"));
+}
+
+#[cfg(windows)]
+#[test]
+fn exec_passes_arguments_to_a_cmd_script() {
+    let proj = TempProject::with_yaml("dependencies:\n  - python\n");
+    let bin = proj.file(".venv\\Scripts");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("devy-test-args.cmd"), "@echo [%~1] [%~2]\r\n").unwrap();
+    let out = proj.run(&["exec", "devy-test-args", "a b", "c"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[a b] [c]");
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_builtin_shadows_project_command() {
+    let proj = TempProject::with_yaml(
+        "package_manager: nix\ncommands:\n  exec: echo project-command\nenvironment:\n  LOG_LEVEL: debug\n",
+    );
+    let out = proj.run(&["exec", "env"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.lines().any(|l| l == "LOG_LEVEL=debug"), "{stdout}");
+    assert!(!stdout.contains("project-command"), "{stdout}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// agent-setup
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SKILL: &str = ".claude/skills/devy/SKILL.md";
+
+#[test]
+fn agent_setup_writes_skill() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["agent-setup"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let skill = std::fs::read_to_string(proj.file(SKILL)).unwrap();
+    assert!(skill.starts_with("---\nname: devy\n"), "{skill}");
+    assert!(skill.contains("devy status --json") && skill.contains("devy exec"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("✓ wrote .claude/skills/devy/SKILL.md"));
+    assert!(!proj.file("AGENTS.md").exists());
+
+    let again = proj.run(&["agent-setup"]);
+    assert!(again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stdout)
+            .contains("○ .claude/skills/devy/SKILL.md is up to date")
+    );
+}
+
+#[test]
+fn agent_setup_from_subdirectory_writes_at_project_root() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    std::fs::create_dir_all(proj.file("src/nested")).unwrap();
+    proj.write("AGENTS.md", "# Agents\n");
+    let out = Command::new(binary())
+        .arg("agent-setup")
+        .current_dir(proj.file("src/nested"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(proj.file(SKILL).exists());
+    assert!(!proj.file("src/nested/.claude").exists());
+    let agents = std::fs::read_to_string(proj.file("AGENTS.md")).unwrap();
+    assert!(
+        agents.starts_with("# Agents\n\n<!-- devy:begin -->"),
+        "{agents}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("✓ updated AGENTS.md"));
+}
+
+#[test]
+fn agent_setup_outside_a_project_fails() {
+    let proj = TempProject::new();
+    let out = proj.run(&["agent-setup"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("error: devy.yml not found"));
+    assert!(!proj.file(".claude").exists());
+}
+
+#[test]
+fn agent_setup_protects_hand_written_skill() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    std::fs::create_dir_all(proj.file(".claude/skills/devy")).unwrap();
+    proj.write(SKILL, "mine\n");
+    let out = proj.run(&["agent-setup"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(
+            "error: .claude/skills/devy/SKILL.md was not written by devy. Use --force to overwrite."
+        ),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(proj.file(SKILL)).unwrap(), "mine\n");
+    assert!(proj.run(&["agent-setup", "--force"]).status.success());
+    assert_ne!(std::fs::read_to_string(proj.file(SKILL)).unwrap(), "mine\n");
+}
+
+#[test]
+fn agent_setup_agents_md_flag_creates_the_file() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["agent-setup", "--agents-md"]);
+    assert!(out.status.success());
+    let agents = std::fs::read_to_string(proj.file("AGENTS.md")).unwrap();
+    assert!(agents.starts_with("<!-- devy:begin -->"));
+    assert!(agents.trim_end().ends_with("<!-- devy:end -->"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("✓ wrote AGENTS.md"));
+}
+
+#[test]
+fn agent_setup_print_writes_nothing() {
+    let proj = TempProject::new();
+    let out = proj.run(&["agent-setup", "--print"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("---\nname: devy\n"));
+    assert!(!proj.file(".claude").exists());
+}
+
+#[test]
+fn agent_setup_print_conflicts_with_force() {
+    let proj = TempProject::new();
+    assert_eq!(
+        proj.run(&["agent-setup", "--print", "--force"])
+            .status
+            .code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn init_detect_installs_agent_skill() {
+    let proj = TempProject::new();
+    let out = proj.run(&["init", "--detect"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(proj.file(SKILL).exists());
+    assert!(!proj.file("AGENTS.md").exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("✓ wrote devy.yml"), "{stdout}");
+    assert!(
+        stdout.contains("✓ wrote .claude/skills/devy/SKILL.md"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn init_that_writes_nothing_installs_no_agent_files() {
+    let proj = TempProject::with_yaml("name: existing\n");
+    assert_eq!(proj.run(&["init", "--detect"]).status.code(), Some(1));
+    assert!(!proj.file(".claude").exists());
+
+    let fresh = TempProject::new();
+    assert!(
+        fresh
+            .run_without_claude(&["init", "--show-context"])
+            .status
+            .success()
+    );
+    assert!(!fresh.file(".claude").exists());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// --json
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parses stdout as exactly one JSON object with `version: 1` and no ANSI escapes.
+fn json_doc(out: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+    assert!(
+        !stdout.contains('\x1b'),
+        "ANSI escape in stdout: {stdout:?}"
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains('\x1b'));
+    assert!(stdout.ends_with("}\n"), "{stdout:?}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(doc["version"], 1, "{doc}");
+    doc
+}
+
+fn keys(v: &serde_json::Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys
+}
+
+#[cfg(unix)]
+#[test]
+fn json_documents_match_the_spec() {
+    let proj = TempProject::with_yaml(
+        "name: shop\npackage_manager: nix\ndependencies:\n  - jq\n  - redis\n\
+         environment:\n  LOG_LEVEL: debug\n  STRIPE_SECRET_KEY: sk_live_abc\n\
+         commands:\n  test: cargo test\n  lint: cargo clippy\n",
+    );
+    proj.write("devy.lock", LOCK_WITH_REDIS_PORT);
+    std::fs::create_dir_all(proj.file(".shadowenv.d")).unwrap();
+    proj.write(
+        ".shadowenv.d/500_devy.lisp",
+        "(provide \"devy\" \"1.0.0\")\n\n(env/set \"LOG_LEVEL\" \"debug\")\n(env/set \"STRIPE_SECRET_KEY\" \"sk_live_abc\")\n",
+    );
+
+    // status
+    let text = proj.run(&["status"]);
+    let out = proj.run(&["status", "--json"]);
+    assert_eq!(out.status.code(), text.status.code());
+    assert_eq!(out.status.code(), Some(0));
+    let doc = json_doc(&out);
+    assert_eq!(
+        keys(&doc),
+        [
+            "commands",
+            "dependencies",
+            "environment",
+            "environment_written",
+            "package_manager",
+            "path",
+            "project",
+            "version"
+        ]
+    );
+    assert_eq!(doc["project"], "shop");
+    assert_eq!(doc["package_manager"], "nix");
+    assert_eq!(doc["environment_written"], true);
+    assert_eq!(doc["environment"]["LOG_LEVEL"], "debug");
+    assert_eq!(doc["environment"]["STRIPE_SECRET_KEY"], "<redacted>");
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("sk_live_abc"),
+        "plain status shows the written value"
+    );
+    let deps = doc["dependencies"].as_array().unwrap();
+    assert_eq!(keys(&deps[0]), ["installed", "name", "service", "version"]);
+    assert_eq!(
+        keys(&deps[1]),
+        [
+            "backend",
+            "host",
+            "installed",
+            "name",
+            "port",
+            "port_source",
+            "running",
+            "service",
+            "version"
+        ]
+    );
+    assert_eq!(deps[1]["port"], 52113);
+    assert_eq!(deps[1]["port_source"], "lock");
+    let names: Vec<&str> = doc["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["lint", "test"]);
+    assert_eq!(keys(&doc["commands"][0]), ["cmd", "name", "shell"]);
+
+    // services
+    let text = proj.run(&["services"]);
+    let out = proj.run(&["services", "--json"]);
+    assert_eq!(out.status.code(), text.status.code());
+    let doc = json_doc(&out);
+    assert_eq!(keys(&doc), ["services", "version"]);
+    let services = doc["services"].as_array().unwrap();
+    assert_eq!(services.len(), 1);
+    assert_eq!(
+        keys(&services[0]),
+        ["backend", "host", "name", "port", "port_source", "running"]
+    );
+    assert_eq!(services[0]["name"], "redis");
+    assert_eq!(services[0]["port"], 52113);
+
+    // check: jq and redis aren't installed in the empty nix profile
+    let text = proj.run(&["check"]);
+    let out = proj.run(&["check", "--json"]);
+    assert_eq!(out.status.code(), text.status.code());
+    assert_eq!(out.status.code(), Some(1));
+    let doc = json_doc(&out);
+    assert_eq!(keys(&doc), ["issues", "passed", "version", "warnings"]);
+    assert_eq!(doc["passed"], false);
+    assert!(
+        doc["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i.as_str().unwrap().contains("jq")),
+        "{doc}"
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("found"));
+
+    // Nothing but what the test wrote, plus the agent files.
+    assert!(proj.run(&["agent-setup"]).status.success());
+    assert!(proj.file(".claude/skills/devy/SKILL.md").exists());
+    assert!(!proj.file(".devy").exists());
+}
+
+#[test]
+fn json_check_passes_with_empty_project() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["check", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let doc = json_doc(&out);
+    assert_eq!(doc["passed"], true);
+    assert_eq!(doc["issues"], serde_json::json!([]));
+}
+
+#[test]
+fn json_without_config_prints_nothing_to_stdout() {
+    let proj = TempProject::new();
+    for cmd in ["status", "services", "check"] {
+        let out = proj.run(&[cmd, "--json"]);
+        assert_eq!(out.status.code(), Some(1), "{cmd}");
+        assert!(out.stdout.is_empty(), "{cmd}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("error: devy.yml not found"),
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn services_json_without_services_is_empty() {
+    let proj = TempProject::with_yaml("dependencies:\n  - jq\n");
+    let out = proj.run(&["services", "--json"]);
+    assert!(out.status.success());
+    assert_eq!(
+        json_doc(&out),
+        serde_json::json!({"version": 1, "services": []})
+    );
 }

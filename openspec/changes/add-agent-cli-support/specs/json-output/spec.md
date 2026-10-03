@@ -10,7 +10,7 @@ Gives scripts and coding agents a stable, machine-readable view of a devy projec
 `devy status`, `devy services` and `devy check` SHALL accept `--json`. With `--json`:
 - the command SHALL write exactly one JSON object to stdout, followed by a newline, and nothing else
 - headers, tables and progress markers SHALL NOT be printed
-- warnings SHALL still go to stderr as defined by the CLI output conventions
+- warnings SHALL still go to stderr as defined by the CLI output conventions, except check warnings, which `devy check --json` reports only in its `warnings` field
 - output SHALL contain no ANSI color codes
 - every document SHALL include an integer field `version` with the value `1`
 
@@ -51,7 +51,7 @@ With `--json`, exit codes SHALL match the command without `--json`. A failure th
 - `port`: the effective port as an integer, or `null` when none is resolved
 - `port_source`: one of `"explicit"`, `"lock"`, `"default"`, `"unassigned"` or `null`
 
-Ports SHALL be resolved as other read-only commands resolve them, and the command SHALL NOT write `devy.lock`. When no services are declared, `services` SHALL be an empty array and the command SHALL exit 0.
+Ports SHALL be resolved as other read-only commands resolve them, and the command SHALL NOT write `devy.lock`. Plain `devy services` SHALL resolve ports the same way, so its running state reflects the locked port and it fails on the same port errors as `devy status`. When no services are declared, `services` SHALL be an empty array and the command SHALL exit 0.
 
 #### Scenario: Locked port reported
 - **WHEN** `devy.yml` declares `redis`, `devy.lock` assigns it port 52113, and redis is running
@@ -82,7 +82,7 @@ Ports SHALL be resolved as other read-only commands resolve them, and the comman
   - for services only: `backend`, `running`, `host`, `port` and `port_source`, with the same meaning as in the services document
 - `environment`: an object mapping each variable configured in `devy.yml` `environment` to the value written in the environment file, or `null` when it is missing or no environment file exists
 - `environment_written`: a boolean, true when the environment file exists
-- `path`: the module PATH entries in order, each with `entry` and `written` (boolean)
+- `path`: the PATH entries `devy up` writes to the environment file, in order and with the package manager's own entry first, each with `entry` and `written` (boolean)
 - `commands`: one entry per project command, sorted by name, each with `name`, `cmd` and `shell`
 
 Like `devy status`, it SHALL exit 0 even when items are missing or stopped, and SHALL NOT write any files.

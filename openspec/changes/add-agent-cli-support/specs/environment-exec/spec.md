@@ -31,7 +31,7 @@ The program SHALL inherit devy's own environment, overlaid with the project envi
 - `<SERVICE>_HOST` and `<SERVICE>_PORT` for each service
 - `devy.yml` `environment`, which overrides module values for the same name
 
-PATH SHALL be the module PATH entries, including the package manager's own entry, in the order `devy up` writes them, followed by the inherited PATH. devy SHALL compute these values from `devy.yml` and `devy.lock` on each run, whether or not the environment file exists or is current. Ports SHALL be resolved read-only, so `devy exec` SHALL NOT assign ports or write `devy.lock`, the environment file or any other file. A service whose port is unassigned SHALL get `<SERVICE>_HOST` but no `<SERVICE>_PORT`. The program SHALL be looked up on the computed PATH.
+PATH SHALL be the module PATH entries, including the package manager's own entry, in the order `devy up` writes them, followed by the inherited PATH. A `PATH` set in devy.yml `environment` SHALL replace this value, as it does in the environment file. devy SHALL compute these values from `devy.yml` and `devy.lock` on each run, whether or not the environment file exists or is current. Ports SHALL be resolved read-only, so `devy exec` SHALL NOT assign ports or write `devy.lock`, the environment file or any other file. A service whose port is unassigned SHALL get `<SERVICE>_HOST` but no `<SERVICE>_PORT`. The program SHALL be looked up on the computed PATH.
 
 #### Scenario: Locked port exported
 - **WHEN** `devy.lock` assigns redis port 52113 and the user runs `devy exec env`
@@ -50,7 +50,7 @@ PATH SHALL be the module PATH entries, including the package manager's own entry
 - **THEN** `devy exec env` prints `LOG_LEVEL=debug` and no file is created
 
 ### Requirement: Exec stdio and exit status
-The program SHALL inherit devy's stdin, stdout and stderr. devy SHALL print nothing to stdout itself. When the program exits, devy SHALL exit with the program's exit code and SHALL NOT print an `error:` line. When the program is terminated by a signal, devy SHALL exit 1. When the program cannot be started, for example because it is not found on the computed PATH, devy SHALL print `error: …` naming the program and exit 1.
+The program SHALL inherit devy's stdin, stdout and stderr. devy SHALL print nothing to stdout itself. When the program exits, devy SHALL exit with the program's exit code and SHALL NOT print an `error:` line. When the program is terminated by a signal, devy SHALL exit 1. When the program cannot be started, for example because it is not found on the computed PATH or the file found there is not executable, devy SHALL print `error: …` naming the program and exit 1. devy's own warnings MAY appear on stderr.
 
 #### Scenario: Exit code passes through
 - **WHEN** the user runs `devy exec sh -c 'exit 3'`

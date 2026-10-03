@@ -295,7 +295,7 @@ fn status_section(config: &DevyConfig, runners: &Runners) -> String {
         Err(e) => s.push_str(&format!("(dependencies could not be read: {e:#})\n")),
         Ok(deps) if deps.is_empty() => s.push_str("none declared\n"),
         Ok(deps) => {
-            let (rows, err) = shared::dep_rows(&deps, runners);
+            let (rows, err) = shared::dep_rows(&deps, &[], runners);
             for row in rows {
                 let mut line = format!(
                     "{}: {}",

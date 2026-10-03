@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 
 use crate::ai::{self, init_prompt};
+use crate::commands::agent_setup;
 use crate::commands::check::static_issues;
 use crate::config::DevyConfig;
 use crate::init_detect::{self, DETECT_HEADER};
@@ -40,6 +41,7 @@ fn run_with(
         Mode::Detect => {
             std::fs::write(config_path, init_detect::detect(&dir).render(DETECT_HEADER))?;
             output::success(&format!("wrote {}", config_path.display()));
+            agent_setup::run_for_init(&dir);
             Ok(())
         }
         Mode::Ai { show_context: true } => {
@@ -54,7 +56,9 @@ fn run_with(
         } => {
             let client = client()
                 .map_err(|e| anyhow!("{e} — or run `devy init --detect` to draft one offline"))?;
-            run_ai(&client, &dir, config_path)
+            run_ai(&client, &dir, config_path)?;
+            agent_setup::run_for_init(&dir);
+            Ok(())
         }
     }
 }
@@ -240,6 +244,92 @@ mod tests {
         std::fs::write(&path, "name: existing\n").unwrap();
         assert!(run_with(Mode::Detect, false, &path, must_not_look_up_claude).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "name: existing\n");
+    }
+
+    // ── agent setup ──────────────────────────────────────────────────────────
+
+    const SKILL: &str = agent_setup::SKILL_PATH;
+
+    #[test]
+    fn detect_also_installs_the_skill_but_not_agents_md() {
+        let path = tmp_config();
+        let dir = path.parent().unwrap();
+        run_with(Mode::Detect, false, &path, must_not_look_up_claude).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(SKILL)).unwrap(),
+            agent_setup::skill()
+        );
+        assert!(!dir.join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn default_mode_also_installs_the_skill() {
+        let path = tmp_config();
+        let reply = "```yaml\nname: x\ndependencies: []\n```";
+        run_with(DEFAULT, false, &path, fake_client(&[reply])).unwrap();
+        assert!(path.parent().unwrap().join(SKILL).exists());
+    }
+
+    #[test]
+    fn init_updates_existing_agents_md() {
+        let path = tmp_config();
+        let dir = path.parent().unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "# Agents\n\nUse tabs.\n").unwrap();
+        run_with(Mode::Detect, false, &path, must_not_look_up_claude).unwrap();
+        let agents = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            agents.starts_with("# Agents\n\nUse tabs.\n\n<!-- devy:begin -->"),
+            "{agents}"
+        );
+    }
+
+    #[test]
+    fn init_leaves_hand_written_skill_and_warns() {
+        let path = tmp_config();
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+        std::fs::write(dir.join(SKILL), "mine\n").unwrap();
+        std::fs::write(&path, "name: old\n").unwrap();
+        let mut result = None;
+        let warnings = crate::output::with_warn_messages(|| {
+            result = Some(run_with(Mode::Detect, true, &path, must_not_look_up_claude));
+        });
+        result.unwrap().unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with(DETECT_HEADER)
+        );
+        assert_eq!(std::fs::read_to_string(dir.join(SKILL)).unwrap(), "mine\n");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("devy agent-setup --force")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn init_writes_no_agent_files_when_it_writes_nothing() {
+        let path = tmp_config();
+        let dir = path.parent().unwrap();
+        std::fs::write(&path, "name: existing\n").unwrap();
+        assert!(run_with(Mode::Detect, false, &path, must_not_look_up_claude).is_err());
+        assert!(run_with(DEFAULT, false, &path, must_not_look_up_claude).is_err());
+        assert!(!dir.join(".claude").exists());
+
+        let fresh = tmp_config();
+        let fresh_dir = fresh.parent().unwrap();
+        run_with(
+            Mode::Ai { show_context: true },
+            false,
+            &fresh,
+            must_not_look_up_claude,
+        )
+        .unwrap();
+        assert!(!fresh_dir.join(".claude").exists());
+        assert!(run_with(DEFAULT, false, &fresh, no_claude).is_err());
+        assert!(!fresh_dir.join(".claude").exists());
     }
 
     #[test]
