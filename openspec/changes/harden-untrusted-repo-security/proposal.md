@@ -59,19 +59,20 @@ A security audit of devy found that a malicious repository can turn its committe
 - `lock-file`: value validation on load; no-follow atomic writes.
 - `environment-up`: trust check in the phase ordering.
 - `shell-environment`: shadowenv trust only after project trust, with a clean `.shadowenv.d`.
-- `shell-integration`: safe bash completion.
+- `shell-integration`: safe bash completion; completes `allow` and `--revoke`.
 - `package-managers`:
   - verified bootstrap installers
   - tap and dependency-name rules
   - `--` and absolute-path privileged commands
 - `dependency-modules`: verified script installers, `venv_path` containment.
-- `service-modules`: `cli_args` allowlist; MinIO, MailHog and RabbitMQ loopback binds; Meilisearch key off argv; private socket directory.
+- `service-modules`: MinIO, MailHog, RabbitMQ and search transport loopback binds; forced bind args after `cli_args`; service secrets off argv; private socket directory.
 - `service-ports`: `cli_args` sanitization becomes an allowlist; lock ports validated.
 - `docker-services`: pinned default tags, credentials via env file, digest validation.
 - `ai-assist`: broader redaction, symlink refusal, private working directory.
 - `environment-doctor`: executable-field changes never auto-applied.
 - `nix-export`: escaping of `name`.
 - `cli`: `allow` subcommand; control-character stripping in output.
+- `environment-check`: `devy status` masks secret-looking values.
 
 ## Impact
 

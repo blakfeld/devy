@@ -4,7 +4,7 @@
 
 ### Requirement: Value validation
 Loading `devy.yml` SHALL fail, before any command acts on it, when any of these values is invalid. The error SHALL be `<location>: invalid <kind> <value>`, with control characters in `<value>` escaped.
-- **Dependency names** SHALL match `^[A-Za-z0-9][A-Za-z0-9._+@-]*$`, so they never start with `-`, contain `/`, `\` or whitespace, or end in `.deb`.
+- **Dependency names** SHALL match `^[A-Za-z0-9][A-Za-z0-9._+@:-]*$`, so they never start with `-`, contain `/`, `\` or whitespace, or end in `.deb`.
 - **Versions** SHALL match `^[A-Za-z0-9][A-Za-z0-9._+~:-]*$` and contain no `/` or `..`.
 - **List entries** passed to tools SHALL NOT start with `-` and SHALL match `^[A-Za-z0-9@][A-Za-z0-9._+@/:=^~<>-]*$`, and SHALL NOT contain `://` or start with `.` or `/`. List entries are node and typescript `global_packages`, rust `targets` and `components`, and gcloud `components`.
 - **Command names** SHALL match `^[A-Za-z0-9][A-Za-z0-9_.:-]*$`.
