@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use which::which;
 
-use super::PackageManager;
+use super::{LogSource, PackageManager};
 use crate::config::Dependency;
 
 pub struct Apt;
@@ -177,11 +177,29 @@ impl PackageManager for Apt {
     fn service_config_dir(&self, service: &str) -> Option<PathBuf> {
         service_config_dir_impl(service, std::path::Path::new("/etc/postgresql"))
     }
+
+    /// The system journal, read as the current user: devy never uses sudo for logs.
+    fn log_source(&self, name: &str, lines: u32, follow: bool) -> Result<LogSource> {
+        Ok(LogSource::journal(name, false, lines, follow))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apt_logs_read_the_system_journal_without_sudo() {
+        let LogSource::Command(cmd) = Apt::new().log_source("redis-server", 100, false).unwrap()
+        else {
+            panic!("expected a command");
+        };
+        assert_eq!(cmd.program, "journalctl");
+        assert_eq!(
+            cmd.args,
+            ["-u", "redis-server", "-n", "100", "--no-pager", "-o", "cat"]
+        );
+    }
 
     fn tmp_dir() -> crate::test_support::TempDir {
         crate::test_support::tmp_dir()

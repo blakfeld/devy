@@ -47,7 +47,7 @@ devy SHALL pass the module's service name to the package-manager backend when st
 - **THEN** devy prints `● redis (docker)`
 
 ### Requirement: Starting a single service
-`devy start <name>` SHALL resolve the service's port as `devy up` does (using `devy.lock`), start the service when it is not running, and then wait for its health check on that port; a health-check timeout MUST be reported as a warning rather than a failure.
+`devy start <name>` SHALL resolve the service's port as `devy up` does (using `devy.lock`), start the service when it is not running, and then wait for its health check on that port; a health-check timeout MUST be reported as a warning rather than a failure, and that warning MUST tell the user to run `devy logs <name>`.
 
 #### Scenario: Already running
 - **WHEN** the named service is already running
@@ -55,7 +55,7 @@ devy SHALL pass the module's service name to the package-manager backend when st
 
 #### Scenario: Health check times out
 - **WHEN** the service starts but never passes its health check within the configured attempts
-- **THEN** devy warns that the service started but the health check timed out and asks the user to verify manually
+- **THEN** devy warns that the service started but the health check timed out, asks the user to verify manually, and suggests `devy logs <name>`
 - **AND** devy prints `✓ <name> started` and exits 0
 
 #### Scenario: Locked port honored
@@ -108,7 +108,7 @@ devy SHALL pass the module's service name to the package-manager backend when st
 - **THEN** devy stops and removes the container and removes the volume `devy-<project>-postgresql`
 
 ### Requirement: Readiness and shutdown polling
-Waiting for a service SHALL poll its health check (or running state when stopping) up to a per-module attempt count with a fixed interval (default 10 attempts at 500 ms), failing with the attempt count when exhausted. Health waits SHALL print `Still waiting for <name> (<n>/<max>)` on every 10th attempt before the last, so a wait with the default 10 attempts prints no progress. Shutdown waits SHALL report no progress and SHALL fail with `<name> did not stop after <N> attempts — try stopping it manually or check its logs`.
+Waiting for a service SHALL poll its health check (or running state when stopping) up to a per-module attempt count with a fixed interval (default 10 attempts at 500 ms), failing with the attempt count when exhausted. Health waits SHALL print `Still waiting for <name> (<n>/<max>)` on every 10th attempt before the last, so a wait with the default 10 attempts prints no progress. Shutdown waits SHALL report no progress and SHALL fail with `<name> did not stop after <N> attempts — try stopping it manually or run devy logs <name>`.
 
 #### Scenario: Service becomes healthy
 - **WHEN** the health check succeeds on the third attempt
@@ -117,6 +117,10 @@ Waiting for a service SHALL poll its health check (or running state when stoppin
 #### Scenario: Never healthy
 - **WHEN** the health check fails on every attempt
 - **THEN** waiting fails with `<name> did not become healthy after <N> attempts`
+
+#### Scenario: Never stops
+- **WHEN** a service is still running after every shutdown attempt
+- **THEN** waiting fails with `<name> did not stop after <N> attempts — try stopping it manually or run devy logs <name>`
 
 ### Requirement: Homebrew service backend
 When the package manager is brew, devy SHALL control services with `brew services start|stop <name>` and SHALL treat a service as running when `brew services info --json <name>` reports `running: true`; a failed info command MUST be treated as not running. If the info command succeeds but returns an empty JSON array, devy SHALL fail with `` `brew services info` returned an empty array — service may not be managed by brew `` instead of reporting the service as stopped.

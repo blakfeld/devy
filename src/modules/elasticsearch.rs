@@ -26,6 +26,10 @@ impl Module for ElasticsearchModule {
         true
     }
 
+    fn extra_log_paths(&self, data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        vec![data_dir.join("logs")]
+    }
+
     fn nix_launch(
         &self,
         dep: &Dependency,
@@ -152,6 +156,12 @@ pub(crate) fn classify_status(status: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn extra_log_paths_is_the_logs_dir() {
+        let d = std::path::Path::new("/p/.devy/data/elasticsearch");
+        assert_eq!(ElasticsearchModule.extra_log_paths(d), [d.join("logs")]);
+    }
 
     fn dep_with_port(port: u64) -> Dependency {
         let mut extra = HashMap::new();

@@ -27,6 +27,10 @@ impl Module for RabbitmqModule {
         true
     }
 
+    fn extra_log_paths(&self, data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        vec![data_dir.join("log")]
+    }
+
     fn nix_launch(
         &self,
         dep: &Dependency,
@@ -129,6 +133,12 @@ impl Module for RabbitmqModule {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn extra_log_paths_is_the_log_dir() {
+        let d = std::path::Path::new("/p/.devy/data/rabbitmq");
+        assert_eq!(RabbitmqModule.extra_log_paths(d), [d.join("log")]);
+    }
 
     fn dep_with_port(port: u64) -> Dependency {
         let mut extra = HashMap::new();

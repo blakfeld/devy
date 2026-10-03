@@ -54,6 +54,8 @@ _{bin}() {
     'status:Show install and environment status'
     'check:Validate the environment without making changes'
     'doctor:Diagnose the environment and the last failed up'
+    'logs:Show recent service log output'
+    'ask:Ask Claude about this environment'
     'init:Create an empty {bin}.yml'
     'hook:Print shell integration snippet'
     'pr:Open a GitHub pull request for the current branch'
@@ -88,6 +90,21 @@ _{bin}() {
     start|stop|restart)
       _arguments '1:service name'
       ;;
+    logs)
+      local -a services
+      services=(${(f)"$(command {bin} _services 2>/dev/null)"})
+      _arguments \
+        '(-f --follow)'{-f,--follow}'[Stream new log output]' \
+        '(-n --lines)'{-n,--lines}'[Lines to show per service]:lines:' \
+        '--explain[Explain the logs with Claude]' \
+        '--show-context[Print the AI request without sending it]' \
+        '1:service:compadd -a services'
+      ;;
+    ask)
+      _arguments \
+        '--show-context[Print the AI request without sending it]' \
+        '1:question:'
+      ;;
     init)
       _arguments '--force[Overwrite an existing {bin}.yml]'
       ;;
@@ -116,7 +133,7 @@ const BASH_SNIPPET_TEMPLATE: &str = r#"
 
 _{bin}_completions() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
-  local subcmds="up down services start stop restart status check doctor init hook pr export"
+  local subcmds="up down services start stop restart status check doctor logs ask init hook pr export"
   local user_cmds
   user_cmds=$(command {bin} _commands 2>/dev/null)
   [ -n "$user_cmds" ] && subcmds="$subcmds $user_cmds"
@@ -135,6 +152,15 @@ _{bin}_completions() {
       ;;
     doctor)
       COMPREPLY=($(compgen -W "--yes --no-ai --show-context" -- "$cur"))
+      ;;
+    logs)
+      case "${COMP_WORDS[COMP_CWORD-1]}" in
+        -n|--lines) return ;;
+      esac
+      COMPREPLY=($(compgen -W "--follow --lines --explain --show-context $(command {bin} _services 2>/dev/null)" -- "$cur"))
+      ;;
+    ask)
+      COMPREPLY=($(compgen -W "--show-context" -- "$cur"))
       ;;
     init)
       COMPREPLY=($(compgen -W "--force" -- "$cur"))
@@ -171,7 +197,7 @@ function __{bin}_user_commands
 end
 
 function __{bin}_no_subcommand
-  not __fish_seen_subcommand_from up down services start stop restart status check doctor init hook pr export
+  not __fish_seen_subcommand_from up down services start stop restart status check doctor logs ask init hook pr export
 end
 
 complete -c {bin} -f
@@ -184,6 +210,8 @@ complete -c {bin} -n __{bin}_no_subcommand -a restart  -d "Restart a named servi
 complete -c {bin} -n __{bin}_no_subcommand -a status   -d "Show install and environment status"
 complete -c {bin} -n __{bin}_no_subcommand -a check    -d "Validate the environment"
 complete -c {bin} -n __{bin}_no_subcommand -a doctor   -d "Diagnose the environment and the last failed up"
+complete -c {bin} -n __{bin}_no_subcommand -a logs     -d "Show recent service log output"
+complete -c {bin} -n __{bin}_no_subcommand -a ask      -d "Ask Claude about this environment"
 complete -c {bin} -n __{bin}_no_subcommand -a init     -d "Scaffold a {bin}.yml"
 complete -c {bin} -n __{bin}_no_subcommand -a hook     -d "Print shell integration snippet"
 complete -c {bin} -n __{bin}_no_subcommand -a pr       -d "Open a GitHub pull request"
@@ -197,6 +225,12 @@ complete -c {bin} -n "__fish_seen_subcommand_from down" -l volumes -d "Also remo
 complete -c {bin} -n "__fish_seen_subcommand_from doctor" -l yes -d "Apply a suggested {bin}.yml fix without asking"
 complete -c {bin} -n "__fish_seen_subcommand_from doctor" -l no-ai -d "Skip the AI diagnosis"
 complete -c {bin} -n "__fish_seen_subcommand_from doctor" -l show-context -d "Print the AI request without sending it"
+complete -c {bin} -n "__fish_seen_subcommand_from logs" -a "(command {bin} _services 2>/dev/null)" -d "Service"
+complete -c {bin} -n "__fish_seen_subcommand_from logs" -s f -l follow -d "Stream new log output"
+complete -c {bin} -n "__fish_seen_subcommand_from logs" -s n -l lines -x -d "Lines to show per service"
+complete -c {bin} -n "__fish_seen_subcommand_from logs" -l explain -d "Explain the logs with Claude"
+complete -c {bin} -n "__fish_seen_subcommand_from logs" -l show-context -d "Print the AI request without sending it"
+complete -c {bin} -n "__fish_seen_subcommand_from ask" -l show-context -d "Print the AI request without sending it"
 complete -c {bin} -n "__fish_seen_subcommand_from export" -l format -x -a "shell flake" -d "Output format"
 complete -c {bin} -n "__fish_seen_subcommand_from init" -l force -d "Overwrite existing {bin}.yml"
 "#;
@@ -284,7 +318,7 @@ mod tests {
         let s = zsh_snippet();
         for cmd in &[
             "up", "down", "services", "start", "stop", "restart", "status", "check", "doctor",
-            "init", "hook", "pr", "export",
+            "logs", "ask", "init", "hook", "pr", "export",
         ] {
             assert!(s.contains(cmd), "zsh snippet missing '{}'", cmd);
         }
@@ -295,7 +329,7 @@ mod tests {
         let s = bash_snippet();
         for cmd in &[
             "up", "down", "services", "start", "stop", "restart", "status", "check", "doctor",
-            "init", "hook", "pr", "export",
+            "logs", "ask", "init", "hook", "pr", "export",
         ] {
             assert!(s.contains(cmd), "bash snippet missing '{}'", cmd);
         }
@@ -306,7 +340,7 @@ mod tests {
         let s = fish_snippet();
         for cmd in &[
             "up", "down", "services", "start", "stop", "restart", "status", "check", "doctor",
-            "init", "hook", "pr", "export",
+            "logs", "ask", "init", "hook", "pr", "export",
         ] {
             assert!(s.contains(cmd), "fish snippet missing '{}'", cmd);
         }
@@ -357,6 +391,42 @@ mod tests {
         assert!(zsh_snippet().contains("    down)\n      _arguments '--volumes["));
         assert!(bash_snippet().contains("    down)\n      COMPREPLY=($(compgen -W \"--volumes\""));
         assert!(fish_snippet().contains("-n \"__fish_seen_subcommand_from down\" -l volumes"));
+    }
+
+    #[test]
+    fn snippets_complete_logs_and_ask() {
+        let zsh = zsh_snippet();
+        for needle in [
+            "'logs:",
+            "'ask:",
+            "    logs)\n",
+            "{-f,--follow}'[",
+            "{-n,--lines}'[",
+            "'--explain[",
+            "_services 2>/dev/null",
+            "    ask)\n      _arguments \\\n        '--show-context[",
+        ] {
+            assert!(zsh.contains(needle), "zsh missing {needle:?}");
+        }
+        let bash = bash_snippet();
+        assert!(bash.contains("doctor logs ask init"), "{bash}");
+        assert!(bash.contains(
+            "compgen -W \"--follow --lines --explain --show-context $(command devy _services 2>/dev/null)\""
+        ));
+        assert!(bash.contains("    ask)\n      COMPREPLY=($(compgen -W \"--show-context\""));
+        let fish = fish_snippet();
+        for needle in [
+            "-a logs ",
+            "-a ask ",
+            "-n \"__fish_seen_subcommand_from logs\" -a \"(command devy _services 2>/dev/null)\"",
+            "-n \"__fish_seen_subcommand_from logs\" -s f -l follow ",
+            "-n \"__fish_seen_subcommand_from logs\" -s n -l lines ",
+            "-n \"__fish_seen_subcommand_from logs\" -l explain ",
+            "-n \"__fish_seen_subcommand_from logs\" -l show-context ",
+            "-n \"__fish_seen_subcommand_from ask\" -l show-context ",
+        ] {
+            assert!(fish.contains(needle), "fish missing {needle:?}");
+        }
     }
 
     #[test]

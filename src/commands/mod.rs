@@ -1,3 +1,4 @@
+pub mod ask;
 pub mod check;
 pub mod doctor;
 pub mod down;
@@ -7,6 +8,7 @@ pub mod failure_record;
 pub mod hook;
 pub mod init;
 pub mod list_commands;
+pub mod logs;
 pub mod ports;
 pub mod pr;
 pub mod service;

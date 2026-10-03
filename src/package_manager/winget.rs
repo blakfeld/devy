@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use which::which;
 
-use super::PackageManager;
+use super::{LogSource, PackageManager};
 use crate::config::Dependency;
 
 pub struct WinGet;
@@ -147,11 +147,27 @@ impl PackageManager for WinGet {
     fn service_config_dir(&self, _service: &str) -> Option<PathBuf> {
         None
     }
+
+    fn log_source(&self, _name: &str, _lines: u32, _follow: bool) -> Result<LogSource> {
+        Ok(LogSource::Unsupported(UNSUPPORTED_LOGS.into()))
+    }
 }
+
+const UNSUPPORTED_LOGS: &str = "Logs are not available for winget-managed services — check Windows Event Viewer or the service's own log directory";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn winget_logs_are_unsupported() {
+        assert_eq!(
+            WinGet::new().log_source("mysql", 100, false).unwrap(),
+            LogSource::Unsupported(
+                "Logs are not available for winget-managed services — check Windows Event Viewer or the service's own log directory".into()
+            )
+        );
+    }
 
     // ── name ──────────────────────────────────────────────────────────────────
 

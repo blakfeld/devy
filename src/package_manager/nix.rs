@@ -629,6 +629,36 @@ fn launchagent_path(name: &str) -> Result<PathBuf> {
     Ok(launchagent_dir()?.join(format!("sh.devy.{name}.plist")))
 }
 
+/// Where the launchd agent for `name` writes stdout and stderr: `$TMPDIR/devy-<name>.log`.
+#[cfg(any(test, target_os = "macos"))]
+fn launchagent_log_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("devy-{name}.log"))
+}
+
+/// The user journal of the systemd unit for `name`, which has no log file of its own.
+#[cfg(any(test, target_os = "linux"))]
+fn systemd_log_source(name: &str, lines: u32, follow: bool) -> super::LogSource {
+    super::LogSource::journal(&format!("devy-{name}.service"), true, lines, follow)
+}
+
+/// Where `devy logs` reads service `name`'s output on this platform.
+fn service_log_source(name: &str, lines: u32, follow: bool) -> super::LogSource {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (lines, follow);
+        super::LogSource::Files(vec![launchagent_log_path(name)])
+    }
+    #[cfg(target_os = "linux")]
+    return systemd_log_source(name, lines, follow);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (name, lines, follow);
+        super::LogSource::Unsupported(
+            "Service management is not supported on this platform with the nix backend".into(),
+        )
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn write_launchagent(
     name: &str,
@@ -644,7 +674,7 @@ fn write_launchagent(
         &program_arguments(launch, exec_dir),
         &unit_environment(launch, profile_bin),
         launch.working_dir.as_deref(),
-        &std::env::temp_dir().join(format!("devy-{name}.log")),
+        &launchagent_log_path(name),
     );
     let path = launchagent_path(name)?;
     std::fs::write(&path, plist).with_context(|| format!("Failed to write {}", path.display()))
@@ -1074,6 +1104,10 @@ impl PackageManager for NixPackageManager {
         self.query_version(dep).map(Option::flatten)
     }
 
+    fn log_source(&self, name: &str, lines: u32, follow: bool) -> Result<super::LogSource> {
+        Ok(service_log_source(name, lines, follow))
+    }
+
     /// Advertises the project-local Nix profile bin dir so shadowenv adds it to PATH.
     /// This ensures `devy up` activates the project's Nix packages without touching
     /// the user's global profile or requiring a manual PATH change.
@@ -1085,6 +1119,49 @@ impl PackageManager for NixPackageManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::package_manager::{LogCommandKind, LogSource};
+
+    #[test]
+    fn launchagent_log_path_is_in_tmpdir() {
+        assert_eq!(
+            launchagent_log_path("redis"),
+            std::env::temp_dir().join("devy-redis.log")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_logs_are_the_launchagent_log_file() {
+        // write_launchagent points StandardOutPath/StandardErrorPath at this same helper.
+        let pm = NixPackageManager::for_project(&crate::test_support::tmp_dir());
+        assert_eq!(
+            pm.log_source("redis", 100, false).unwrap(),
+            LogSource::Files(vec![launchagent_log_path("redis")])
+        );
+    }
+
+    #[test]
+    fn systemd_logs_read_the_user_journal() {
+        for (follow, tail) in [(false, &[][..]), (true, &["-f"][..])] {
+            let LogSource::Command(cmd) = systemd_log_source("redis", 30, follow) else {
+                panic!("expected a command");
+            };
+            let mut expected = vec![
+                "--user",
+                "-u",
+                "devy-redis.service",
+                "-n",
+                "30",
+                "--no-pager",
+                "-o",
+                "cat",
+            ];
+            expected.extend(tail);
+            assert_eq!(cmd.program, "journalctl");
+            assert_eq!(cmd.args, expected);
+            assert_eq!(cmd.kind, LogCommandKind::UserJournal);
+        }
+    }
 
     #[test]
     fn nix_name_is_nix() {

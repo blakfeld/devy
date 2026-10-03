@@ -109,6 +109,11 @@ impl Module for KafkaModule {
         true
     }
 
+    fn extra_log_paths(&self, data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        // `logs/` holds the partition data (`log.dirs`); the application logs go here.
+        vec![data_dir.join("app-logs")]
+    }
+
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
         Some("apacheKafka".to_string())
     }
@@ -267,6 +272,12 @@ impl Module for KafkaModule {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn extra_log_paths_is_the_app_logs_dir() {
+        let d = std::path::Path::new("/p/.devy/data/kafka");
+        assert_eq!(KafkaModule.extra_log_paths(d), [d.join("app-logs")]);
+    }
 
     fn dep_with_port(port: u64) -> Dependency {
         let mut extra = HashMap::new();

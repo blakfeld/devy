@@ -24,6 +24,64 @@ use std::path::PathBuf;
 use crate::config::{Dependency, DevyConfig, PackageManagerChoice};
 use crate::modules::LaunchSpec;
 
+/// Where a service's log output can be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogSource {
+    /// Files tailed in-process, in display order (e.g. stdout then stderr).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only macOS backends log to files
+    Files(Vec<PathBuf>),
+    /// A command that prints the log, already built for the requested line count and
+    /// follow mode.
+    Command(LogCommand),
+    /// Logs can't be read for this backend; the message is shown as the error.
+    Unsupported(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub kind: LogCommandKind,
+}
+
+/// What a log command reads, which decides how its output and failures are interpreted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // journals exist only on Linux
+pub enum LogCommandKind {
+    /// The user journal (`journalctl --user`).
+    UserJournal,
+    /// The system journal for `unit` (`journalctl -u`), which may need extra permissions.
+    SystemJournal { unit: String },
+    /// A container's output (`docker logs`), written to both stdout and stderr.
+    Container,
+}
+
+impl LogSource {
+    /// `journalctl [--user] -u <unit> -n <lines> --no-pager -o cat [-f]`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // journals exist only on Linux
+    pub fn journal(unit: &str, user: bool, lines: u32, follow: bool) -> Self {
+        let mut args: Vec<String> = Vec::new();
+        if user {
+            args.push("--user".into());
+        }
+        let lines = lines.to_string();
+        args.extend(["-u", unit, "-n", &lines, "--no-pager", "-o", "cat"].map(String::from));
+        if follow {
+            args.push("-f".into());
+        }
+        let kind = if user {
+            LogCommandKind::UserJournal
+        } else {
+            LogCommandKind::SystemJournal { unit: unit.into() }
+        };
+        Self::Command(LogCommand {
+            program: "journalctl".into(),
+            args,
+            kind,
+        })
+    }
+}
+
 pub trait PackageManager {
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
@@ -54,6 +112,15 @@ pub trait PackageManager {
     /// Used by `devy up` to wire the environment so project-local binaries are found first.
     fn path_prepends(&self, _project_root: &std::path::Path) -> Vec<String> {
         vec![]
+    }
+
+    /// Where the logs of service `name` (the backend service name) can be read: its last
+    /// `lines` lines and, with `follow`, new output as it is written.
+    fn log_source(&self, _name: &str, _lines: u32, _follow: bool) -> Result<LogSource> {
+        Ok(LogSource::Unsupported(format!(
+            "Logs are not available for {}-managed services",
+            self.name()
+        )))
     }
 
     /// URL for manual installation instructions. Empty string means no URL is shown.
@@ -180,6 +247,10 @@ pub struct MockPackageManager {
     /// When true, `is_available` returns false, so `ensure_available` fails without
     /// `--bootstrap`.
     pub unavailable: bool,
+    /// Returned by `log_source`; `None` keeps the trait default.
+    pub log_source_result: Option<LogSource>,
+    /// Tracks every `(name, lines, follow)` passed to `log_source`.
+    pub log_queries: std::cell::RefCell<Vec<(String, u32, bool)>>,
 }
 
 #[cfg(test)]
@@ -206,6 +277,8 @@ impl Default for MockPackageManager {
             validate_config_fails: false,
             path_prepends_result: Vec::new(),
             unavailable: false,
+            log_source_result: None,
+            log_queries: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -288,6 +361,18 @@ impl PackageManager for MockPackageManager {
     }
     fn path_prepends(&self, _project_root: &std::path::Path) -> Vec<String> {
         self.path_prepends_result.clone()
+    }
+    fn log_source(&self, name: &str, lines: u32, follow: bool) -> Result<LogSource> {
+        self.log_queries
+            .borrow_mut()
+            .push((name.to_string(), lines, follow));
+        match &self.log_source_result {
+            Some(source) => Ok(source.clone()),
+            None => Ok(LogSource::Unsupported(format!(
+                "Logs are not available for {}-managed services",
+                self.name
+            ))),
+        }
     }
 }
 
@@ -446,5 +531,40 @@ mod tests {
         };
         let result = pm.path_prepends(std::path::Path::new("/tmp"));
         assert_eq!(result, vec!["/custom/bin"]);
+    }
+
+    #[test]
+    fn default_log_source_is_unsupported() {
+        assert_eq!(
+            AvailablePm.log_source("redis", 100, false).unwrap(),
+            LogSource::Unsupported("Logs are not available for available-managed services".into())
+        );
+    }
+
+    #[test]
+    fn journal_source_builds_argv() {
+        let LogSource::Command(cmd) = LogSource::journal("redis-server", false, 20, true) else {
+            panic!("expected a command");
+        };
+        assert_eq!(cmd.program, "journalctl");
+        assert_eq!(
+            cmd.args,
+            [
+                "-u",
+                "redis-server",
+                "-n",
+                "20",
+                "--no-pager",
+                "-o",
+                "cat",
+                "-f"
+            ]
+        );
+        assert_eq!(
+            cmd.kind,
+            LogCommandKind::SystemJournal {
+                unit: "redis-server".into()
+            }
+        );
     }
 }
