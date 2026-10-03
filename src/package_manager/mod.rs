@@ -28,6 +28,7 @@ use crate::modules::LaunchSpec;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogSource {
     /// Files tailed in-process, in display order (e.g. stdout then stderr).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only macOS backends log to files
     Files(Vec<PathBuf>),
     /// A command that prints the log, already built for the requested line count and
     /// follow mode.
