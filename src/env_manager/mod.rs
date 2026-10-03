@@ -31,6 +31,8 @@ pub struct MockEnvManager {
     pub read_vars_returns_some: bool,
     /// Variables passed to the last `setup` call.
     pub last_vars: std::cell::RefCell<HashMap<String, String>>,
+    /// PATH entries passed to the last `setup` call.
+    pub last_path_prepends: std::cell::RefCell<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -42,6 +44,7 @@ impl Default for MockEnvManager {
             setup_called: std::cell::Cell::new(false),
             read_vars_returns_some: false,
             last_vars: std::cell::RefCell::new(HashMap::new()),
+            last_path_prepends: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -58,10 +61,11 @@ impl EnvManager for MockEnvManager {
         &self,
         _dir: &Path,
         vars: &HashMap<String, String>,
-        _path_prepends: &[String],
+        path_prepends: &[String],
     ) -> Result<()> {
         self.setup_called.set(true);
         *self.last_vars.borrow_mut() = vars.clone();
+        *self.last_path_prepends.borrow_mut() = path_prepends.to_vec();
         if self.setup_fails {
             anyhow::bail!("mock env setup failure")
         } else {

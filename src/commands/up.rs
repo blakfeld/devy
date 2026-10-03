@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use fs2::FileExt;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::commands::exec::{run_hook, spawn_cmd};
@@ -12,6 +12,7 @@ use crate::lock::{LockFile, LockedDep};
 use crate::modules;
 use crate::output;
 use crate::package_manager;
+use crate::project_env::{self, ProjectEnv};
 use crate::service_runner::docker::ContainerRuntime;
 use crate::service_runner::{self, Runners, ServiceRunner};
 
@@ -284,13 +285,6 @@ pub(crate) fn up_tracked(
         ports::PortMode::Assign,
     )?;
 
-    // Collect module-suggested env vars and PATH prepends after each dep installs.
-    // This ensures failed installs don't pollute the environment config.
-    let mut module_env: HashMap<String, String> = HashMap::new();
-    // PM-level prepends (e.g. .devy/nix-profile/bin) go first so project-local
-    // binaries shadow any system copies of the same tools.
-    let mut module_path_prepends: Vec<String> = pm.path_prepends(project_root);
-
     // Phase 1: install all binaries (no services started yet).
     progress.enter("install");
     if !effective_deps.is_empty() {
@@ -298,35 +292,6 @@ pub(crate) fn up_tracked(
         for effective in &effective_deps {
             progress.dependency = Some(effective.name.clone());
             install_binary(&runners, effective, project_root)?;
-            let m = modules::get(&effective.name);
-            module_env.extend(m.env_vars(effective, project_root));
-            module_path_prepends.extend(m.path_prepends(effective, project_root));
-        }
-    }
-
-    // Emit <SERVICE>_HOST and <SERVICE>_PORT for every service dep.
-    // These run after module env_vars so service-specific vars (REDIS_URL, etc.) are
-    // already present; config.environment can still override everything via merge_env.
-    for effective in &effective_deps {
-        let m = modules::get(&effective.name);
-        if !m.is_service() {
-            continue;
-        }
-        let canonical = modules::canonical_name(&effective.name);
-        let prefix = canonical.replace('-', "_").to_ascii_uppercase();
-        let port_opt: Option<u16> = if let Some(key) = m.port_key() {
-            effective
-                .extra
-                .get(key)
-                .and_then(|v| v.as_u64())
-                .and_then(|raw| u16::try_from(raw).ok())
-                .or_else(|| m.default_port())
-        } else {
-            m.default_port()
-        };
-        module_env.insert(format!("{prefix}_HOST"), "127.0.0.1".into());
-        if let Some(p) = port_opt {
-            module_env.insert(format!("{prefix}_PORT"), p.to_string());
         }
     }
 
@@ -338,7 +303,12 @@ pub(crate) fn up_tracked(
 
     progress.enter("configure environment");
 
-    let merged_env = merge_env(module_env, &config.environment);
+    // Computed only after every install succeeded, so a failed install never writes
+    // the environment.
+    let ProjectEnv {
+        vars: merged_env,
+        path_prepends: module_path_prepends,
+    } = project_env::resolve(config, &effective_deps, pm, project_root);
 
     let has_content = !merged_env.is_empty() || !module_path_prepends.is_empty();
     let has_existing_file = env_mgr.read_vars(project_root).is_some();
@@ -619,16 +589,6 @@ pub(crate) fn write_lock(deps: &[Dependency], runners: &Runners, path: &Path) ->
     new_lock.write(path).context("Failed to write devy.lock")?;
     output::success(&format!("Lock file written to {}", crate::lock::PATH));
     Ok(())
-}
-
-/// Merge module-supplied env vars with user config env vars, letting config win on conflicts.
-pub(crate) fn merge_env(
-    module_env: HashMap<String, String>,
-    config_env: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    let mut merged = module_env;
-    merged.extend(config_env.iter().map(|(k, v)| (k.clone(), v.clone())));
-    merged
 }
 
 #[cfg(test)]
@@ -1090,34 +1050,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(locked_version(&path, "node").as_deref(), Some("24.21.0"));
-    }
-
-    // ── merge_env ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn config_env_overrides_module_env_for_same_key() {
-        let mut module_env = HashMap::new();
-        module_env.insert("VAULT_TOKEN".into(), "root".into());
-        let mut config_env = HashMap::new();
-        config_env.insert("VAULT_TOKEN".into(), "my-token".into());
-        let merged = merge_env(module_env, &config_env);
-        assert_eq!(
-            merged.get("VAULT_TOKEN").map(String::as_str),
-            Some("my-token"),
-            "config.environment must overwrite module env_vars on conflict"
-        );
-    }
-
-    #[test]
-    fn module_env_keys_absent_from_config_are_preserved() {
-        let mut module_env = HashMap::new();
-        module_env.insert("VAULT_ADDR".into(), "http://127.0.0.1:8200".into());
-        let config_env = HashMap::new();
-        let merged = merge_env(module_env, &config_env);
-        assert_eq!(
-            merged.get("VAULT_ADDR").map(String::as_str),
-            Some("http://127.0.0.1:8200")
-        );
     }
 
     // ── up_impl ───────────────────────────────────────────────────────────────
@@ -1812,6 +1744,60 @@ mod tests {
     }
 
     // ── HOST / PORT env vars ──────────────────────────────────────────────────
+
+    #[test]
+    fn up_writes_exactly_the_resolved_project_env() {
+        // `devy exec` recomputes the environment from devy.yml and devy.lock; it must
+        // match what `up` handed to the env manager.
+        let mut env = HashMap::new();
+        env.insert("LOG_LEVEL".to_string(), "debug".to_string());
+        env.insert("DATABASE_URL".to_string(), "postgres://custom".to_string());
+        let config = make_config(&["redis", "postgres", "jq"], env);
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            service_running: true,
+            path_prepends_result: vec!["/p/.devy/nix-profile/bin".into()],
+            ..Default::default()
+        };
+        let env_mgr = MockEnvManager::default();
+        let dir = crate::test_support::tmp_dir();
+        let lock_path = dir.join(crate::lock::PATH);
+        up_impl(
+            &config,
+            &pm,
+            &env_mgr,
+            UpOptions {
+                update: false,
+                bootstrap: false,
+            },
+            &dir,
+            &lock_path,
+        )
+        .unwrap();
+
+        let lock = LockFile::load(&lock_path).unwrap();
+        let mut deps: Vec<Dependency> = config
+            .normalized_dependencies()
+            .unwrap()
+            .iter()
+            .map(|dep| apply_lock_from_source(dep, lock.as_ref(), &pm))
+            .collect();
+        ports::resolve_ports(&mut deps, lock.as_ref(), &pm, ports::PortMode::ReadOnly).unwrap();
+        let resolved = project_env::resolve(&config, &deps, &pm, &dir);
+
+        assert_eq!(resolved.vars, *env_mgr.last_vars.borrow());
+        assert_eq!(resolved.path_prepends, *env_mgr.last_path_prepends.borrow());
+        assert!(
+            resolved.vars.contains_key("REDIS_PORT"),
+            "{:?}",
+            resolved.vars
+        );
+        assert_eq!(
+            resolved.vars.get("DATABASE_URL").map(String::as_str),
+            Some("postgres://custom")
+        );
+    }
 
     #[test]
     fn up_impl_emits_host_and_port_env_vars_for_services() {

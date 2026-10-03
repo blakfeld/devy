@@ -2,8 +2,12 @@ use anyhow::{Result, bail};
 use colored::Colorize;
 use std::path::Path;
 
+use serde::Serialize;
+
 use crate::commands::ports::{self, PortMode};
+use crate::commands::shared;
 use crate::config::{Dependency, DevyConfig};
+use crate::lock::LockFile;
 use crate::modules;
 use crate::output;
 use crate::package_manager::{self, PackageManager};
@@ -12,28 +16,79 @@ use crate::service_runner::{self, Runners, ServiceRunner};
 
 /// Print all services from devy.yml with their current running status.
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
-pub fn list() -> Result<()> {
+pub fn list(json: bool) -> Result<()> {
     let (config, project_root) = DevyConfig::load_with_root()?;
     let pm = package_manager::detect(&config, &project_root)?;
+    let lock = ports::load_lock(&project_root)?;
     let runners = Runners::new(
         pm.as_ref(),
         ContainerRuntime::system(config.container_cli),
         &config,
         &project_root,
-        None,
+        lock.as_ref(),
         false,
     );
-    list_impl(&config, &runners)
+    list_impl(&config, &runners, lock.as_ref(), json)
+}
+
+/// One declared service, as `devy services` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ServiceInfo {
+    /// The name as written in devy.yml.
+    pub name: String,
+    /// `redis` or `redis (docker)`, for the text listing.
+    #[serde(skip)]
+    pub label: String,
+    #[serde(flatten)]
+    pub state: shared::ServiceState,
+}
+
+#[derive(Serialize)]
+struct ServicesDocument<'a> {
+    services: &'a [ServiceInfo],
+}
+
+/// Every service in devy.yml in declaration order, with its running state and its port
+/// resolved read-only from `lock`. Never writes devy.lock.
+pub(crate) fn services_report(
+    config: &DevyConfig,
+    runners: &Runners,
+    lock: Option<&LockFile>,
+) -> Result<Vec<ServiceInfo>> {
+    let mut deps = config.normalized_dependencies()?;
+    let resolved = ports::resolve_ports(&mut deps, lock, runners.package.pm(), PortMode::ReadOnly)?;
+    deps.iter()
+        .zip(resolved)
+        .filter(|(dep, _)| modules::get(&dep.name).is_service())
+        .map(|(dep, port)| {
+            let runner = runners.runner_for(dep);
+            Ok(ServiceInfo {
+                name: dep.name.clone(),
+                label: service_runner::display_name(&dep.name, runner),
+                state: shared::ServiceState::new(
+                    shared::Backend::of(runner),
+                    runner.is_running(dep)?,
+                    port,
+                ),
+            })
+        })
+        .collect()
 }
 
 /// One line per service: `● redis` when running, `○ redis` when stopped, with
-/// docker-managed services suffixed `(docker)`.
-pub(crate) fn list_impl(config: &DevyConfig, runners: &Runners) -> Result<()> {
-    let services: Vec<_> = config
-        .normalized_dependencies()?
-        .into_iter()
-        .filter(|dep| modules::get(&dep.name).is_service())
-        .collect();
+/// docker-managed services suffixed `(docker)`. With `json`, the services document.
+pub(crate) fn list_impl(
+    config: &DevyConfig,
+    runners: &Runners,
+    lock: Option<&LockFile>,
+    json: bool,
+) -> Result<()> {
+    let services = services_report(config, runners, lock)?;
+    if json {
+        return super::json::print(&ServicesDocument {
+            services: &services,
+        });
+    }
 
     if services.is_empty() {
         println!("No services defined.");
@@ -42,13 +97,11 @@ pub(crate) fn list_impl(config: &DevyConfig, runners: &Runners) -> Result<()> {
 
     output::header("Services");
 
-    for dep in &services {
-        let runner = runners.runner_for(dep);
-        let name = service_runner::display_name(&dep.name, runner);
-        if runner.is_running(dep)? {
-            println!("  {}  {}", "●".green().bold(), name);
+    for service in &services {
+        if service.state.running {
+            println!("  {}  {}", "●".green().bold(), service.label);
         } else {
-            println!("  {}  {}", "○".dimmed(), name.dimmed());
+            println!("  {}  {}", "○".dimmed(), service.label.dimmed());
         }
     }
 
@@ -423,7 +476,15 @@ mod tests {
     fn list_impl_returns_ok_with_no_services() {
         let config = make_config(&["node"]); // node is not a service
         let pm = MockPackageManager::default();
-        assert!(list_impl(&config, &package_runners(&pm, Path::new("/tmp"))).is_ok());
+        assert!(
+            list_impl(
+                &config,
+                &package_runners(&pm, Path::new("/tmp")),
+                None,
+                false
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -433,7 +494,15 @@ mod tests {
             service_running: true,
             ..Default::default()
         };
-        assert!(list_impl(&config, &package_runners(&pm, Path::new("/tmp"))).is_ok());
+        assert!(
+            list_impl(
+                &config,
+                &package_runners(&pm, Path::new("/tmp")),
+                None,
+                false
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -445,7 +514,13 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            list_impl(&config, &package_runners(&pm, Path::new("/tmp"))).is_err(),
+            list_impl(
+                &config,
+                &package_runners(&pm, Path::new("/tmp")),
+                None,
+                false
+            )
+            .is_err(),
             "list_impl must propagate is_running errors"
         );
     }
@@ -571,7 +646,7 @@ mod tests {
             None,
             false,
         );
-        list_impl(&config, &runners).unwrap();
+        list_impl(&config, &runners, None, false).unwrap();
         let lines = cli.lines();
         assert_eq!(lines.len(), 1, "only redis is a service: {lines:?}");
         assert!(lines[0].starts_with("docker container inspect"));
@@ -652,5 +727,147 @@ mod tests {
         };
         let err = resolve_service(&docker_config(), "redis", &pm, &dir, true).unwrap_err();
         assert!(err.to_string().contains("run `devy up` first"), "{err}");
+    }
+
+    // ── services --json ──────────────────────────────────────────────────────
+
+    fn services_doc(
+        config: &DevyConfig,
+        runners: &Runners,
+        lock: Option<&LockFile>,
+    ) -> serde_json::Value {
+        let services = services_report(config, runners, lock).unwrap();
+        let out = crate::commands::json::render(&ServicesDocument {
+            services: &services,
+        })
+        .unwrap();
+        serde_json::from_str(&out).unwrap()
+    }
+
+    #[test]
+    fn services_json_reports_locked_port() {
+        let dir = crate::test_support::tmp_dir();
+        write_lock_with_port(&dir, "redis", 52113);
+        let lock = ports::load_lock(&dir).unwrap();
+        let config = make_config(&["redis"]);
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            service_running: true,
+            ..Default::default()
+        };
+        let doc = services_doc(&config, &package_runners(&pm, &dir), lock.as_ref());
+        assert_eq!(
+            doc,
+            serde_json::json!({
+                "version": 1,
+                "services": [{
+                    "name": "redis",
+                    "backend": "package",
+                    "running": true,
+                    "host": "127.0.0.1",
+                    "port": 52113,
+                    "port_source": "lock",
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn services_json_reports_docker_service() {
+        let config: DevyConfig = serde_yml::from_str(
+            "dependencies:\n  - postgres:\n      service_manager: docker\n  - redis\n",
+        )
+        .unwrap();
+        let pm = MockPackageManager {
+            name: "brew",
+            service_running: true,
+            ..Default::default()
+        };
+        let cli =
+            FakeRunner::new(|_| ok(r#"[{"State":{"Running":false},"Config":{"Labels":{}}}]"#));
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &cli),
+            &config,
+            Path::new("/src/app"),
+            None,
+            false,
+        );
+        let doc = services_doc(&config, &runners, None);
+        let postgres = &doc["services"][0];
+        assert_eq!(postgres["name"], "postgres");
+        assert_eq!(postgres["backend"], "docker");
+        assert_eq!(postgres["running"], false);
+        let redis = &doc["services"][1];
+        assert_eq!(redis["backend"], "package");
+        assert_eq!(redis["running"], true);
+        assert_eq!(redis["port"], 6379);
+        assert_eq!(redis["port_source"], "default");
+    }
+
+    #[test]
+    fn services_json_reports_unassigned_port() {
+        let config = make_config(&["redis"]);
+        let pm = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        let doc = services_doc(&config, &package_runners(&pm, Path::new("/tmp")), None);
+        let redis = &doc["services"][0];
+        assert_eq!(redis["port"], serde_json::Value::Null);
+        assert_eq!(redis["port_source"], "unassigned");
+    }
+
+    #[test]
+    fn services_json_without_services_is_empty() {
+        let config = make_config(&["jq", "node"]);
+        let pm = MockPackageManager::default();
+        let doc = services_doc(&config, &package_runners(&pm, Path::new("/tmp")), None);
+        assert_eq!(doc, serde_json::json!({"version": 1, "services": []}));
+    }
+
+    #[test]
+    fn services_report_does_not_write_lock() {
+        let dir = crate::test_support::tmp_dir();
+        let config = make_config(&["redis", "postgres"]);
+        let pm = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        let lock = ports::load_lock(&dir).unwrap();
+        list_impl(&config, &package_runners(&pm, &dir), lock.as_ref(), true).unwrap();
+        assert!(!dir.join(crate::lock::PATH).exists());
+    }
+
+    #[test]
+    fn services_rejects_an_out_of_range_port_like_status() {
+        let config: DevyConfig =
+            serde_yml::from_str("dependencies:\n  - redis:\n      port: 70000\n").unwrap();
+        let pm = MockPackageManager::default();
+        let err = list_impl(
+            &config,
+            &package_runners(&pm, Path::new("/tmp")),
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    #[test]
+    fn services_probes_the_locked_port() {
+        // The running check sees the port `up` assigned, not the module default.
+        let dir = crate::test_support::tmp_dir();
+        write_lock_with_port(&dir, "redis", 52113);
+        let lock = ports::load_lock(&dir).unwrap();
+        let config = make_config(&["redis"]);
+        let pm = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        let services =
+            services_report(&config, &package_runners(&pm, &dir), lock.as_ref()).unwrap();
+        assert_eq!(services[0].state.port, Some(52113));
     }
 }
