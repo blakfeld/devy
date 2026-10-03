@@ -63,6 +63,10 @@ impl Module for NginxModule {
         true
     }
 
+    fn extra_log_paths(&self, data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        vec![data_dir.join("error.log"), data_dir.join("access.log")]
+    }
+
     fn nix_launch(
         &self,
         dep: &Dependency,
@@ -144,6 +148,15 @@ impl Module for NginxModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_log_paths_are_error_and_access_logs() {
+        let d = std::path::Path::new("/p/.devy/data/nginx");
+        assert_eq!(
+            NginxModule.extra_log_paths(d),
+            [d.join("error.log"), d.join("access.log")]
+        );
+    }
 
     #[test]
     fn nginx_module_is_service() {

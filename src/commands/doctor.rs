@@ -16,14 +16,18 @@ use crate::lock::LockFile;
 use crate::modules;
 use crate::output;
 use crate::package_manager::{self, PackageManager};
+use crate::service_runner::Runners;
 use crate::service_runner::docker::ContainerRuntime;
 
 use super::check::{self, Findings};
 use super::failure_record::{self, FailureRecord};
+use super::logs::Tail;
 use super::ports::{self, PortMode};
 
 /// Log lines sent per affected service.
 const LOG_LINES: usize = 50;
+/// How long one service's log command may run while collecting logs.
+const LOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How doctor uses AI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,16 +48,42 @@ pub struct Options {
 /// Recent log output for a service.
 pub trait LogSource {
     /// Up to the last `lines` lines of `service`'s log, or `None` when none are available.
-    fn tail(&self, project_root: &Path, service: &str, lines: usize) -> Option<String>;
+    fn tail(
+        &self,
+        config: &DevyConfig,
+        pm: &dyn PackageManager,
+        project_root: &Path,
+        service: &str,
+        lines: u32,
+    ) -> Option<String>;
 }
 
-/// No service logs: the retrieval API arrives with the service-logs work. Until then
-/// every affected service is reported as having no logs available.
-pub struct NoLogs;
+/// Logs read through the service's runner, the same way `devy logs` reads them. A
+/// service with no output, an unsupported backend or a failed read has none available.
+pub struct ServiceLogs;
 
-impl LogSource for NoLogs {
-    fn tail(&self, _: &Path, _: &str, _: usize) -> Option<String> {
-        None
+impl LogSource for ServiceLogs {
+    fn tail(
+        &self,
+        config: &DevyConfig,
+        pm: &dyn PackageManager,
+        project_root: &Path,
+        service: &str,
+        lines: u32,
+    ) -> Option<String> {
+        let dep = super::service::resolve_dep(config, service).ok()?;
+        let runners = Runners::new(
+            pm,
+            ContainerRuntime::system(config.container_cli),
+            config,
+            project_root,
+            None,
+            false,
+        );
+        match super::logs::recent(runners.runner_for(&dep), &dep, lines, LOG_TIMEOUT) {
+            Ok(Tail::Text(text)) => Some(text),
+            Ok(Tail::Empty) | Err(_) => None,
+        }
     }
 }
 
@@ -98,7 +128,7 @@ pub fn run(yes: bool, no_ai: bool, show_context: bool) -> Result<()> {
             detect: &|config, root| package_manager::detect(config, root),
             env_mgr: &Shadowenv,
             client: &ai::Client::from_env,
-            logs: &NoLogs,
+            logs: &ServiceLogs,
             input: &mut input,
             is_tty,
         },
@@ -176,7 +206,10 @@ pub(crate) fn run_with(
         logs: affected_services(record.as_ref(), &findings)
             .into_iter()
             .map(|s| {
-                let lines = deps.logs.tail(project_root, &s, LOG_LINES);
+                let lines = config.zip(pm.as_deref()).and_then(|(config, pm)| {
+                    deps.logs
+                        .tail(config, pm, project_root, &s, LOG_LINES as u32)
+                });
                 (s, lines)
             })
             .collect(),
@@ -296,7 +329,7 @@ pub(crate) struct Bundle<'a> {
 const SYSTEM: &str = "You diagnose problems in projects managed by devy, a declarative developer \
 environment manager. Follow the reference and the reply format in the prompt exactly.";
 
-const BACKEND_NOTES: &str = "Backend notes:
+pub(crate) const BACKEND_NOTES: &str = "Backend notes:
 - nix (default on macOS and Linux): packages install into the project-local profile .devy/nix-profile from nixpkgs; versions map to versioned attributes (e.g. nodejs_22) and an unmapped version falls back to the nixpkgs default. Services run as launchd agents (macOS) or systemd --user units (Linux), with data under .devy/data.
 - brew (macOS) and apt (Linux): system packages; services use brew services or systemd. Ports set in devy.yml cannot be applied to every service with these backends.
 - winget (Windows).
@@ -742,7 +775,14 @@ mod tests {
 
     struct FakeLogs;
     impl LogSource for FakeLogs {
-        fn tail(&self, _: &Path, service: &str, _: usize) -> Option<String> {
+        fn tail(
+            &self,
+            _: &DevyConfig,
+            _: &dyn PackageManager,
+            _: &Path,
+            service: &str,
+            _: u32,
+        ) -> Option<String> {
             Some(format!("starting\nLOG-{service}\n"))
         }
     }
@@ -754,6 +794,7 @@ mod tests {
         yes: bool,
         detect: &'a DetectFn,
         client: &'a dyn Fn() -> Result<ai::Client>,
+        logs: &'a dyn LogSource,
         input: &'a str,
         is_tty: bool,
     }
@@ -766,6 +807,7 @@ mod tests {
                 yes: false,
                 detect: &running_pm,
                 client: &must_not_ask,
+                logs: &FakeLogs,
                 input: "",
                 is_tty: false,
             }
@@ -786,7 +828,7 @@ mod tests {
                         detect: self.detect,
                         env_mgr: &MockEnvManager::default(),
                         client: self.client,
-                        logs: &FakeLogs,
+                        logs: self.logs,
                         input: &mut input,
                         is_tty: self.is_tty,
                     },
@@ -945,6 +987,60 @@ mod tests {
         assert!(sent.contains("=== devy.lock ===\nversion: 1"), "{sent}");
         assert!(sent.contains("step: start services"), "{sent}");
         assert!(sent.contains("Backend: brew"), "{sent}");
+    }
+
+    #[test]
+    fn stopped_services_logs_are_read_like_devy_logs() {
+        let dir = project("name: shop\ndependencies:\n  - postgres\n  - redis\n");
+        std::fs::write(
+            dir.join("pg.log"),
+            "FATAL: lock file \"postmaster.pid\" already exists\n",
+        )
+        .unwrap();
+        let log = dir.join("pg.log");
+        // Every service is stopped (so affected) and its backend logs to pg.log.
+        let detect = move |_: &DevyConfig, _: &Path| -> Result<Box<dyn PackageManager>> {
+            Ok(Box::new(MockPackageManager {
+                name: "brew",
+                installed: true,
+                service_running: false,
+                log_source_result: Some(crate::package_manager::LogSource::Files(vec![
+                    log.clone(),
+                ])),
+                ..Default::default()
+            }))
+        };
+        let fake = fake(&[&reply(None, &[])]);
+        let client = client_for(&fake);
+        let run = Run {
+            detect: &detect,
+            client: &client,
+            logs: &ServiceLogs,
+            ..Run::new(&dir)
+        };
+        run.go().0.unwrap();
+        let sent = fake.stdin(0);
+        assert!(
+            sent.contains(
+                "--- postgres (last 50 lines) ---\nFATAL: lock file \"postmaster.pid\" already exists\n"
+            ),
+            "{sent}"
+        );
+
+        // No log output, and unsupported backends, are "no logs available".
+        let config: DevyConfig = serde_yml::from_str("dependencies:\n  - redis\n").unwrap();
+        let empty = MockPackageManager {
+            log_source_result: Some(crate::package_manager::LogSource::Files(vec![
+                dir.join("missing.log"),
+            ])),
+            ..Default::default()
+        };
+        assert_eq!(ServiceLogs.tail(&config, &empty, &dir, "redis", 50), None);
+        let winget = MockPackageManager {
+            name: "winget",
+            ..Default::default()
+        };
+        assert_eq!(ServiceLogs.tail(&config, &winget, &dir, "redis", 50), None);
     }
 
     #[test]

@@ -909,6 +909,155 @@ fn doctor_healthy_project_reports_no_problems() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// devy logs
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn logs_undeclared_name_fails() {
+    let proj = TempProject::with_yaml("dependencies:\n  - redis\n");
+    let out = proj.run(&["logs", "nosuch"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: 'nosuch' not found in devy.yml dependencies"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn logs_non_service_fails() {
+    let proj = TempProject::with_yaml("dependencies:\n  - node\n");
+    let out = proj.run(&["logs", "node"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: 'node' is not a service"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn logs_invalid_line_count_is_a_usage_error() {
+    let proj = TempProject::with_yaml("dependencies:\n  - redis\n");
+    for n in ["zero", "0", "-3"] {
+        let out = proj.run(&["logs", "redis", "-n", n]);
+        assert_eq!(out.status.code(), Some(2), "-n {n}");
+    }
+}
+
+#[test]
+fn logs_without_services_says_so() {
+    let proj = TempProject::with_yaml("dependencies:\n  - node\n");
+    let out = proj.run(&["logs"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "No services defined.\n"
+    );
+}
+
+#[test]
+fn logs_builtin_shadows_project_command() {
+    let proj =
+        TempProject::with_yaml("dependencies:\n  - node\ncommands:\n  logs: echo project-logs\n");
+    let out = proj.run(&["logs"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "No services defined.\n"
+    );
+}
+
+#[test]
+fn logs_explain_with_follow_is_a_usage_error() {
+    let proj = TempProject::with_yaml("dependencies:\n  - redis\n");
+    let out = proj.run_without_claude(&["logs", "redis", "--explain", "-f"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn logs_explain_without_a_service_is_a_usage_error() {
+    let proj = TempProject::with_yaml("dependencies:\n  - redis\n");
+    let out = proj.run_without_claude(&["logs", "--explain"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = proj.run_without_claude(&["logs", "redis", "--show-context"]);
+    assert_eq!(out.status.code(), Some(2), "--show-context needs --explain");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// devy ask
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn ask_without_a_question_is_a_usage_error() {
+    let proj = TempProject::with_yaml("name: app\n");
+    assert_eq!(proj.run_without_claude(&["ask"]).status.code(), Some(2));
+    assert_eq!(
+        proj.run_without_claude(&["ask", "  "]).status.code(),
+        Some(2)
+    );
+}
+
+#[test]
+fn ask_show_context_works_without_claude() {
+    let proj = TempProject::with_yaml("name: app\nenvironment:\n  API_TOKEN: abc123\n");
+    let out = proj.run_without_claude(&["ask", "--show-context", "is postgres ok?"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("=== devy.yml ==="), "{stdout}");
+    assert!(
+        stdout.contains("=== question ===\nis postgres ok?"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("abc123"), "{stdout}");
+}
+
+#[test]
+fn ask_without_claude_fails() {
+    let proj = TempProject::with_yaml("name: app\n");
+    let out = proj.run_without_claude(&["ask", "is postgres ok?"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: the `claude` CLI was not found"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn ask_requires_devy_yml() {
+    let proj = TempProject::new();
+    let out = proj.run_without_claude(&["ask", "--show-context", "hi"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("devy.yml not found"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ask_piped_output_is_only_the_answer() {
+    let proj = TempProject::with_yaml("name: app\n");
+    let reply = r#"{"type":"result","subtype":"success","is_error":false,"result":"Postgres is fine.","modelUsage":{"claude-test-model":{"outputTokens":3}}}"#;
+    let out = proj.run_with_fake_claude(&["ask", "is postgres ok?"], reply);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Postgres is fine.\n");
+    let stdin = proj.fake_claude_record("stdin.txt");
+    assert!(
+        stdin.ends_with("=== question ===\nis postgres ok?\n"),
+        "{stdin}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // general CLI
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -928,7 +1077,9 @@ fn help_flag_exits_zero() {
 fn help_output_lists_key_subcommands() {
     let out = Command::new(binary()).arg("--help").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for cmd in &["up", "down", "check", "doctor", "init", "hook", "status"] {
+    for cmd in &[
+        "up", "down", "check", "doctor", "init", "hook", "status", "logs", "ask",
+    ] {
         assert!(
             stdout.contains(cmd),
             "--help output must list the '{cmd}' subcommand"

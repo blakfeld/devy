@@ -14,10 +14,38 @@ pub fn run() {
     }
 }
 
+/// Prints each service dependency's name from devy.yml, one per line, in declaration
+/// order. Silent on any error, like `run`.
+#[cfg_attr(test, mutants::skip)] // returns () and only prints to stdout — not observable in unit tests
+pub fn run_services() {
+    if let Ok(config) = DevyConfig::load_default() {
+        for name in service_names(&config) {
+            println!("{}", name);
+        }
+    }
+}
+
+fn service_names(config: &DevyConfig) -> Vec<String> {
+    config
+        .normalized_dependencies()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|dep| crate::modules::get(&dep.name).is_service())
+        .map(|dep| dep.name)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::{DevyConfig, RawCommand};
     use std::collections::HashMap;
+
+    #[test]
+    fn service_names_are_services_in_declaration_order() {
+        let config =
+            crate::test_support::make_config(&["redis", "node", "postgres"], HashMap::new());
+        assert_eq!(super::service_names(&config), ["redis", "postgres"]);
+    }
 
     fn config_with_commands(names: &[&str]) -> DevyConfig {
         let commands = names

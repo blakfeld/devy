@@ -515,3 +515,43 @@ fn docker_warnings_only_for_docker_managed() {
     kafka.docker = true;
     assert_eq!(docker_warnings(&kafka).len(), 1);
 }
+
+#[test]
+fn docker_logs_tail_the_container() {
+    for (yaml, cli) in [
+        ("name: app\n", "docker"),
+        ("name: app\ncontainer_cli: podman\n", "podman"),
+    ] {
+        let fake = FakeRunner::ok();
+        let runner = docker_runner(&fake, yaml, None, false);
+        let dep = docker_dep("redis", None);
+        let name = format!("devy-{}-redis", slug());
+        for (follow, expected) in [
+            (false, vec!["logs", "--tail", "50", name.as_str()]),
+            (true, vec!["logs", "--tail", "50", "-f", name.as_str()]),
+        ] {
+            let LogSource::Command(cmd) = runner.log_source(&dep, 50, follow).unwrap() else {
+                panic!("expected a command");
+            };
+            assert_eq!(cmd.program, cli);
+            assert_eq!(cmd.args, expected);
+            assert_eq!(cmd.kind, LogCommandKind::Container);
+        }
+        assert!(fake.lines().is_empty(), "building the command runs nothing");
+    }
+}
+
+#[test]
+fn package_logs_come_from_the_package_manager() {
+    let pm = MockPackageManager {
+        log_source_result: Some(LogSource::Files(vec!["/tmp/r.log".into()])),
+        ..Default::default()
+    };
+    let runner = PackageRunner::new(&pm, Path::new(ROOT));
+    assert_eq!(
+        runner
+            .log_source(&Dependency::simple("redis"), 10, false)
+            .unwrap(),
+        LogSource::Files(vec!["/tmp/r.log".into()])
+    );
+}

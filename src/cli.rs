@@ -59,6 +59,32 @@ enum Commands {
         /// Service name as defined in devy.yml
         name: String,
     },
+    /// Show recent log output for a service, or for every service
+    Logs {
+        /// Service name as defined in devy.yml (default: every service)
+        name: Option<String>,
+        /// Number of trailing lines to show per service
+        #[arg(short = 'n', long, default_value_t = commands::logs::DEFAULT_LINES, value_parser = clap::value_parser!(u32).range(1..))]
+        lines: u32,
+        /// Keep streaming new log output until interrupted (Ctrl-C)
+        #[arg(short, long)]
+        follow: bool,
+        /// Ask Claude to explain the service's logs and suggest a fix (needs the claude CLI)
+        #[arg(long, requires = "name", conflicts_with = "follow")]
+        explain: bool,
+        /// With --explain, print exactly what would be sent to Claude, then exit without sending it
+        #[arg(long, requires = "explain")]
+        show_context: bool,
+    },
+    /// Ask Claude a question about this project's environment (needs the claude CLI)
+    Ask {
+        /// The question, e.g. "why can't my app reach redis?"
+        #[arg(value_parser = non_blank)]
+        question: String,
+        /// Print exactly what would be sent to Claude, then exit without sending it
+        #[arg(long)]
+        show_context: bool,
+    },
     /// Stop all services defined in devy.yml
     Down {
         /// Also remove docker-managed services' containers and data volumes
@@ -97,9 +123,21 @@ enum Commands {
     /// List commands from devy.yml — used by shell completion, not intended for direct use
     #[command(hide = true, name = "_commands")]
     ListDefined,
+    /// List service names from devy.yml — used by shell completion, not intended for direct use
+    #[command(hide = true, name = "_services")]
+    ListServices,
     /// Run a command defined in devy.yml
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+/// Rejects an empty or whitespace-only argument as a usage error.
+fn non_blank(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        Err("must not be empty".into())
+    } else {
+        Ok(s.to_string())
+    }
 }
 
 /// Names of devy's own subcommands, which a `commands:` entry cannot shadow.
@@ -151,6 +189,23 @@ impl Cli {
             Commands::Start { name } => commands::service::start(name),
             Commands::Stop { name } => commands::service::stop(name),
             Commands::Restart { name } => commands::service::restart(name),
+            Commands::Logs {
+                name,
+                lines,
+                follow,
+                explain,
+                show_context,
+            } => commands::logs::run(commands::logs::Options {
+                name: name.clone(),
+                lines: *lines,
+                follow: *follow,
+                explain: *explain,
+                show_context: *show_context,
+            }),
+            Commands::Ask {
+                question,
+                show_context,
+            } => commands::ask::run(question, *show_context),
             Commands::Down { volumes } => commands::down::run(*volumes),
             Commands::Status => commands::status::run(),
             Commands::Check => commands::check::run(),
@@ -164,6 +219,10 @@ impl Cli {
             Commands::Hook { shell } => commands::hook::run(shell),
             Commands::ListDefined => {
                 commands::list_commands::run();
+                Ok(())
+            }
+            Commands::ListServices => {
+                commands::list_commands::run_services();
                 Ok(())
             }
             Commands::External(args) => match args.as_slice() {

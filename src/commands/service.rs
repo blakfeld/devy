@@ -72,13 +72,16 @@ pub(crate) fn start_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result
     output::step(&format!("Starting {}…", dep.name));
     runner.start(dep)?;
     if let Err(e) = module.wait_for_ready(dep) {
-        output::warn(&format!(
-            "{} started but health check timed out — verify manually: {}",
-            dep.name, e
-        ));
+        output::warn(&health_timeout_warning(&dep.name, &e));
     }
     output::success(&format!("{} started", dep.name));
     Ok(())
+}
+
+fn health_timeout_warning(name: &str, err: &anyhow::Error) -> String {
+    format!(
+        "{name} started but health check timed out — verify manually: {err} — run devy logs {name}"
+    )
 }
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
@@ -119,10 +122,7 @@ pub(crate) fn restart_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Resu
     output::step(&format!("Starting {}…", dep.name));
     runner.start(dep)?;
     if let Err(e) = module.wait_for_ready(dep) {
-        output::warn(&format!(
-            "{} started but health check timed out — verify manually: {}",
-            dep.name, e
-        ));
+        output::warn(&health_timeout_warning(&dep.name, &e));
     }
     output::success(&format!("{} started", dep.name));
     Ok(())
@@ -342,6 +342,47 @@ mod tests {
         // Returns Ok without calling start_service.
         start_impl(&dep, &PackageRunner::new(&pm, Path::new("/tmp"))).unwrap();
         assert!(pm.started_services.borrow().is_empty());
+    }
+
+    #[test]
+    fn health_timeouts_suggest_devy_logs() {
+        let pm = MockPackageManager::default();
+        // Port 1 is never listening, so the health check always times out.
+        let mut dep = Dependency::simple("mysql");
+        dep.extra.insert(
+            "port".into(),
+            crate::config::ExtraValue::Number(1u64.into()),
+        );
+        let runner = PackageRunner::new(&pm, Path::new("/tmp"));
+        let start = output::with_warn_messages(|| start_impl(&dep, &runner).unwrap());
+        let restart = output::with_warn_messages(|| restart_impl(&dep, &runner).unwrap());
+        for msgs in [start, restart] {
+            assert_eq!(msgs.len(), 1, "{msgs:?}");
+            assert!(
+                msgs[0].starts_with("mysql started but health check timed out — verify manually: ")
+                    && msgs[0].ends_with(" — run devy logs mysql"),
+                "{}",
+                msgs[0]
+            );
+        }
+    }
+
+    #[test]
+    fn stop_timeout_suggests_devy_logs() {
+        let pm = MockPackageManager {
+            service_running: true,
+            ..Default::default()
+        };
+        // memcached is a service whose module uses the default shutdown attempts.
+        let err = modules::get("memcached")
+            .wait_for_stopped(&pm, &Dependency::simple("memcached"))
+            .unwrap_err();
+        assert!(
+            err.to_string().ends_with(
+                "did not stop after 10 attempts — try stopping it manually or run devy logs memcached"
+            ),
+            "{err}"
+        );
     }
 
     #[test]

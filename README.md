@@ -27,7 +27,7 @@ On macOS and Linux you can opt into your system package manager instead by setti
 
 - A supported platform (see above)
 - **macOS / Linux:** Nix is required. Run `devy up --bootstrap` to install it automatically via the [Determinate Installer](https://install.determinate.systems), or install Nix manually first.
-- **`devy init` and `devy doctor`:** the [Claude Code](https://claude.com/claude-code) CLI (`claude`), signed in. Only these two commands use it; `devy init --detect` works without it, and `devy doctor` falls back to devy's own checks.
+- **`devy init`, `devy doctor`, `devy ask` and `devy logs --explain`:** the [Claude Code](https://claude.com/claude-code) CLI (`claude`), signed in. Only these commands use it; `devy init --detect` works without it, and `devy doctor` falls back to devy's own checks.
 
 ## Installation
 
@@ -294,6 +294,57 @@ devy restart mysql   # Stop then start a service, waiting for it to be healthy
 
 Service names match what's defined under `dependencies:` in `devy.yml`.
 
+When a service starts but its health check times out, or doesn't stop in time, devy points you at `devy logs <name>`.
+
+### `devy logs`
+
+Shows a service's recent log output, wherever its backend keeps it. Reading logs never starts, stops or changes anything.
+
+```sh
+devy logs redis              # The last 100 lines of redis's log
+devy logs redis -n 20        # The last 20 lines (--lines)
+devy logs redis -f           # Then keep streaming new lines until Ctrl-C (--follow)
+devy logs                    # Every service, each under its own heading
+devy logs -f                 # Every service, streamed together as "<name> | <line>"
+devy logs postgres --explain # Ask Claude what's wrong (see "devy ask" below)
+```
+
+Names resolve like `devy start`: `devy logs postgres` finds a `postgresql` dependency. A name that isn't declared, or isn't a service, is an error. Following a service that isn't running is allowed, so you can watch it start from another terminal. Ctrl-C ends `--follow` with exit status 0.
+
+Where devy reads from:
+
+| Backend | Log source |
+|---|---|
+| nix on macOS | the launchd agent's log file, `$TMPDIR/devy-<name>.log` (shared by every project with a service of that name) |
+| nix on Linux | the user journal: `journalctl --user -u devy-<name>.service` |
+| brew | the files `brew services info --json <name>` reports; both stdout and stderr files when it reports two |
+| apt | the system journal: `journalctl -u <name>` |
+| docker / podman | `docker logs` (or `podman logs`) for the container `devy-<project>-<service>` |
+| winget | not supported — devy says to check Windows Event Viewer or the service's own log directory |
+
+`<name>` is the backend's service name, e.g. `postgresql` for a `postgres` dependency.
+
+When a service hasn't logged anything yet, devy prints `· No logs yet for <name>` (with the expected file under nix on macOS) and exits 0. Under nix, services that also write their own log files under `.devy/data/<name>/` (nginx's `error.log` and `access.log`, Elasticsearch's and OpenSearch's `logs/`, Kafka's `app-logs/`, RabbitMQ's `log/`) get one `· also see <path>` line per file that exists.
+
+On apt systems your user may not be allowed to read the system journal. devy never uses `sudo` for logs; it says the journal couldn't be read and suggests `sudo journalctl -u <name>` or adding yourself to the `systemd-journal` group (`sudo usermod -aG systemd-journal $USER`, then log in again).
+
+### `devy ask`
+
+Asks Claude a question about this project's environment, using a snapshot devy collects for it (see [What `devy ask` and `devy logs --explain` send](#ai-features)).
+
+```sh
+devy ask "why can't my app reach redis?"
+devy ask "is postgres ok?" > answer.md                   # Only the answer goes to the file
+devy ask --show-context "is postgres ok?"                 # Print what would be sent, then exit
+devy logs postgres --explain                              # Diagnose one service from its logs
+devy logs postgres --explain -n 300                       # …from its last 300 lines
+devy logs postgres --explain --show-context               # Print that request, then exit
+```
+
+`devy ask` needs a `devy.yml` and doesn't install, start or change anything. `devy logs <name> --explain` sends that service's last `--lines` lines (default 100) with its configuration, and prints the likely cause and steps to fix it; it needs a service name and can't be combined with `--follow`. When the service has no logs yet, devy says so and doesn't contact Claude. `--show-context` works without `claude` installed.
+
+If `claude` isn't installed or the request fails, devy prints `error: …` and exits 1.
+
 ### `devy status`
 
 Shows what is installed, what services are running, and what environment variables are set.
@@ -423,7 +474,7 @@ devy hook fish
 The snippet does two things:
 
 1. **Shadowenv activation** — wraps `devy up` so the new environment is activated in your current shell session immediately after installation.
-2. **Tab completion** — registers completion for all built-in subcommands (`up`, `down`, `start`, `stop`, `restart`, `services`, `status`, `check`, `doctor`, `init`, `hook`, `pr`, `export`) and flags. Commands you define under `commands:` in `devy.yml` are completed **dynamically** — the completion function calls `devy _commands` at tab-press time so new commands appear without reloading your shell.
+2. **Tab completion** — registers completion for all built-in subcommands (`up`, `down`, `start`, `stop`, `restart`, `services`, `status`, `check`, `doctor`, `logs`, `ask`, `init`, `hook`, `pr`, `export`) and flags. Commands you define under `commands:` in `devy.yml` are completed **dynamically** — the completion function calls `devy _commands` at tab-press time so new commands appear without reloading your shell. `devy logs <TAB>` completes service names the same way, from `devy _services`.
 
 ## Lock file
 
@@ -552,7 +603,7 @@ Each module knows the correct package name for each package manager — you alwa
 
 ## AI features
 
-Only `devy init` (not with `--detect`) and `devy doctor` (not with `--no-ai` or `--show-context`) use AI. No other command looks for or runs `claude`. A failed `devy up` only suggests `devy doctor`; it never contacts Claude.
+Only `devy init` (not with `--detect`), `devy doctor` (not with `--no-ai`), `devy ask` and `devy logs --explain` use AI, and none of them with `--show-context`. No other command looks for or runs `claude`. A failed `devy up` only suggests `devy doctor`; it never contacts Claude.
 
 They run through your own [Claude Code](https://claude.com/claude-code) CLI, so devy needs no API key of its own: install `claude`, sign in once, and devy uses whatever account and default model `claude` is set up with. devy runs `claude -p` with all tools, MCP servers and slash commands disabled, without saving the session, and from an empty temporary directory, so the project's own `.claude/` settings, hooks and `CLAUDE.md` are not loaded.
 
@@ -573,9 +624,22 @@ The header of a generated file names the model `claude` reports having used.
 - the findings from devy's checks
 - `devy.yml` and `devy.lock`
 - the platform, package manager and devy version
-- up to the last 50 log lines of each service that is named in the failure record or reported stopped
+- up to the last 50 log lines of each service that is named in the failure record or reported stopped, read the same way as [`devy logs`](#devy-logs)
 
 Services with no logs available are listed as `no logs available`. devy never sends the environment file (`.shadowenv.d/`), dotenv files or any other file. The request also includes devy's `devy.yml` reference and module catalog.
+
+**What `devy ask` sends.** Your question and, after redaction:
+
+- `devy.yml`, and `devy.lock` if it exists
+- the platform and the package manager
+- for each dependency, whether it is installed and, for services, whether it is running
+- for each service, its last 50 log lines, read the same way as `devy logs` (each log command gets 5 seconds)
+
+A service whose logs can't be read (winget, an unreadable journal, a stopped container runtime) gets a one-line note instead, and the question is still sent. When the whole snapshot would exceed 60 KiB, the oldest log lines are dropped first.
+
+**What `devy logs <name> --explain` sends.** After redaction: that service's `devy.yml` entry, its `devy.lock` entry, whether it is running, its port, and its last `--lines` log lines.
+
+Both requests also include a short note on how devy's backends work. Neither ever includes your shell's environment variables, the shadowenv file or any other file.
 
 **What is redacted.** Before anything is sent, devy replaces with `<redacted>`:
 
@@ -588,7 +652,7 @@ devy never reads `.env`, `.env.local` or other real dotenv files, `.git`, SSH ke
 
 Redaction is pattern-based. A secret stored under an innocuous name — for example a password pasted into `README.md` — would be sent. Use `--show-context` to check before sending.
 
-**Failures.** If `claude` is not on `PATH`, `devy init` says so and suggests `devy init --detect`; `devy doctor` prints its own findings and exits 0 (see [`devy doctor`](#devy-doctor)). A request is stopped after 5 minutes. When `claude` fails or reports an error (for example, not signed in), devy prints `AI request failed: <reason>` and exits 1 without writing files. Retries on rate limits are left to `claude`.
+**Failures.** If `claude` is not on `PATH`, `devy init` says so and suggests `devy init --detect`; `devy doctor` prints its own findings and exits 0 (see [`devy doctor`](#devy-doctor)); `devy ask` and `devy logs --explain` print `error: …` and exit 1. A request is stopped after 5 minutes. When `claude` fails or reports an error (for example, not signed in), devy prints `AI request failed: <reason>` and exits 1 without writing files. Retries on rate limits are left to `claude`.
 
 ## Security
 

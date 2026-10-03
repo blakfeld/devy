@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Dependency;
 use crate::output;
-use crate::package_manager::PackageManager;
+use crate::package_manager::{LogSource, PackageManager};
 pub(crate) use helpers::fnv1a;
 use helpers::{
     PackageModule, extra_port, extra_strs, node_pkg, pm_dep, run_cmd, tcp_ping, write_mysql_config,
@@ -575,6 +575,24 @@ pub trait Module: Sync {
         Ok(())
     }
 
+    /// Where the package manager keeps this service's logs, looked up by its backend
+    /// service name.
+    fn log_source(
+        &self,
+        pm: &dyn PackageManager,
+        dep: &Dependency,
+        lines: u32,
+        follow: bool,
+    ) -> Result<LogSource> {
+        pm.log_source(&self.service_name(dep), lines, follow)
+    }
+
+    /// Log files or directories this service writes itself under its nix `data_dir`
+    /// (`<project_root>/.devy/data/<canonical-name>`), shown by `devy logs` as hints.
+    fn extra_log_paths(&self, _data_dir: &Path) -> Vec<PathBuf> {
+        vec![]
+    }
+
     /// Probes the service directly to confirm it is accepting connections.
     /// Override in service modules; default always passes.
     fn health_check(&self, _dep: &Dependency) -> Result<()> {
@@ -640,9 +658,10 @@ pub trait Module: Sync {
             }
         }
         anyhow::bail!(
-            "{} did not stop after {} attempts — try stopping it manually or check its logs",
+            "{} did not stop after {} attempts — try stopping it manually or run devy logs {}",
             dep.name,
-            max
+            max,
+            dep.name
         )
     }
 
@@ -979,6 +998,29 @@ pub fn catalog() -> Vec<CatalogEntry> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    // ── logs ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn log_source_uses_the_backend_service_name() {
+        let pm = crate::package_manager::MockPackageManager {
+            log_source_result: Some(LogSource::Files(vec![PathBuf::from("/tmp/x.log")])),
+            ..Default::default()
+        };
+        let source = get("postgres")
+            .log_source(&pm, &Dependency::simple("postgres"), 20, true)
+            .unwrap();
+        assert_eq!(source, LogSource::Files(vec![PathBuf::from("/tmp/x.log")]));
+        assert_eq!(
+            *pm.log_queries.borrow(),
+            [("postgresql".to_string(), 20, true)]
+        );
+    }
+
+    #[test]
+    fn extra_log_paths_default_is_empty() {
+        assert!(get("redis").extra_log_paths(Path::new("/d")).is_empty());
+    }
 
     // ── catalog ───────────────────────────────────────────────────────────────
 

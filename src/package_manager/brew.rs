@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use which::which;
 
-use super::PackageManager;
+use super::{LogSource, PackageManager};
 use crate::config::Dependency;
 use crate::output;
 
@@ -24,6 +24,34 @@ fn parse_brew_service_info_json(stdout: &[u8]) -> Result<bool> {
         );
     }
     Ok(arr[0]["running"].as_bool().unwrap_or(false))
+}
+
+/// Reads the log files of service `name` from `brew services info --json` output: its
+/// `log_path` (stdout) and then its `error_log_path` (stderr), once each.
+fn parse_brew_log_paths(name: &str, stdout: &[u8]) -> Result<LogSource> {
+    let json: serde_json::Value =
+        serde_json::from_slice(stdout).context("Failed to parse `brew services info` JSON")?;
+    let info = json
+        .as_array()
+        .and_then(|a| a.first())
+        .context("`brew services info` returned no service")?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for key in ["log_path", "error_log_path"] {
+        if let Some(path) = info[key]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            && !paths.contains(&path)
+        {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return Ok(LogSource::Unsupported(format!(
+            "brew did not report a log path for {name} — check $(brew --prefix)/var/log"
+        )));
+    }
+    Ok(LogSource::Files(paths))
 }
 
 /// Parses `brew list --versions` output and extracts the version (second whitespace token).
@@ -184,6 +212,18 @@ impl PackageManager for Homebrew {
         self.fetch_config_dir(service)
     }
 
+    fn log_source(&self, name: &str, _lines: u32, _follow: bool) -> Result<LogSource> {
+        let output = self.run(&["services", "info", "--json", name])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "`brew services info {name}` failed: {}",
+                stderr.trim().lines().last().unwrap_or("no output")
+            );
+        }
+        parse_brew_log_paths(name, &output.stdout)
+    }
+
     fn validate_config(&self, dep: &Dependency) -> Result<()> {
         if let Some(ref tap) = dep.tap {
             validate_tap(tap).with_context(|| format!("{}: invalid tap", dep.name))?;
@@ -223,6 +263,44 @@ pub(crate) fn validate_tap(tap: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brew_log_paths_with_both_keys() {
+        let json = br#"[{"name":"redis","log_path":"/opt/homebrew/var/log/redis.log","error_log_path":"/opt/homebrew/var/log/redis.err"}]"#;
+        assert_eq!(
+            parse_brew_log_paths("redis", json).unwrap(),
+            LogSource::Files(vec![
+                PathBuf::from("/opt/homebrew/var/log/redis.log"),
+                PathBuf::from("/opt/homebrew/var/log/redis.err"),
+            ])
+        );
+    }
+
+    #[test]
+    fn brew_log_paths_with_one_key_or_the_same_file_twice() {
+        let json = br#"[{"name":"redis","error_log_path":"/v/redis.log"}]"#;
+        assert_eq!(
+            parse_brew_log_paths("redis", json).unwrap(),
+            LogSource::Files(vec![PathBuf::from("/v/redis.log")])
+        );
+        let same = br#"[{"log_path":"/v/redis.log","error_log_path":"/v/redis.log"}]"#;
+        assert_eq!(
+            parse_brew_log_paths("redis", same).unwrap(),
+            LogSource::Files(vec![PathBuf::from("/v/redis.log")])
+        );
+    }
+
+    #[test]
+    fn brew_log_paths_with_no_keys_is_unsupported() {
+        let json = br#"[{"name":"redis","log_path":null}]"#;
+        assert_eq!(
+            parse_brew_log_paths("redis", json).unwrap(),
+            LogSource::Unsupported(
+                "brew did not report a log path for redis — check $(brew --prefix)/var/log".into()
+            )
+        );
+        assert!(parse_brew_log_paths("redis", b"[]").is_err());
+    }
 
     #[test]
     fn validate_tap_accepts_valid_org_repo() {

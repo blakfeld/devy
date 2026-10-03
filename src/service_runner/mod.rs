@@ -14,7 +14,7 @@ use crate::config::{ContainerCli, Dependency, DevyConfig};
 use crate::lock::LockFile;
 use crate::modules::{self, DockerSpec, ImageRef};
 use crate::output;
-use crate::package_manager::PackageManager;
+use crate::package_manager::{LogCommand, LogCommandKind, LogSource, PackageManager};
 use docker::{ContainerRuntime, RunSpec};
 
 /// Container label holding the project root.
@@ -41,6 +41,9 @@ pub trait ServiceRunner {
     /// Removes the service's container and, with `volumes`, its data volume. Returns
     /// whether there was anything this runner could remove (only containers can be).
     fn remove(&self, dep: &Dependency, volumes: bool) -> Result<bool>;
+    /// Where the service's logs can be read: the last `lines` lines and, with `follow`,
+    /// new output as it is written.
+    fn log_source(&self, dep: &Dependency, lines: u32, follow: bool) -> Result<LogSource>;
 
     /// Polls `is_running` until the service has stopped or the module's shutdown
     /// attempts are exhausted.
@@ -56,7 +59,8 @@ pub trait ServiceRunner {
             }
         }
         anyhow::bail!(
-            "{} did not stop after {max} attempts — try stopping it manually or check its logs",
+            "{} did not stop after {max} attempts — try stopping it manually or run devy logs {}",
+            dep.name,
             dep.name
         )
     }
@@ -106,6 +110,9 @@ impl ServiceRunner for PackageRunner<'_> {
     }
     fn remove(&self, _dep: &Dependency, _volumes: bool) -> Result<bool> {
         Ok(false)
+    }
+    fn log_source(&self, dep: &Dependency, lines: u32, follow: bool) -> Result<LogSource> {
+        modules::get(&dep.name).log_source(self.pm, dep, lines, follow)
     }
     fn wait_for_stopped(&self, dep: &Dependency) -> Result<()> {
         modules::get(&dep.name).wait_for_stopped(self.pm, dep)
@@ -328,6 +335,19 @@ impl ServiceRunner for DockerRunner<'_> {
             self.runtime.remove_volume(&name)?;
         }
         Ok(true)
+    }
+
+    fn log_source(&self, dep: &Dependency, lines: u32, follow: bool) -> Result<LogSource> {
+        let mut args: Vec<String> = vec!["logs".into(), "--tail".into(), lines.to_string()];
+        if follow {
+            args.push("-f".into());
+        }
+        args.push(self.container_name(dep));
+        Ok(LogSource::Command(LogCommand {
+            program: self.runtime.cli_name().into(),
+            args,
+            kind: LogCommandKind::Container,
+        }))
     }
 }
 
