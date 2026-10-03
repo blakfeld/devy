@@ -43,7 +43,11 @@ enum Commands {
         show_context: bool,
     },
     /// List services from devy.yml and their current running status
-    Services,
+    Services {
+        /// Print one JSON document instead of the listing
+        #[arg(long)]
+        json: bool,
+    },
     /// Start a named service
     Start {
         /// Service name as defined in devy.yml
@@ -92,9 +96,17 @@ enum Commands {
         volumes: bool,
     },
     /// Show install, service, and environment status
-    Status,
+    Status {
+        /// Print one JSON document instead of the tables
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate the environment matches devy.yml without making changes
-    Check,
+    Check {
+        /// Print one JSON document instead of the tables
+        #[arg(long)]
+        json: bool,
+    },
     /// Diagnose the environment and the last failed `devy up`, with Claude when available
     Doctor {
         /// Apply a suggested devy.yml fix without asking
@@ -119,6 +131,29 @@ enum Commands {
         /// Output format
         #[arg(long, default_value = "flake")]
         format: ExportFormat,
+    },
+    /// Run a program with the project environment from devy.yml, without a shell
+    Exec {
+        /// The program to run, followed by its arguments
+        #[arg(
+            value_name = "PROGRAM",
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true
+        )]
+        argv: Vec<String>,
+    },
+    /// Write a Claude Code skill (and an AGENTS.md block) teaching coding agents to use devy
+    AgentSetup {
+        /// Overwrite .claude/skills/devy/SKILL.md even if devy didn't write it
+        #[arg(long)]
+        force: bool,
+        /// Create AGENTS.md with the devy block when it doesn't exist
+        #[arg(long)]
+        agents_md: bool,
+        /// Print the skill to stdout without writing anything
+        #[arg(long, conflicts_with_all = ["force", "agents_md"])]
+        print: bool,
     },
     /// List commands from devy.yml — used by shell completion, not intended for direct use
     #[command(hide = true, name = "_commands")]
@@ -164,7 +199,7 @@ impl Cli {
                 if *bootstrap {
                     output::warn("--bootstrap has no effect with --dry-run; ignoring");
                 }
-                commands::check::run()
+                commands::check::run(false)
             }
             Commands::Up {
                 update,
@@ -185,7 +220,12 @@ impl Cli {
                 };
                 commands::init::run(mode, *force, std::path::Path::new("devy.yml"))
             }
-            Commands::Services => commands::service::list(),
+            Commands::Services { json } => {
+                if *json {
+                    commands::json::disable_color();
+                }
+                commands::service::list(*json)
+            }
             Commands::Start { name } => commands::service::start(name),
             Commands::Stop { name } => commands::service::stop(name),
             Commands::Restart { name } => commands::service::restart(name),
@@ -207,8 +247,18 @@ impl Cli {
                 show_context,
             } => commands::ask::run(question, *show_context),
             Commands::Down { volumes } => commands::down::run(*volumes),
-            Commands::Status => commands::status::run(),
-            Commands::Check => commands::check::run(),
+            Commands::Status { json } => {
+                if *json {
+                    commands::json::disable_color();
+                }
+                commands::status::run(*json)
+            }
+            Commands::Check { json } => {
+                if *json {
+                    commands::json::disable_color();
+                }
+                commands::check::run(*json)
+            }
             Commands::Doctor {
                 yes,
                 no_ai,
@@ -217,6 +267,18 @@ impl Cli {
             Commands::Pr => commands::pr::run(),
             Commands::Export { format } => commands::export::run(*format),
             Commands::Hook { shell } => commands::hook::run(shell),
+            Commands::Exec { argv } => commands::exec_env::run(argv),
+            Commands::AgentSetup {
+                force,
+                agents_md,
+                print,
+            } => commands::agent_setup::run(
+                commands::agent_setup::Options {
+                    force: *force,
+                    agents_md: *agents_md,
+                },
+                *print,
+            ),
             Commands::ListDefined => {
                 commands::list_commands::run();
                 Ok(())
@@ -271,6 +333,67 @@ mod tests {
             result.is_err(),
             "check must return Err when no devy.yml exists"
         );
+    }
+
+    fn exec_argv(args: &[&str]) -> Vec<String> {
+        match Cli::try_parse_from(args).unwrap().command {
+            Commands::Exec { argv } => argv,
+            _ => panic!("expected exec"),
+        }
+    }
+
+    #[test]
+    fn exec_keeps_program_flags_in_argv() {
+        assert_eq!(
+            exec_argv(&["devy", "exec", "cargo", "test", "--help"]),
+            ["cargo", "test", "--help"]
+        );
+        assert_eq!(
+            exec_argv(&["devy", "exec", "ls", "-la", "--", "x"]),
+            ["ls", "-la", "--", "x"]
+        );
+    }
+
+    #[test]
+    fn exec_strips_a_leading_double_dash() {
+        assert_eq!(
+            exec_argv(&["devy", "exec", "--", "printf", "%s\\n", "$HOME; rm -rf x"]),
+            ["printf", "%s\\n", "$HOME; rm -rf x"]
+        );
+        assert_eq!(
+            exec_argv(&["devy", "exec", "--", "--version"]),
+            ["--version"]
+        );
+    }
+
+    #[test]
+    fn exec_without_program_is_a_usage_error() {
+        let err = Cli::try_parse_from(["devy", "exec"])
+            .err()
+            .expect("usage error");
+        assert_eq!(err.exit_code(), 2);
+        let err = Cli::try_parse_from(["devy", "exec", "--"])
+            .err()
+            .expect("usage error");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn exec_and_agent_setup_are_builtins() {
+        let builtins = builtin_subcommands();
+        assert!(builtins.contains(&"exec".to_string()));
+        assert!(builtins.contains(&"agent-setup".to_string()));
+    }
+
+    #[test]
+    fn agent_setup_print_conflicts_with_write_flags() {
+        for flag in ["--force", "--agents-md"] {
+            let err = Cli::try_parse_from(["devy", "agent-setup", "--print", flag])
+                .err()
+                .expect("usage error");
+            assert_eq!(err.exit_code(), 2);
+        }
+        assert!(Cli::try_parse_from(["devy", "agent-setup", "--force", "--agents-md"]).is_ok());
     }
 
     #[test]

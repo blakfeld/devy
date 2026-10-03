@@ -287,6 +287,7 @@ Manage individual services without touching the rest of the environment. Use the
 
 ```sh
 devy services        # List all services and their current running status
+devy services --json # The same as JSON, with each service's port (see "JSON output")
 devy start redis     # Start a service (skips if already running)
 devy stop redis      # Stop a service (skips if already stopped)
 devy restart mysql   # Stop then start a service, waiting for it to be healthy
@@ -351,6 +352,7 @@ Shows what is installed, what services are running, and what environment variabl
 
 ```sh
 devy status
+devy status --json   # Machine-readable; see "JSON output"
 ```
 
 ### `devy check`
@@ -359,6 +361,77 @@ Validates that everything matches `devy.yml` and exits non-zero if any issues ar
 
 ```sh
 devy check
+devy check --json    # Machine-readable; see "JSON output"
+```
+
+### JSON output
+
+`devy status`, `devy services` and `devy check` accept `--json` for scripts and coding agents. Each prints exactly one JSON object to stdout, with no headers, tables or color. Warnings, such as the notice that devy is defaulting to nix, still go to stderr, except the ones `check --json` reports in its `warnings` field. Exit codes are the same as without `--json`. When the report can't be built, for example outside a devy project or with an invalid `devy.yml`, devy prints `error: …` to stderr, prints nothing to stdout and exits 1.
+
+Every document has an integer `version`, currently `1`. New fields may be added without changing it. Removing or renaming a field, or changing its type or meaning, increments it.
+
+**`devy services --json`** lists the services in `devy.yml` order. Ports are resolved the way `devy start` resolves them, and devy never writes `devy.lock`. Plain `devy services` resolves them the same way, so it also checks whether each service is running on its locked port, and it fails on the same port errors as `devy status`.
+
+```json
+{
+  "version": 1,
+  "services": [
+    {
+      "name": "redis",
+      "backend": "package",
+      "running": true,
+      "host": "127.0.0.1",
+      "port": 52113,
+      "port_source": "lock"
+    }
+  ]
+}
+```
+
+- `backend` is `"package"` or `"docker"`.
+- `port` is `null` when no port is resolved yet.
+- `port_source` is where the port came from: `"explicit"` (set in `devy.yml`), `"lock"` (assigned by `devy up`), `"default"` (the module's default port), `"unassigned"` (the backend applies ports, but `devy up` hasn't assigned one yet), or `null` for a service without a configurable port.
+
+**`devy status --json`** has these fields:
+
+- `project`: `name` from `devy.yml`, or `null`
+- `package_manager`: the detected package manager, such as `"nix"`
+- `dependencies`: one entry per dependency in `devy.yml` order, with `name`, `installed`, `version` (the version requested in `devy.yml`, or `null`) and `service`. Services also have `backend`, `running`, `host`, `port` and `port_source`, as in `devy services --json`.
+- `environment`: each variable from `devy.yml` `environment`, mapped to the value in the environment file, or `null` when it isn't there
+- `environment_written`: whether the environment file exists
+- `path`: the PATH entries `devy up` writes, in order, each with `entry` and `written`. The package manager's own entry, such as `.devy/nix-profile/bin`, comes first. These are the entries `devy exec` puts ahead of your PATH.
+- `commands`: the project commands sorted by name, each with `name`, `cmd` and `shell`
+
+```json
+{
+  "version": 1,
+  "project": "app",
+  "package_manager": "nix",
+  "dependencies": [
+    { "name": "node", "installed": true, "version": "22", "service": false },
+    {
+      "name": "redis", "installed": true, "version": null, "service": true,
+      "backend": "package", "running": true, "host": "127.0.0.1", "port": 52113, "port_source": "lock"
+    }
+  ],
+  "environment": { "LOG_LEVEL": "debug", "STRIPE_SECRET_KEY": "<redacted>" },
+  "environment_written": true,
+  "path": [{ "entry": "/home/me/app/.devy/nix-profile/bin", "written": true }],
+  "commands": [{ "name": "test", "cmd": "npm test", "shell": "sh" }]
+}
+```
+
+Environment values are redacted with the same rules as [AI requests](#ai-features): a variable whose name contains `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `PRIVATE` shows `<redacted>`, and URL passwords and well-known token prefixes are replaced in other values. Redaction is best-effort and only applies to `--json`; plain `devy status` shows the values as written, and `devy exec env` prints everything.
+
+**`devy check --json`** runs the same checks as `devy check` and prints `passed`, `issues` and `warnings`. The last two are arrays of the messages `devy check` would show. `passed` is `true` exactly when `issues` is empty, and devy exits 1 when it isn't, without the `✗ N issues found` summary. Warnings appear only in `warnings` and aren't repeated on stderr. Problems that make `devy check` stop with `error: …`, such as a port conflict, still do.
+
+```json
+{
+  "version": 1,
+  "passed": false,
+  "issues": ["jq: not installed"],
+  "warnings": []
+}
 ```
 
 ### `devy doctor`
@@ -398,6 +471,8 @@ devy init --show-context  # Print what would be sent to Claude, without sending 
 ```
 
 `--detect` and `--show-context` cannot be combined. `--force` applies to every mode. `init` only looks at the current directory, never its parents or subdirectories.
+
+After writing `devy.yml`, `init` also runs [`devy agent-setup`](#using-devy-with-coding-agents), so coding agents learn to use devy in the new project. It writes `.claude/skills/devy/SKILL.md` and updates the devy block in `AGENTS.md` if that file exists, but never creates `AGENTS.md`. If a hand-written skill is already there, `init` leaves it alone and warns instead of failing. When `init` writes no `devy.yml`, it writes no agent files either.
 
 #### Project scan (`devy init --detect`)
 
@@ -460,6 +535,33 @@ Runs a command defined under `commands:` in `devy.yml`.
 devy dev      # Runs the "dev" command
 devy migrate  # Runs the "migrate" command
 ```
+
+A project command named like a built-in subcommand, such as `status` or `exec`, is shadowed by the built-in and can't be run this way.
+
+### `devy exec`
+
+Runs a program with the project environment, without needing a shadowenv-activated shell. Use it in scripts, CI, editors and coding agents, whose shells usually don't run the shadowenv hook.
+
+```sh
+devy exec npm test                 # Run npm test with the project environment
+devy exec -- cargo test --release  # Everything after the program is passed to it
+devy exec env                      # Show the environment the program sees
+devy exec sh -c 'npm test | tee test.log'  # Use a shell explicitly for pipes and redirects
+```
+
+The environment is the one `devy up` writes to `.shadowenv.d/`:
+
+- variables set by modules, such as `REDIS_URL`
+- `<SERVICE>_HOST` and `<SERVICE>_PORT` for each service, with ports from `devy.lock`
+- `devy.yml` `environment`, which wins over module values
+
+PATH starts with the project's own entries, such as `.devy/nix-profile/bin` and a Python virtualenv, followed by your PATH. The program is looked up on that PATH, so the project's copy of a tool runs even if another is installed globally. A `PATH` set in `devy.yml` `environment` replaces all of this, as it does in the activated shell.
+
+devy computes the environment from `devy.yml` and `devy.lock` on every run. So `devy exec` sees an edit to `devy.yml` straight away, while an activated shell only picks it up after `devy up`. It works before the first `devy up` too, but a service that `devy up` hasn't assigned a port to yet gets `<SERVICE>_HOST` and no `<SERVICE>_PORT`. `devy exec` never installs anything, starts services, assigns ports or writes files.
+
+The program runs directly, not through a shell, so arguments are passed exactly as given: `devy exec printf '%s\n' '$HOME'` prints `$HOME`. Wrap the command in `sh -c '…'` when you need pipes, globbing or variable expansion. Flags after the program belong to the program, and a `--` before the program is optional.
+
+stdin, stdout and stderr are the program's own. devy writes nothing to stdout itself; its warnings, such as the notice that it is defaulting to nix when `package_manager` isn't set, go to stderr. devy exits with the program's exit code. If the program is killed by a signal, devy exits 1. If the program can't be started, for example because it isn't on PATH, devy prints `error: …` and exits 1.
 
 ### `devy hook <shell>`
 
@@ -600,6 +702,64 @@ Each module knows the correct package name for each package manager — you alwa
 **Ubuntu/Debian (apt):** Set `package_manager: apt` in `devy.yml`. Install operations use `sudo apt-get`. Version pinning with the `version:` field uses apt's exact-version syntax (`pkg=version`) — for most languages, omit the version field and rely on `devy.lock` to pin the installed version across machines.
 
 **Windows:** Service management uses `net start`/`sc`. Custom MySQL/PostgreSQL config options (`port`, `cli_args`) are not applied on Windows. Nix is not supported on Windows.
+
+## Using devy with coding agents
+
+Coding agents such as Claude Code work in your project through a shell that usually never runs the shadowenv hook. Left to themselves, they guess at ports, scrape the colored tables, and run `npm test` without the project's environment. devy gives them what they need from the CLI:
+
+- `devy status --json`, `devy services --json` and `devy check --json` describe the project as JSON (see [JSON output](#json-output))
+- [`devy exec`](#devy-exec) runs a tool with the project environment
+
+`devy agent-setup` installs guidance that teaches agents to use both:
+
+```sh
+devy agent-setup              # Write .claude/skills/devy/SKILL.md; update the devy block in AGENTS.md if it exists
+devy agent-setup --agents-md  # Also create AGENTS.md with the devy block if it doesn't exist
+devy agent-setup --force      # Overwrite a SKILL.md that devy didn't write
+devy agent-setup --print      # Print the skill without writing anything
+```
+
+`devy init` runs this for you in new projects. Run `devy agent-setup` in existing projects, and again after upgrading devy to pick up new guidance. It writes at the project root even when you run it from a subdirectory. `--print` works outside a devy project and can't be combined with `--force` or `--agents-md`.
+
+The skill tells agents to:
+
+- learn the project with `devy status --json` and `devy services --json` instead of guessing ports or environment variables
+- run tools as `devy exec -- <program> [args…]`, wrapping pipes in `sh -c '…'`
+- run project commands as `devy <command>`
+- start a stopped service with `devy start <name>`, and read failures with `devy logs <name>` and `devy check --json`
+- leave `devy.lock` and `.shadowenv.d/` alone, and ask you to run `devy up` when dependencies are missing
+
+The skill doesn't contain anything about your project, so it never goes stale as `devy.yml` changes. It is marked `<!-- generated by devy agent-setup; rerun to update -->`. devy overwrites a file with that marker, and refuses to touch one without it unless you pass `--force`. Claude Code loads the skill when it is relevant. Other agents, such as Codex, Cursor and Copilot, read `AGENTS.md`, where devy maintains a short summary between `<!-- devy:begin -->` and `<!-- devy:end -->`. Everything outside those markers is left as is. devy stops with an error, without changing the file, if the markers are unbalanced.
+
+**Permissions.** devy doesn't change your agent's settings. For Claude Code, a reasonable starting point in `.claude/settings.json` is to allow the read-only commands and ask before anything that installs, starts, runs something or contacts Claude:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(devy status:*)",
+      "Bash(devy services:*)",
+      "Bash(devy check:*)"
+    ],
+    "ask": [
+      "Bash(devy logs:*)",
+      "Bash(devy up:*)",
+      "Bash(devy start:*)",
+      "Bash(devy stop:*)",
+      "Bash(devy restart:*)",
+      "Bash(devy exec:*)"
+    ]
+  }
+}
+```
+
+`devy logs` is under `ask` because `devy logs --explain` sends the logs to Claude. To let the agent read logs without asking, allow it per service instead, for example `Bash(devy logs redis)`.
+
+Allow-listing `Bash(devy exec:*)` allows the agent to run any command at all, since `devy exec` runs whatever program it is given. Project commands (`devy <command>`) also run arbitrary shell from `devy.yml`. Allow them individually, for example `Bash(devy test:*)`, rather than with a wildcard.
+
+devy doesn't provide an MCP server. Agents use the CLI through their shell, under the same permission rules as any other command.
+
+**Reserved names.** `exec` and `agent-setup` are built-in subcommands. A project command with either name in `devy.yml` is shadowed and can no longer be run as `devy exec` or `devy agent-setup`. Rename it.
 
 ## AI features
 

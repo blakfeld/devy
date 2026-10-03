@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -55,6 +56,53 @@ pub(crate) fn check_with_runtime(
     } else {
         let noun = issue_noun(issues);
         eprintln!("  {}  {} {} found", "✗".red().bold(), issues, noun);
+        Err(SilentExit(1).into())
+    }
+}
+
+/// The `devy check --json` document.
+#[derive(Debug, Serialize)]
+pub(crate) struct CheckDocument {
+    pub passed: bool,
+    pub issues: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Runs the checks for `devy check --json`. A hard error (an unloadable config, a port
+/// conflict, a failed backend query) is returned as an error instead of a document.
+pub(crate) fn check_document(
+    config: &DevyConfig,
+    pm: &dyn PackageManager,
+    runtime: ContainerRuntime<'_>,
+    env_mgr: &dyn EnvManager,
+    project_root: &Path,
+) -> Result<CheckDocument> {
+    let mut findings = collect_findings(config, pm, runtime, env_mgr, project_root);
+    if let Some(e) = findings.hard_error.take() {
+        return Err(e);
+    }
+    let issues = findings.issues();
+    Ok(CheckDocument {
+        passed: issues.is_empty(),
+        issues,
+        warnings: findings.warnings(),
+    })
+}
+
+/// Prints the check document and exits 1, without the stderr summary, when it reports
+/// issues.
+pub(crate) fn check_json(
+    config: &DevyConfig,
+    pm: &dyn PackageManager,
+    runtime: ContainerRuntime<'_>,
+    env_mgr: &dyn EnvManager,
+    project_root: &Path,
+) -> Result<()> {
+    let doc = check_document(config, pm, runtime, env_mgr, project_root)?;
+    super::json::print(&doc)?;
+    if doc.passed {
+        Ok(())
+    } else {
         Err(SilentExit(1).into())
     }
 }
@@ -209,7 +257,8 @@ fn collect_into(
     // Resolve ports exactly as `up` would, without assigning new ones or writing the lock.
     let lock = ports::load_lock(project_root)?;
     let mut resolved_deps = deps.clone();
-    ports::resolve_and_check(&mut resolved_deps, lock.as_ref(), pm, PortMode::ReadOnly)?;
+    let resolved =
+        ports::resolve_and_check(&mut resolved_deps, lock.as_ref(), pm, PortMode::ReadOnly)?;
     let runners = Runners::new(pm, runtime, config, project_root, lock.as_ref(), false);
 
     if !deps.is_empty() {
@@ -235,7 +284,7 @@ fn collect_into(
             }
             findings.notes.extend(shell_issue(dep).map(Note::Issue));
         }
-        let (rows, err) = shared::dep_rows(&resolved_deps, &runners);
+        let (rows, err) = shared::dep_rows(&resolved_deps, &resolved, &runners);
         findings.deps = Some(rows);
         if let Some(e) = err {
             return Err(e);
@@ -336,11 +385,16 @@ fn issue_noun(count: usize) -> &'static str {
 }
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper
-pub fn run() -> Result<()> {
+pub fn run(json: bool) -> Result<()> {
     let (config, project_root) = DevyConfig::load_with_root()?;
     let pm = package_manager::detect(&config, &project_root)?;
     let env_mgr = Shadowenv;
-    check_impl(&config, pm.as_ref(), &env_mgr, &project_root)
+    if json {
+        let runtime = ContainerRuntime::system(config.container_cli);
+        check_json(&config, pm.as_ref(), runtime, &env_mgr, &project_root)
+    } else {
+        check_impl(&config, pm.as_ref(), &env_mgr, &project_root)
+    }
 }
 
 #[cfg(test)]
@@ -760,6 +814,100 @@ mod tests {
             &MockEnvManager::default(),
             &dir,
         )
+    }
+
+    // ── check --json ─────────────────────────────────────────────────────────
+
+    fn json_doc(config: &DevyConfig, pm: &MockPackageManager) -> Result<CheckDocument> {
+        let dir = crate::test_support::tmp_dir();
+        check_document(
+            config,
+            pm,
+            ContainerRuntime::system(config.container_cli),
+            &MockEnvManager::default(),
+            &dir,
+        )
+    }
+
+    fn rendered(doc: &CheckDocument) -> serde_json::Value {
+        serde_json::from_str(&crate::commands::json::render(doc).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn check_json_passes() {
+        let config = make_config(&["node"], HashMap::new());
+        let pm = MockPackageManager {
+            installed: true,
+            ..Default::default()
+        };
+        let doc = json_doc(&config, &pm).unwrap();
+        assert_eq!(
+            rendered(&doc),
+            serde_json::json!({"version": 1, "passed": true, "issues": [], "warnings": []})
+        );
+    }
+
+    #[test]
+    fn check_json_lists_two_issues_and_exits_one() {
+        let config = make_config(&["jq", "node"], HashMap::new());
+        let pm = MockPackageManager::default();
+        let doc = json_doc(&config, &pm).unwrap();
+        assert!(!doc.passed);
+        assert_eq!(doc.issues, ["jq: not installed", "node: not installed"]);
+        let dir = crate::test_support::tmp_dir();
+        let err = check_json(
+            &config,
+            &pm,
+            ContainerRuntime::system(config.container_cli),
+            &MockEnvManager::default(),
+            &dir,
+        )
+        .unwrap_err();
+        assert_eq!(err.downcast_ref::<SilentExit>().map(|e| e.0), Some(1));
+    }
+
+    #[test]
+    fn check_json_warning_does_not_fail() {
+        let config: DevyConfig =
+            serde_yml::from_str("dependencies:\n  - jq:\n      version: \"1.6\"\n").unwrap();
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            ..Default::default()
+        };
+        let doc = json_doc(&config, &pm).unwrap();
+        assert!(doc.passed);
+        assert!(doc.issues.is_empty());
+        assert_eq!(
+            doc.warnings,
+            [
+                "jq: version 1.6 is not supported by the nix backend — installing the nixpkgs default"
+            ]
+        );
+        let dir = crate::test_support::tmp_dir();
+        assert!(
+            check_json(
+                &config,
+                &pm,
+                ContainerRuntime::system(config.container_cli),
+                &MockEnvManager::default(),
+                &dir,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn check_json_port_conflict_is_a_hard_error() {
+        let config = make_config(&["mysql", "mariadb"], HashMap::new());
+        let pm = MockPackageManager {
+            installed: true,
+            service_running: true,
+            ..Default::default()
+        };
+        let err = json_doc(&config, &pm).unwrap_err();
+        assert!(err.downcast_ref::<SilentExit>().is_none());
+        assert!(format!("{err:#}").contains("port conflict"), "{err:#}");
     }
 
     #[test]

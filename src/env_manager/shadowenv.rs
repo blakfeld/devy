@@ -14,7 +14,7 @@ const ENV_FILENAME: &str = "500_devy.lisp";
 pub struct Shadowenv;
 
 impl Shadowenv {
-    fn write_env_file(
+    pub(crate) fn write_env_file(
         &self,
         dir: &Path,
         vars: &HashMap<String, String>,

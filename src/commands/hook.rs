@@ -60,6 +60,8 @@ _{bin}() {
     'hook:Print shell integration snippet'
     'pr:Open a GitHub pull request for the current branch'
     'export:Export the environment as a Nix shell.nix or flake.nix'
+    'exec:Run a program with the project environment'
+    'agent-setup:Write the coding agent skill'
   )
   local user_cmd
   while IFS= read -r user_cmd; do
@@ -114,6 +116,23 @@ _{bin}() {
     export)
       _arguments '--format[Output format]:format:(shell flake)'
       ;;
+    status|services|check)
+      _arguments '--json[Print one JSON document]'
+      ;;
+    exec)
+      # The program and its arguments, after an optional `--`.
+      local skip=2
+      (( CURRENT > 3 )) && [[ ${words[3]} == -- ]] && skip=3
+      shift $skip words
+      (( CURRENT -= skip ))
+      _normal
+      ;;
+    agent-setup)
+      _arguments \
+        '--force[Overwrite a skill {bin} did not write]' \
+        '--agents-md[Create AGENTS.md if missing]' \
+        '--print[Print the skill without writing]'
+      ;;
   esac
 }
 
@@ -133,7 +152,7 @@ const BASH_SNIPPET_TEMPLATE: &str = r#"
 
 _{bin}_completions() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
-  local subcmds="up down services start stop restart status check doctor logs ask init hook pr export"
+  local subcmds="up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup"
   local user_cmds
   user_cmds=$(command {bin} _commands 2>/dev/null)
   [ -n "$user_cmds" ] && subcmds="$subcmds $user_cmds"
@@ -175,6 +194,20 @@ _{bin}_completions() {
         COMPREPLY=($(compgen -W "--format" -- "$cur"))
       fi
       ;;
+    status|services|check)
+      COMPREPLY=($(compgen -W "--json" -- "$cur"))
+      ;;
+    exec)
+      # The program name, then its arguments as files.
+      if [ "$COMP_CWORD" -eq 2 ] || { [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[2]}" = "--" ]; }; then
+        COMPREPLY=($(compgen -c -- "$cur"))
+      else
+        COMPREPLY=($(compgen -f -- "$cur"))
+      fi
+      ;;
+    agent-setup)
+      COMPREPLY=($(compgen -W "--force --agents-md --print" -- "$cur"))
+      ;;
   esac
 }
 
@@ -196,8 +229,18 @@ function __{bin}_user_commands
   command {bin} _commands 2>/dev/null
 end
 
+function __{bin}_complete_exec
+  # The program and its arguments, after an optional `--`.
+  set -l tokens (commandline -opc)
+  if test (count $tokens) -ge 3; and test "$tokens[3]" = "--"
+    __fish_complete_subcommand --fcs-skip=3
+  else
+    __fish_complete_subcommand --fcs-skip=2
+  end
+end
+
 function __{bin}_no_subcommand
-  not __fish_seen_subcommand_from up down services start stop restart status check doctor logs ask init hook pr export
+  not __fish_seen_subcommand_from up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup
 end
 
 complete -c {bin} -f
@@ -216,6 +259,8 @@ complete -c {bin} -n __{bin}_no_subcommand -a init     -d "Scaffold a {bin}.yml"
 complete -c {bin} -n __{bin}_no_subcommand -a hook     -d "Print shell integration snippet"
 complete -c {bin} -n __{bin}_no_subcommand -a pr       -d "Open a GitHub pull request"
 complete -c {bin} -n __{bin}_no_subcommand -a export   -d "Export a Nix shell.nix or flake.nix"
+complete -c {bin} -n __{bin}_no_subcommand -a exec     -d "Run a program with the project environment"
+complete -c {bin} -n __{bin}_no_subcommand -a agent-setup -d "Write the coding agent skill"
 complete -c {bin} -n __{bin}_no_subcommand -a "(__{bin}_user_commands)" -d "User-defined command"
 complete -c {bin} -n "__fish_seen_subcommand_from hook" -a "zsh bash fish"
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l update  -d "Re-resolve all versions"
@@ -233,6 +278,11 @@ complete -c {bin} -n "__fish_seen_subcommand_from logs" -l show-context -d "Prin
 complete -c {bin} -n "__fish_seen_subcommand_from ask" -l show-context -d "Print the AI request without sending it"
 complete -c {bin} -n "__fish_seen_subcommand_from export" -l format -x -a "shell flake" -d "Output format"
 complete -c {bin} -n "__fish_seen_subcommand_from init" -l force -d "Overwrite existing {bin}.yml"
+complete -c {bin} -n "__fish_seen_subcommand_from status services check" -l json -d "Print one JSON document"
+complete -c {bin} -n "__fish_seen_subcommand_from exec" -a "(__{bin}_complete_exec)"
+complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l force -d "Overwrite a skill {bin} did not write"
+complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l agents-md -d "Create AGENTS.md if missing"
+complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l print -d "Print the skill without writing"
 "#;
 
 #[cfg(test)]
@@ -247,6 +297,16 @@ mod tests {
     }
     fn fish_snippet() -> String {
         make_snippet(FISH_SNIPPET_TEMPLATE)
+    }
+
+    /// The subcommands `devy --help` lists: every built-in except the hidden helpers.
+    fn visible_subcommands() -> Vec<String> {
+        let names: Vec<String> = crate::cli::builtin_subcommands()
+            .into_iter()
+            .filter(|c| !c.starts_with('_') && c != "help")
+            .collect();
+        assert!(names.contains(&"agent-setup".to_string()), "{names:?}");
+        names
     }
 
     #[test]
@@ -316,33 +376,40 @@ mod tests {
     #[test]
     fn all_builtin_subcommands_appear_in_zsh_snippet() {
         let s = zsh_snippet();
-        for cmd in &[
-            "up", "down", "services", "start", "stop", "restart", "status", "check", "doctor",
-            "logs", "ask", "init", "hook", "pr", "export",
-        ] {
-            assert!(s.contains(cmd), "zsh snippet missing '{}'", cmd);
+        for cmd in visible_subcommands() {
+            assert!(
+                s.contains(&format!("    '{cmd}:")),
+                "zsh snippet missing '{cmd}'"
+            );
         }
     }
 
     #[test]
     fn all_builtin_subcommands_appear_in_bash_snippet() {
         let s = bash_snippet();
-        for cmd in &[
-            "up", "down", "services", "start", "stop", "restart", "status", "check", "doctor",
-            "logs", "ask", "init", "hook", "pr", "export",
-        ] {
-            assert!(s.contains(cmd), "bash snippet missing '{}'", cmd);
+        let subcmds: Vec<&str> = s
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("local subcmds=\""))
+            .and_then(|l| l.strip_suffix('"'))
+            .expect("subcmds list")
+            .split(' ')
+            .collect();
+        for cmd in visible_subcommands() {
+            assert!(
+                subcmds.contains(&cmd.as_str()),
+                "bash snippet missing '{cmd}'"
+            );
         }
     }
 
     #[test]
     fn all_builtin_subcommands_appear_in_fish_snippet() {
         let s = fish_snippet();
-        for cmd in &[
-            "up", "down", "services", "start", "stop", "restart", "status", "check", "doctor",
-            "logs", "ask", "init", "hook", "pr", "export",
-        ] {
-            assert!(s.contains(cmd), "fish snippet missing '{}'", cmd);
+        for cmd in visible_subcommands() {
+            assert!(
+                s.contains(&format!("-a {cmd} ")),
+                "fish snippet missing '{cmd}'"
+            );
         }
     }
 
@@ -449,6 +516,41 @@ mod tests {
                 )),
                 "fish missing --{flag}"
             );
+        }
+    }
+
+    #[test]
+    fn snippets_complete_json_exec_and_agent_setup() {
+        let zsh = zsh_snippet();
+        for needle in [
+            "    status|services|check)\n      _arguments '--json[",
+            "    exec)\n      # The program and its arguments, after an optional `--`.\n      local skip=2\n      (( CURRENT > 3 )) && [[ ${words[3]} == -- ]] && skip=3\n",
+            "      _normal\n",
+            "    agent-setup)\n      _arguments \\\n        '--force[",
+            "'--agents-md[",
+            "'--print[",
+        ] {
+            assert!(zsh.contains(needle), "zsh missing {needle:?}");
+        }
+        let bash = bash_snippet();
+        for needle in [
+            "    status|services|check)\n      COMPREPLY=($(compgen -W \"--json\"",
+            "COMPREPLY=($(compgen -c -- \"$cur\"))",
+            "    agent-setup)\n      COMPREPLY=($(compgen -W \"--force --agents-md --print\"",
+        ] {
+            assert!(bash.contains(needle), "bash missing {needle:?}");
+        }
+        let fish = fish_snippet();
+        for needle in [
+            "-n \"__fish_seen_subcommand_from status services check\" -l json ",
+            "-n \"__fish_seen_subcommand_from exec\" -a \"(__devy_complete_exec)\"",
+            "__fish_complete_subcommand --fcs-skip=3",
+            "-n \"__fish_seen_subcommand_from agent-setup\" -l force ",
+            "-n \"__fish_seen_subcommand_from agent-setup\" -l agents-md ",
+            "-n \"__fish_seen_subcommand_from agent-setup\" -l print ",
+            "hook pr export exec agent-setup\nend",
+        ] {
+            assert!(fish.contains(needle), "fish missing {needle:?}");
         }
     }
 }
