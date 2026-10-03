@@ -37,4 +37,5 @@ Prerequisites: `add-ai-init` (`ai-assist`) and `add-service-logs` are implemente
 
 ## 7. Integration check
 
-- [ ] 7.1 End to end on macOS and Linux CI: break a project (a port conflict via `devy.lock`), run `devy up` (record and hint), then `devy doctor --no-ai` (findings shown, exit 0), then fix and run `devy up` (record removed). Verify that `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` all pass.
+- [x] 7.1 End to end on macOS and Linux CI: break a project (a port conflict via `devy.lock`), run `devy up` (record and hint), then `devy doctor --no-ai` (findings shown, exit 0), then fix and run `devy up` (record removed). Verify that `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` all pass.
+  - Passed on the PR #17 merge (aa39351): `.github/scripts/doctor-e2e.sh` printed `doctor e2e passed` on Nix Linux and Nix macOS (Integration run 37079917949), and the CI run 37079917948 passed Test (Linux x86_64/arm64, macOS, Windows), Clippy and Format.
