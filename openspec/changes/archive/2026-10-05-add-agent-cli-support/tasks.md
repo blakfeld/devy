@@ -45,4 +45,4 @@
 ## 6. Integration checks
 
 - [x] 6.1 Add a `tests/cli.rs` test that runs `status --json`, `services --json` and `check --json` against a temp project. Assert that each stdout parses as one JSON object with `version: 1` and no ANSI escapes, that the field sets match the spec, and that exit codes match the non-JSON commands. Run `devy agent-setup` in that project and assert the files exist.
-- [ ] 6.2 Run `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`, and verify all pass. Manually run `devy agent-setup` in a sample project, start Claude Code there, and confirm the devy skill loads and the agent uses `devy services --json` and `devy exec` when asked to run the tests.
+- [x] 6.2 Run `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`, and verify all pass. Manually run `devy agent-setup` in a sample project, start Claude Code there, and confirm the devy skill loads and the agent uses `devy services --json` and `devy exec` when asked to run the tests.
