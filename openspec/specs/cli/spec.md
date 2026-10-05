@@ -6,12 +6,12 @@ Defines the `devy` command-line surface: the built-in subcommands, how user-defi
 ## Requirements
 
 ### Requirement: Built-in subcommands
-The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`, `stop`, `restart`, `down`, `status`, `check`, `doctor`, `hook`, `pr`, `export`, `logs` and `ask`, plus the hidden `_commands` and `_services` subcommands used by shell completion, and `--help` SHALL list the visible ones.
+The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`, `stop`, `restart`, `down`, `status`, `check`, `doctor`, `hook`, `pr`, `export`, `logs`, `ask`, `exec` and `agent-setup`, plus the hidden `_commands` and `_services` subcommands used by shell completion, and `--help` SHALL list the visible ones.
 
 #### Scenario: Help lists core subcommands
 - **WHEN** the user runs `devy --help`
 - **THEN** the process exits 0
-- **AND** the output lists `up`, `down`, `check`, `doctor`, `init`, `hook`, `status`, `logs` and `ask`
+- **AND** the output lists `up`, `down`, `check`, `doctor`, `init`, `hook`, `status`, `logs`, `ask`, `exec` and `agent-setup`
 - **AND** the output does not list `allow`
 
 #### Scenario: Hidden subcommand is not advertised
@@ -34,6 +34,10 @@ The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`
 #### Scenario: Built-in logs shadows project command
 - **WHEN** `devy.yml` defines a project command named `logs` and the user runs `devy logs`
 - **THEN** the built-in `logs` subcommand runs
+
+#### Scenario: Built-in exec shadows project command
+- **WHEN** `devy.yml` defines a project command named `exec` and the user runs `devy exec env`
+- **THEN** the built-in `exec` subcommand runs `env` with the project environment
 
 ### Requirement: Unknown subcommands dispatch to project commands
 The CLI SHALL treat any subcommand that is not built in as the name of a project command from `devy.yml`, passing any remaining arguments through to it, and built-in names SHALL take precedence over project commands of the same name.
@@ -93,9 +97,13 @@ On failure the CLI SHALL print `error: <message chain>` to stderr, with context 
 - **THEN** the process exits 2
 
 ### Requirement: Child process failures map to exit 1
-When a project command, hook or `after_install` command exits non-zero, devy SHALL fail with an error describing the command and its exit status and SHALL exit 1, rather than passing through the child's exit code.
+When a project command, hook or `after_install` command exits non-zero, devy SHALL fail with an error describing the command and its exit status and SHALL exit 1, rather than passing through the child's exit code. `devy exec` is the exception: it SHALL pass the program's exit code through without an `error:` line, as defined by the environment-exec capability.
 
 #### Scenario: Project command exits with 3
 - **WHEN** a project command exits with status 3
 - **THEN** devy reports the failure, including the exit status
 - **AND** devy itself exits 1
+
+#### Scenario: Exec passes the exit code through
+- **WHEN** `devy exec sh -c 'exit 3'` runs
+- **THEN** devy exits 3 without printing `error:`

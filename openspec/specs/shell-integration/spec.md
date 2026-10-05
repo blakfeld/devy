@@ -36,7 +36,7 @@ Each snippet SHALL define a `devy` shell function that wraps the real binary. Af
 
 ### Requirement: Tab completion
 Each snippet SHALL register completion for:
-- the built-in subcommands `up`, `down`, `services`, `start`, `stop`, `restart`, `status`, `check`, `doctor`, `logs`, `ask`, `init`, `hook`, `pr`, and `export`
+- the built-in subcommands `up`, `down`, `services`, `start`, `stop`, `restart`, `status`, `check`, `doctor`, `logs`, `ask`, `init`, `hook`, `pr`, `export`, `exec` and `agent-setup`
 - project command names taken from `devy _commands`, with errors suppressed
 
 It MUST complete:
@@ -48,10 +48,13 @@ It MUST complete:
 - `zsh bash fish` after `hook`
 - `--follow`, `--lines`, `--explain`, and `--show-context` after `logs`, and service names taken from `devy _services`, with errors suppressed
 - `--show-context` after `ask`
+- `--json` after `status`, `services` and `check`
+- `--force`, `--agents-md` and `--print` after `agent-setup`
+- command names from the shell's own command completion after `exec`
 
 #### Scenario: Project commands appear in completion
 - **WHEN** `devy.yml` defines a command `dev` and the user tab-completes `devy <TAB>`
-- **THEN** the candidates include the built-ins, including `doctor`, `pr`, `export`, `logs` and `ask`, and `dev`
+- **THEN** the candidates include the built-ins, including `doctor`, `pr`, `export`, `logs`, `ask`, `exec` and `agent-setup`, and `dev`
 
 #### Scenario: Hook argument completion
 - **WHEN** the user tab-completes `devy hook <TAB>`
@@ -80,6 +83,14 @@ It MUST complete:
 #### Scenario: Logs service names
 - **WHEN** `devy.yml` declares `redis` and `node`, and the user tab-completes `devy logs <TAB>`
 - **THEN** the candidates include `redis` and not `node`
+
+#### Scenario: JSON flag
+- **WHEN** the user tab-completes `devy status --<TAB>`
+- **THEN** the candidates include `--json`
+
+#### Scenario: Agent setup flags
+- **WHEN** the user tab-completes `devy agent-setup --<TAB>`
+- **THEN** the candidates are `--force`, `--agents-md` and `--print`
 
 #### Scenario: Allow flags
 - **WHEN** the user tab-completes `devy <TAB>` or `devy allow --<TAB>`
