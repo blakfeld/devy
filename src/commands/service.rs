@@ -98,10 +98,11 @@ pub(crate) fn list_impl(
     output::header("Services");
 
     for service in &services {
+        let label = output::clean_line(&service.label);
         if service.state.running {
-            println!("  {}  {}", "●".green().bold(), service.label);
+            println!("  {}  {}", "●".green().bold(), label);
         } else {
-            println!("  {}  {}", "○".dimmed(), service.label.dimmed());
+            println!("  {}  {}", "○".dimmed(), label.as_ref().dimmed());
         }
     }
 
@@ -109,9 +110,17 @@ pub(crate) fn list_impl(
     Ok(())
 }
 
+/// Whether a service command requires the project to be trusted. `start` and `restart`
+/// run project-configured services; `stop` only stops what devy started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Trusted,
+    None,
+}
+
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn start(name: &str) -> Result<()> {
-    with_service(name, true, start_impl)
+    with_service(name, true, Gate::Trusted, start_impl)
 }
 
 pub(crate) fn start_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<()> {
@@ -139,7 +148,7 @@ fn health_timeout_warning(name: &str, err: &anyhow::Error) -> String {
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn stop(name: &str) -> Result<()> {
-    with_service(name, false, stop_impl)
+    with_service(name, false, Gate::None, stop_impl)
 }
 
 pub(crate) fn stop_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<()> {
@@ -157,7 +166,7 @@ pub(crate) fn stop_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn restart(name: &str) -> Result<()> {
-    with_service(name, true, restart_impl)
+    with_service(name, true, Gate::Trusted, restart_impl)
 }
 
 pub(crate) fn restart_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<()> {
@@ -235,9 +244,17 @@ pub(crate) fn resolve_service(
 fn with_service(
     name: &str,
     require_port: bool,
+    gate: Gate,
     f: impl FnOnce(&Dependency, &dyn ServiceRunner) -> Result<()>,
 ) -> Result<()> {
-    let (config, project_root) = DevyConfig::load_with_root()?;
+    let (config, project_root) = if gate == Gate::Trusted {
+        crate::trust::load_gated()?
+    } else {
+        DevyConfig::load_with_root()?
+    };
+    if gate == Gate::Trusted {
+        crate::trust::require(&config, &project_root, crate::trust::Gate::Other)?;
+    }
     let pm = package_manager::detect(&config, &project_root)?;
     let dep = resolve_service(&config, name, pm.as_ref(), &project_root, require_port)?;
     let lock = ports::load_lock(&project_root)?;
@@ -259,6 +276,7 @@ mod tests {
     use crate::config::DevyConfig;
     use crate::package_manager::MockPackageManager;
     use crate::service_runner::{PackageRunner, package_runners};
+    use serde_norway as yaml;
     use std::collections::HashMap;
 
     fn make_config(dep_names: &[&str]) -> DevyConfig {
@@ -603,10 +621,8 @@ mod tests {
     use std::rc::Rc;
 
     fn docker_config() -> DevyConfig {
-        serde_yml::from_str(
-            "name: app\nservice_manager: docker\ndependencies:\n  - redis\n  - jq\n",
-        )
-        .unwrap()
+        yaml::from_str("name: app\nservice_manager: docker\ndependencies:\n  - redis\n  - jq\n")
+            .unwrap()
     }
 
     #[test]
@@ -775,7 +791,7 @@ mod tests {
 
     #[test]
     fn services_json_reports_docker_service() {
-        let config: DevyConfig = serde_yml::from_str(
+        let config: DevyConfig = yaml::from_str(
             "dependencies:\n  - postgres:\n      service_manager: docker\n  - redis\n",
         )
         .unwrap();
@@ -843,7 +859,7 @@ mod tests {
     #[test]
     fn services_rejects_an_out_of_range_port_like_status() {
         let config: DevyConfig =
-            serde_yml::from_str("dependencies:\n  - redis:\n      port: 70000\n").unwrap();
+            yaml::from_str("dependencies:\n  - redis:\n      port: 70000\n").unwrap();
         let pm = MockPackageManager::default();
         let err = list_impl(
             &config,

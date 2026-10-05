@@ -67,7 +67,7 @@ impl Module for VaultModule {
             )));
         }
         let conf = data_dir.join("vault.hcl");
-        std::fs::write(&conf, vault_hcl(p, data_dir))
+        crate::fs_safe::write_atomic(&conf, vault_hcl(p, data_dir).as_bytes(), 0o644)
             .with_context(|| format!("Failed to write {}", conf.display()))?;
         Ok(Some(super::LaunchSpec::new(
             "vault",

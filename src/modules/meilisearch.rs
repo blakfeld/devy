@@ -33,17 +33,24 @@ impl Module for MeilisearchModule {
         data_dir: &std::path::Path,
     ) -> Result<Option<super::LaunchSpec>> {
         let p = port(dep)?;
-        let mut args = vec![
+        let args = vec![
             "--http-addr".to_string(),
             format!("127.0.0.1:{p}"),
             "--db-path".to_string(),
             super::path_arg(data_dir),
         ];
-        if let Some(key) = dep.extra.get("master_key").and_then(|v| v.as_str()) {
-            args.push("--master-key".into());
-            args.push(key.to_string());
-        }
-        Ok(Some(super::LaunchSpec::new("meilisearch", args)))
+        // The key goes in the environment: argv is readable by every local user (`ps`).
+        let env = dep
+            .extra
+            .get("master_key")
+            .and_then(|v| v.as_str())
+            .map(|key| ("MEILI_MASTER_KEY".to_string(), key.to_string()))
+            .into_iter()
+            .collect();
+        Ok(Some(super::LaunchSpec {
+            env,
+            ..super::LaunchSpec::new("meilisearch", args)
+        }))
     }
 
     fn nix_attr(&self, _dep: &crate::config::Dependency) -> Option<String> {
@@ -54,7 +61,7 @@ impl Module for MeilisearchModule {
         let mut spec =
             super::DockerSpec::new("getmeili/meilisearch", "v1.8", 7700).data("/meili_data");
         if let Some(key) = dep.extra.get("master_key").and_then(|v| v.as_str()) {
-            spec = spec.env(&[("MEILI_MASTER_KEY", key)]);
+            spec = spec.secret_env(&[("MEILI_MASTER_KEY", key)]);
         }
         Ok(Some(spec))
     }
@@ -64,6 +71,12 @@ impl Module for MeilisearchModule {
     }
     fn known_extra_keys(&self) -> Option<&'static [&'static str]> {
         Some(&["port", "master_key"])
+    }
+
+    fn config_issues(&self, dep: &Dependency) -> Vec<String> {
+        super::helpers::control_char_issue(dep, "master_key")
+            .into_iter()
+            .collect()
     }
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
@@ -139,6 +152,19 @@ impl Module for MeilisearchModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn master_key_with_control_character_is_an_issue() {
+        let mut dep = Dependency::simple("meilisearch");
+        assert!(MeilisearchModule.config_issues(&dep).is_empty());
+        dep.extra.insert(
+            "master_key".into(),
+            crate::config::ExtraValue::String("k\rExecStartPre=/bin/sh".into()),
+        );
+        let issues = MeilisearchModule.config_issues(&dep);
+        assert_eq!(issues.len(), 1);
+        assert!(!issues[0].contains("ExecStartPre"));
+    }
     use std::collections::HashMap;
 
     fn dep_with_port(port: u64) -> Dependency {

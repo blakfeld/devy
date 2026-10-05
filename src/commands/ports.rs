@@ -103,6 +103,20 @@ fn resolve_one(
             .and_then(|l| l.get(canonical))
             .and_then(|d| d.assigned_port)
         {
+            // devy only assigns unprivileged ports and records an explicit port (handled
+            // above) verbatim, so a privileged locked port here came from an edited lock.
+            if p < 1024 {
+                return Err(crate::validate::invalid(
+                    canonical,
+                    "assigned_port",
+                    &p.to_string(),
+                ))
+                .context("Failed to parse devy.lock")
+                .context(format!(
+                    "ports below 1024 are only allowed when set with `port:` in devy.yml; \
+                     remove the {canonical} entry from devy.lock and run `devy up` to assign a new port"
+                ));
+            }
             return Ok(ResolvedPort::Locked(p));
         }
         return match mode {
@@ -193,6 +207,20 @@ mod tests {
     use crate::package_manager::MockPackageManager;
     use std::collections::BTreeMap;
 
+    #[cfg(unix)]
+    #[test]
+    fn load_lock_refuses_a_symlink_without_echoing_its_target() {
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        std::fs::write(outside.join("creds"), "https://user:SENTINEL@example.com\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("creds"), dir.join(crate::lock::PATH)).unwrap();
+        let err = format!("{:#}", load_lock(&dir).unwrap_err());
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(!err.contains("SENTINEL"), "{err}");
+        std::fs::remove_file(dir.join(crate::lock::PATH)).unwrap();
+        assert!(load_lock(&dir).unwrap().is_none());
+    }
+
     fn dep_with_port(name: &str, port: u64) -> Dependency {
         let mut extra = HashMap::new();
         extra.insert("port".into(), ExtraValue::Number(port.into()));
@@ -230,6 +258,47 @@ mod tests {
     }
 
     // ── resolve_ports ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn privileged_locked_port_is_rejected_when_used() {
+        let lock = lock_with(&[("redis", 22)]);
+        let mut deps = vec![Dependency::simple("redis")];
+        for mode in [PortMode::Assign, PortMode::ReadOnly] {
+            let err = resolve_ports(&mut deps, Some(&lock), &pm("nix"), mode).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.ends_with("Failed to parse devy.lock: redis: invalid assigned_port \"22\""),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("remove the redis entry from devy.lock"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn privileged_locked_port_is_rejected_through_alias() {
+        let lock = lock_with(&[("postgresql", 543)]);
+        let mut deps = vec![Dependency::simple("postgres")];
+        assert!(resolve_ports(&mut deps, Some(&lock), &pm("nix"), PortMode::ReadOnly).is_err());
+    }
+
+    #[test]
+    fn privileged_locked_port_is_ignored_when_explicit_port_set() {
+        // A previous explicit `port: 543` was recorded in the lock, then changed to 5433.
+        let lock = lock_with(&[("postgresql", 543)]);
+        let mut deps = vec![dep_with_port("postgresql", 5433)];
+        let r = resolve_ports(&mut deps, Some(&lock), &pm("nix"), PortMode::Assign).unwrap();
+        assert_eq!(r[0], Some(ResolvedPort::Explicit(5433)));
+    }
+
+    #[test]
+    fn privileged_orphan_lock_entry_is_ignored() {
+        let lock = lock_with(&[("redis", 22)]);
+        let mut deps = vec![Dependency::simple("mysql")];
+        resolve_ports(&mut deps, Some(&lock), &pm("nix"), PortMode::Assign).unwrap();
+    }
 
     #[test]
     fn resolve_service_ports_injects_random_port_when_no_lock() {

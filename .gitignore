@@ -11,3 +11,5 @@ plan.md
 .devy_gcloud_components_stamp
 .devy-lock
 
+node_modules/
+repomix-output.xml

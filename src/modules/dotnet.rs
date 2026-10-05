@@ -20,19 +20,22 @@ fn major_version(dep: &Dependency) -> u32 {
         .unwrap_or(8)
 }
 
-/// Finds the first `.sln` (preferred) or `.csproj` in the project root.
+/// The alphabetically first `.sln` (preferred) or `.csproj` in the project root, so
+/// the choice does not depend on directory-listing order.
 fn find_dotnet_manifest(project_root: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(project_root).ok()?;
-    let mut csproj: Option<PathBuf> = None;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("sln") => return Some(path),
-            Some("csproj") if csproj.is_none() => csproj = Some(path),
-            _ => {}
-        }
-    }
-    csproj
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(project_root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    let with_ext = |ext: &str| {
+        paths
+            .iter()
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some(ext))
+            .cloned()
+    };
+    with_ext("sln").or_else(|| with_ext("csproj"))
 }
 
 /// The SDK nixpkgs installs when no supported version is given.
@@ -81,6 +84,13 @@ impl Module for DotnetModule {
         pm.install_package(&pm_dep(dep, &name))
     }
 
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        find_dotnet_manifest(project_root)
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .map(|name| vec![format!("dotnet restore ({name} MSBuild targets)")])
+            .unwrap_or_default()
+    }
+
     fn post_setup(
         &self,
         _dep: &Dependency,
@@ -104,7 +114,7 @@ impl Module for DotnetModule {
         if !status.success() {
             anyhow::bail!("`dotnet restore` failed — check the output above for details");
         }
-        write_stamp(&stamp_path, &manifest);
+        write_stamp(&stamp_path, &manifest)?;
         output::success(".NET dependencies restored");
         Ok(())
     }

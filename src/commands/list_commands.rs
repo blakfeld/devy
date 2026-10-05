@@ -1,4 +1,5 @@
 use crate::config::DevyConfig;
+use crate::output::clean_line;
 
 /// Prints each command name from devy.yml, one per line. Exits silently if
 /// devy.yml does not exist — callers are shell completion functions that must
@@ -9,7 +10,7 @@ pub fn run() {
         let mut names: Vec<&str> = config.commands.keys().map(|k| k.as_str()).collect();
         names.sort_unstable();
         for name in names {
-            println!("{}", name);
+            println!("{}", clean_line(name));
         }
     }
 }
@@ -20,7 +21,7 @@ pub fn run() {
 pub fn run_services() {
     if let Ok(config) = DevyConfig::load_default() {
         for name in service_names(&config) {
-            println!("{}", name);
+            println!("{}", clean_line(&name));
         }
     }
 }

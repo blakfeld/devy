@@ -13,6 +13,7 @@ mod generic;
 mod java;
 mod kafka;
 mod kotlin;
+mod loopback;
 mod mailhog;
 mod mariadb;
 mod meilisearch;
@@ -42,9 +43,13 @@ use crate::config::Dependency;
 use crate::output;
 use crate::package_manager::{LogSource, PackageManager};
 pub(crate) use helpers::fnv1a;
-use helpers::{
-    PackageModule, extra_port, extra_strs, node_pkg, pm_dep, run_cmd, tcp_ping, write_mysql_config,
-};
+#[cfg(test)]
+use helpers::write_mysql_config;
+use helpers::{PackageModule, extra_list, extra_port, node_pkg, pm_dep, run_cmd, tcp_ping};
+
+/// How the setup step for `global_packages` (`npm install -g …`) ends, so `devy init`
+/// can restore a removed step through the `global_packages` key that produced it.
+pub(crate) const GLOBAL_PACKAGES_STEP: &str = "(global_packages install scripts)";
 
 /// How the Nix backend runs a service under launchd or systemd.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +131,10 @@ pub struct DockerSpec {
     pub image: String,
     /// Tag used when the dependency has no `version`.
     pub default_tag: String,
+    /// Content digest (`sha256:<hex>`) of `default_tag` in `image`. When set, a dependency
+    /// that sets neither `image` nor `version` runs `<image>@<digest>` instead of the
+    /// mutable tag; `default_tag` stays the resolved version shown in status and the lock.
+    pub default_digest: Option<&'static str>,
     /// Port the service listens on inside the container. Fixed per module; the resolved
     /// host port is published to it.
     pub container_port: u16,
@@ -134,6 +143,9 @@ pub struct DockerSpec {
     /// Mount path of the service's named data volume; `None` for stateless services.
     pub data_path: Option<String>,
     pub env: Vec<(String, String)>,
+    /// Credentials, passed through a mode-0600 `--env-file` instead of `-e` so they stay
+    /// out of the `docker run` argv.
+    pub secret_env: Vec<(String, String)>,
     /// Arguments after the image (the container's command).
     pub args: Vec<String>,
 }
@@ -143,12 +155,20 @@ impl DockerSpec {
         Self {
             image: image.to_string(),
             default_tag: default_tag.to_string(),
+            default_digest: None,
             container_port,
             extra_ports: Vec::new(),
             data_path: None,
             env: Vec::new(),
+            secret_env: Vec::new(),
             args: Vec::new(),
         }
+    }
+
+    /// Pins `default_tag` to `digest` (see [`DockerSpec::default_digest`]).
+    fn pinned(mut self, digest: &'static str) -> Self {
+        self.default_digest = Some(digest);
+        self
     }
 
     fn data(mut self, path: &str) -> Self {
@@ -161,19 +181,30 @@ impl DockerSpec {
             .extend(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         self
     }
+
+    fn secret_env(mut self, pairs: &[(&str, &str)]) -> Self {
+        self.secret_env
+            .extend(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        self
+    }
 }
 
-/// An image repository and tag, e.g. `redis` and `7`.
+/// An image repository and tag, e.g. `redis` and `7`, optionally pinned to a digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRef {
     pub repository: String,
     pub tag: String,
+    /// The module's built-in digest for `tag` (`sha256:<hex>`), when it has one.
+    pub digest: Option<String>,
 }
 
 impl ImageRef {
-    /// `<repository>:<tag>`.
+    /// `<repository>@<digest>` when pinned, otherwise `<repository>:<tag>`.
     pub fn reference(&self) -> String {
-        format!("{}:{}", self.repository, self.tag)
+        match &self.digest {
+            Some(digest) => format!("{}@{digest}", self.repository),
+            None => format!("{}:{}", self.repository, self.tag),
+        }
     }
 }
 
@@ -189,7 +220,8 @@ fn split_image_tag(image: &str) -> (&str, Option<&str>) {
 
 /// The image a docker-managed `dep` runs. The repository is the `image` override, or
 /// the module's image. The tag is a tag written in `image`, then `version`, then the
-/// module's default tag.
+/// module's default tag. Only the module's own default (neither `image` nor `version`
+/// set) uses the module's pinned digest.
 pub(crate) fn docker_image(spec: &DockerSpec, dep: &Dependency) -> ImageRef {
     let (repository, image_tag) = match dep.image.as_deref() {
         Some(image) => split_image_tag(image),
@@ -198,9 +230,14 @@ pub(crate) fn docker_image(spec: &DockerSpec, dep: &Dependency) -> ImageRef {
     let tag = image_tag
         .or(dep.version.as_deref())
         .unwrap_or(&spec.default_tag);
+    let digest = match (&dep.image, &dep.version) {
+        (None, None) => spec.default_digest.map(String::from),
+        _ => None,
+    };
     ImageRef {
         repository: repository.to_string(),
         tag: tag.to_string(),
+        digest,
     }
 }
 
@@ -219,14 +256,27 @@ pub(crate) fn docker_image_warning(dep: &Dependency) -> Option<String> {
 const MAX_SOCKET_PATH: usize = 100;
 
 /// Directory for a service's Unix sockets: `data_dir` when `<data_dir>/<socket_name>`
-/// fits in `sun_path`, otherwise a short per-project directory under `/tmp`.
-/// Deeply nested projects would otherwise fail to start postgres or mysqld.
+/// fits in `sun_path`, otherwise a short per-project directory inside devy's private
+/// per-user directory (see `fs_safe::user_dir`). Deeply nested projects would otherwise
+/// fail to start postgres or mysqld. The name is deterministic so it survives restarts;
+/// a directory another user created there makes this fail instead of being used.
 pub(crate) fn socket_dir(data_dir: &Path, socket_name: &str) -> Result<PathBuf> {
     if path_arg(data_dir).len() + 1 + socket_name.len() <= MAX_SOCKET_PATH {
         return Ok(data_dir.to_path_buf());
     }
-    let dir = PathBuf::from(format!("/tmp/devy-{:016x}", fnv1a(&path_arg(data_dir))));
-    std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    let user_dir = crate::fs_safe::user_dir()?;
+    let dir = crate::fs_safe::private_dir(
+        &user_dir,
+        &format!("s-{:016x}", fnv1a(&path_arg(data_dir))),
+        false,
+    )?;
+    // A long $XDG_RUNTIME_DIR/$TMPDIR can still exceed `sun_path`.
+    if path_arg(&dir).len() + 1 + socket_name.len() > MAX_SOCKET_PATH {
+        anyhow::bail!(
+            "socket directory {} is too long for a Unix socket path — point XDG_RUNTIME_DIR or TMPDIR at a shorter directory",
+            dir.display()
+        );
+    }
     Ok(dir)
 }
 
@@ -254,8 +304,11 @@ pub(crate) fn nix_launch_for(
     if pm.name() != "nix" {
         return Ok(None);
     }
+    // `devy service start/restart` reach here without `up`'s managed-path check, and the
+    // service would run on whatever state a repository committed under `.devy/data`.
+    crate::fs_safe::check_managed_paths(project_root, &[])?;
     let data_dir = nix_data_dir(project_root, canonical_name(&dep.name));
-    std::fs::create_dir_all(&data_dir)
+    crate::fs_safe::ensure_dir_in(project_root, &data_dir)
         .with_context(|| format!("Failed to create {}", data_dir.display()))?;
     Ok(module.nix_launch(dep, &data_dir)?.map(|mut spec| {
         spec.working_dir.get_or_insert(data_dir);
@@ -291,7 +344,7 @@ pub(crate) fn search_server_launch(
     let logs_dir = data_dir.join("logs");
     let logs = path_arg(&logs_dir);
     // The JVM opens its GC log before the server creates `path.logs`.
-    std::fs::create_dir_all(&logs_dir)
+    crate::fs_safe::ensure_dir_in(data_dir, &logs_dir)
         .with_context(|| format!("Failed to create {}", logs_dir.display()))?;
     // The package's start script runs from its store directory, so the stock
     // `jvm.options` paths relative to it (GC log, error file, heap dump) are read-only.
@@ -317,6 +370,8 @@ pub(crate) fn search_server_launch(
             [
                 "-E".to_string(),
                 "http.host=127.0.0.1".to_string(),
+                "-E".to_string(),
+                "transport.host=127.0.0.1".to_string(),
                 "-E".to_string(),
                 format!("http.port={port}"),
                 "-E".to_string(),
@@ -490,6 +545,16 @@ pub trait Module: Sync {
     /// Return `None` to derive the source from the active package manager name.
     fn source(&self) -> Option<&'static str> {
         None
+    }
+
+    /// How `install` really gets the dependency onto the machine, for the trust summary,
+    /// given `backend`, the package manager as the summary names it (`nix`, `brew`,
+    /// `sudo apt-get`, `winget`). Unlike [`Module::source`] (a stable lock key), it shows
+    /// the route through the package manager, including `sudo`. The default: the module's
+    /// own installer when it has one (rustup and the bun and deno installers always
+    /// bypass the package manager), otherwise `backend`.
+    fn install_route(&self, backend: &str) -> String {
+        self.source().unwrap_or(backend).to_string()
     }
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool>;
@@ -675,6 +740,21 @@ pub trait Module: Sync {
         HashMap::new()
     }
 
+    /// Environment variables that depend on the backend running the service, added after
+    /// `env_vars`. Used for values devy chooses at launch time (MinIO's console port
+    /// under nix), so the exported value matches what the service was started with.
+    /// Only `PortMode::Assign` (`devy up`) may choose and record such a value; under
+    /// `PortMode::ReadOnly` nothing is written.
+    fn backend_env_vars(
+        &self,
+        _dep: &Dependency,
+        _pm: &dyn PackageManager,
+        _project_root: &std::path::Path,
+        _mode: crate::commands::ports::PortMode,
+    ) -> HashMap<String, String> {
+        HashMap::new()
+    }
+
     /// PATH entries to prepend when this module is active.
     /// Emitted as shadowenv `env/prepend-to-pathlist` directives so they compose
     /// correctly with the user's existing PATH.
@@ -689,6 +769,14 @@ pub trait Module: Sync {
     /// `Some(&["port", ...])` declares a known-key allowlist.
     fn known_extra_keys(&self) -> Option<&'static [&'static str]> {
         Some(&[])
+    }
+
+    /// The commands `post_setup` runs because of files in the project (package-manager
+    /// installs that run lifecycle scripts, repository-provided scripts, build scripts),
+    /// each as `<command> (<what drives it>)`, for the trust summary. Empty when this
+    /// module runs none for the project at `project_root`.
+    fn setup_steps(&self, _dep: &Dependency, _project_root: &Path) -> Vec<String> {
+        Vec::new()
     }
 
     /// Called unconditionally after a dependency is installed or confirmed installed.
@@ -716,6 +804,13 @@ pub trait Module: Sync {
     /// Called by `devy check` before any installation to surface issues early.
     /// Warnings are printed but do not count as blocking issues.
     fn config_warnings(&self, _dep: &Dependency) -> Vec<String> {
+        vec![]
+    }
+
+    /// Blocking problems in the dependency's configuration that `up` would fail on (an
+    /// invalid secondary port, a credential that can't be passed safely). `devy check`
+    /// counts them as issues. Messages omit the dependency name.
+    fn config_issues(&self, _dep: &Dependency) -> Vec<String> {
         vec![]
     }
 }
@@ -944,6 +1039,15 @@ pub fn is_registered(name: &str) -> bool {
 /// `"postgres"` → `"postgresql"`, `"js"` → `"node"`, unknown → unchanged.
 pub fn canonical_name(name: &str) -> &str {
     ALIASES_MAP.get(name).copied().unwrap_or(name)
+}
+
+/// The project-relative virtualenv directories devy manages for `deps` (one per
+/// `python` dependency), for the managed-path check.
+pub(crate) fn managed_venvs(deps: &[Dependency]) -> Vec<PathBuf> {
+    deps.iter()
+        .filter(|d| !d.docker && canonical_name(&d.name) == "python")
+        .map(python::venv_rel_path)
+        .collect()
 }
 
 /// One registry entry as described to an AI model: everything needed to write a valid
@@ -1225,7 +1329,7 @@ mod tests {
         assert_eq!(mysql.container_port, 3306);
         assert_eq!(mysql.data_path.as_deref(), Some("/var/lib/mysql"));
         assert_eq!(env_of(&mysql, "MYSQL_ALLOW_EMPTY_PASSWORD"), Some("yes"));
-        assert_eq!(mysql.args, s(&["--max-connections=50", "--sql_mode=ANSI"]));
+        assert_eq!(mysql.args, s(&["--max-connections=50", "--sql-mode=ANSI"]));
 
         let dep = Dependency {
             name: "mariadb".into(),
@@ -1244,7 +1348,7 @@ mod tests {
         );
         assert_eq!(
             mariadb.args,
-            s(&["--max-connections=50", "--sql_mode=ANSI"])
+            s(&["--max-connections=50", "--sql-mode=ANSI"])
         );
     }
 
@@ -1256,8 +1360,8 @@ mod tests {
             ("mongodb", "mongo", "7", 27017, Some("/data/db")),
             ("rabbitmq", "rabbitmq", "3", 5672, Some("/var/lib/rabbitmq")),
             ("memcached", "memcached", "1", 11211, None),
-            ("nginx", "nginx", "stable", 80, None),
-            ("mailhog", "mailhog/mailhog", "latest", 1025, None),
+            ("nginx", "nginx", "1.30.5", 80, None),
+            ("mailhog", "mailhog/mailhog", "v1.0.1", 1025, None),
             (
                 "meilisearch",
                 "getmeili/meilisearch",
@@ -1280,6 +1384,17 @@ mod tests {
         }
     }
 
+    /// Only rejects `latest`; tags like `redis:7` follow the spec's version table.
+    #[test]
+    fn no_docker_default_tag_is_latest() {
+        for (name, module) in REGISTRY {
+            if let Some(spec) = module.docker_spec(&Dependency::simple(name)).unwrap() {
+                assert_ne!(spec.default_tag, "latest", "{name}");
+                assert!(!spec.default_tag.is_empty(), "{name}");
+            }
+        }
+    }
+
     #[test]
     fn meilisearch_docker_spec_passes_master_key() {
         let dep = with_extra(
@@ -1289,9 +1404,11 @@ mod tests {
                 crate::config::ExtraValue::String("s3cret".into()),
             )],
         );
+        let spec = dspec("meilisearch", &dep);
+        assert_eq!(env_of(&spec, "MEILI_MASTER_KEY"), None);
         assert_eq!(
-            env_of(&dspec("meilisearch", &dep), "MEILI_MASTER_KEY"),
-            Some("s3cret")
+            spec.secret_env,
+            [("MEILI_MASTER_KEY".to_string(), "s3cret".to_string())]
         );
     }
 
@@ -1322,8 +1439,16 @@ mod tests {
     fn minio_docker_spec_console_and_credentials() {
         let plain = dspec("minio", &Dependency::simple("minio"));
         assert_eq!(
-            (plain.image.as_str(), plain.default_tag.as_str()),
-            ("minio/minio", "latest")
+            (
+                plain.image.as_str(),
+                plain.default_tag.as_str(),
+                plain.default_digest
+            ),
+            (
+                "pgsty/silo",
+                "RELEASE.2026-09-16T00-00-00Z",
+                Some("sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46")
+            )
         );
         assert_eq!(plain.container_port, 9000);
         assert_eq!(plain.data_path.as_deref(), Some("/data"));
@@ -1333,6 +1458,7 @@ mod tests {
         );
         assert!(plain.extra_ports.is_empty());
         assert!(plain.env.is_empty());
+        assert!(plain.secret_env.is_empty());
 
         let dep = with_extra(
             "minio",
@@ -1344,8 +1470,14 @@ mod tests {
         );
         let spec = dspec("minio", &dep);
         assert_eq!(spec.extra_ports, vec![(9101, 9001)]);
-        assert_eq!(env_of(&spec, "MINIO_ROOT_USER"), Some("me"));
-        assert_eq!(env_of(&spec, "MINIO_ROOT_PASSWORD"), Some("pw"));
+        assert!(spec.env.is_empty(), "credentials must not be plain -e env");
+        assert_eq!(
+            spec.secret_env,
+            [
+                ("MINIO_ROOT_USER".to_string(), "me".to_string()),
+                ("MINIO_ROOT_PASSWORD".to_string(), "pw".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -1452,7 +1584,10 @@ mod tests {
             .map(|(n, _)| *n)
             .collect();
         skipped.sort_unstable();
-        assert_eq!(skipped, vec!["mariadb", "mysql", "postgresql"]);
+        assert_eq!(
+            skipped,
+            vec!["kafka", "mariadb", "mysql", "postgresql", "rabbitmq"]
+        );
     }
 
     #[test]
@@ -1508,19 +1643,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn socket_dir_falls_back_to_short_tmp_dir_for_deep_projects() {
+    fn socket_dir_falls_back_to_private_user_dir_for_deep_projects() {
+        use std::os::unix::fs::PermissionsExt;
         let deep = PathBuf::from(format!("/{}/.devy/data/postgresql", "x".repeat(90)));
         let dir = socket_dir(&deep, ".s.PGSQL.51000").unwrap();
-        assert!(
-            path_arg(&dir).starts_with("/tmp/devy-"),
-            "{}",
-            dir.display()
+        assert_eq!(
+            dir.parent(),
+            Some(crate::fs_safe::user_dir_path().as_path())
         );
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
         assert!(dir.join(".s.PGSQL.65535.lock").as_os_str().len() <= MAX_SOCKET_PATH);
         assert_eq!(
             dir,
             socket_dir(&deep, ".s.PGSQL.51000").unwrap(),
             "must be stable"
+        );
+    }
+
+    /// Scenario "Pre-created socket directory": a socket directory owned by another
+    /// user makes the service start fail with the ownership error.
+    #[cfg(unix)]
+    #[test]
+    fn foreign_socket_dir_fails_service_start() {
+        use crate::package_manager::MockPackageManager;
+        let tmp = crate::test_support::tmp_dir();
+        let root = tmp.join("p".repeat(100));
+        std::fs::create_dir(&root).unwrap();
+        let pm = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        let dep = Dependency::simple("postgresql");
+        // The directory exists and is ours, but presented as another user's.
+        crate::fs_safe::user_dir().unwrap();
+        let err = crate::fs_safe::with_fake_owner(crate::fs_safe::current_uid() + 1, || {
+            start_via_pm(get("postgresql"), &pm, &dep, &root)
+        })
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("is not owned by the current user"),
+            "{err:#}"
         );
     }
 
@@ -1606,11 +1769,11 @@ mod tests {
             s(&[
                 "--no-defaults",
                 "--datadir=/p/.devy/data/mysql",
+                "--innodb-buffer-pool-size=256M",
                 "--port=51001",
                 "--bind-address=127.0.0.1",
                 "--socket=/p/.devy/data/mysql/mysql.sock",
                 "--mysqlx=OFF",
-                "--innodb-buffer-pool-size=256M",
             ])
         );
         assert_eq!(spec.exec_package.as_deref(), Some("mysql84"));
@@ -1659,6 +1822,82 @@ mod tests {
         );
     }
 
+    // The nix backend only exists on macOS and Linux.
+    #[cfg(unix)]
+    #[test]
+    fn mysql_family_launch_skips_dangerous_options() {
+        for name in ["mysql", "mariadb"] {
+            let dep = with_extra(
+                name,
+                &[
+                    ("port", num(51001)),
+                    (
+                        "cli_args",
+                        crate::config::ExtraValue::String(
+                            "--bind-address=0.0.0.0 --skip-grant-tables=1".into(),
+                        ),
+                    ),
+                ],
+            );
+            let mut spec = None;
+            let msgs = crate::output::with_warn_messages(|| {
+                spec = Some(launch(name, &dep, Path::new("/p/.devy/data/db")));
+            });
+            let args = spec.unwrap().args;
+            assert_eq!(
+                msgs,
+                [
+                    "skipped cli_args token --bind-address=0.0.0.0: not an allowed server option",
+                    "skipped cli_args token --skip-grant-tables=1: not an allowed server option",
+                ],
+                "{name}"
+            );
+            assert!(!args.iter().any(|a| a.contains("0.0.0.0")), "{name}");
+            assert!(!args.iter().any(|a| a.contains("grant")), "{name}");
+            assert_eq!(
+                args.iter()
+                    .filter(|a| a.starts_with("--bind-address"))
+                    .count(),
+                1,
+                "{name}"
+            );
+        }
+    }
+
+    // The nix backend only exists on macOS and Linux.
+    #[cfg(unix)]
+    #[test]
+    fn mysql_family_launch_forced_bind_wins() {
+        for name in ["mysql", "mariadb"] {
+            let dep = with_extra(
+                name,
+                &[(
+                    "cli_args",
+                    crate::config::ExtraValue::String(
+                        "--max-connections=5 --sql_mode=ANSI --skip-name-resolve=1".into(),
+                    ),
+                )],
+            );
+            let args = launch(name, &dep, Path::new("/p/.devy/data/db")).args;
+            let bind = args
+                .iter()
+                .position(|a| a == "--bind-address=127.0.0.1")
+                .expect("forced bind present");
+            for token in [
+                "--max-connections=5",
+                "--sql-mode=ANSI",
+                "--skip-name-resolve=1",
+            ] {
+                let at = args
+                    .iter()
+                    .position(|a| a == token)
+                    .unwrap_or_else(|| panic!("{name}: {token} missing from {args:?}"));
+                assert!(at < bind, "{name}: {token} must precede the forced bind");
+            }
+            assert_eq!(args[0], "--no-defaults", "{name}");
+        }
+    }
+
     #[test]
     fn redis_memcached_launch_args() {
         let d = Path::new("/p/.devy/data/redis");
@@ -1702,6 +1941,11 @@ mod tests {
         let env: HashMap<_, _> = spec.env.into_iter().collect();
         assert_eq!(env["RABBITMQ_NODE_PORT"], "51004");
         assert_eq!(env["RABBITMQ_NODE_IP_ADDRESS"], "127.0.0.1");
+        assert_eq!(env["ERL_EPMD_ADDRESS"], "127.0.0.1");
+        assert_eq!(
+            env["RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS"],
+            "-kernel inet_dist_use_interface {127,0,0,1}"
+        );
         assert_eq!(env["RABBITMQ_MNESIA_BASE"], path_arg(&d.join("mnesia")));
         assert_eq!(env["RABBITMQ_LOG_BASE"], path_arg(&d.join("log")));
         let dist: u16 = env["RABBITMQ_DIST_PORT"].parse().expect("valid dist port");
@@ -1737,6 +1981,8 @@ mod tests {
             let mut args = s(&[
                 "-E",
                 "http.host=127.0.0.1",
+                "-E",
+                "transport.host=127.0.0.1",
                 "-E",
                 "http.port=51005",
                 "-E",
@@ -1809,18 +2055,31 @@ mod tests {
             ],
         );
         let spec = launch("meilisearch", &dep, d);
-        assert_eq!(spec.args[4..], s(&["--master-key", "k3y"]));
+        assert_eq!(
+            spec.args,
+            s(&["--http-addr", "127.0.0.1:51006", "--db-path", "/p/d"])
+        );
+        assert!(
+            !spec.args.iter().any(|a| a.contains("k3y")),
+            "the master key must not be in argv"
+        );
+        assert_eq!(spec.env, [("MEILI_MASTER_KEY".into(), "k3y".into())]);
     }
 
     #[test]
     fn minio_launch_console_and_credentials() {
-        let d = Path::new("/p/d");
+        let dir = crate::test_support::tmp_dir();
+        let d: &Path = &dir;
         let spec = launch("minio", &with_extra("minio", &[("port", num(51007))]), d);
         assert_eq!(spec.exec, "minio");
         assert_eq!(
-            spec.args,
-            s(&["server", "/p/d", "--address", "127.0.0.1:51007"])
+            spec.args[..4],
+            s(&["server", &path_arg(d), "--address", "127.0.0.1:51007"])
         );
+        // Without console_port, a free port is chosen, still on loopback.
+        assert_eq!(spec.args[4], "--console-address");
+        assert!(spec.args[5].starts_with("127.0.0.1:"), "{:?}", spec.args);
+        assert_eq!(spec.args.len(), 6);
         assert!(spec.env.is_empty());
         let dep = with_extra(
             "minio",
@@ -1832,7 +2091,8 @@ mod tests {
             ],
         );
         let spec = launch("minio", &dep, d);
-        assert_eq!(spec.args[4..], s(&["--console-address", ":9001"]));
+        assert_eq!(spec.args[4..], s(&["--console-address", "127.0.0.1:9001"]));
+        assert!(!spec.args.iter().any(|a| a == "u" || a == "p"));
         let env: HashMap<_, _> = spec.env.into_iter().collect();
         assert_eq!(env["MINIO_ROOT_USER"], "u");
         assert_eq!(env["MINIO_ROOT_PASSWORD"], "p");
@@ -1846,7 +2106,17 @@ mod tests {
             Path::new("/p/d"),
         );
         assert_eq!(spec.exec, "MailHog");
-        assert_eq!(spec.args, s(&["-smtp-bind-addr", "127.0.0.1:51008"]));
+        assert_eq!(
+            spec.args,
+            s(&[
+                "-smtp-bind-addr",
+                "127.0.0.1:51008",
+                "-ui-bind-addr",
+                "127.0.0.1:8025",
+                "-api-bind-addr",
+                "127.0.0.1:8025",
+            ])
+        );
     }
 
     #[test]
@@ -1865,6 +2135,8 @@ mod tests {
                 "--bind_ip",
                 "127.0.0.1",
                 "--dbpath",
+                "/p/.devy/data/mongodb",
+                "--unixSocketPrefix",
                 "/p/.devy/data/mongodb",
             ])
         );
@@ -2854,16 +3126,16 @@ mod tests {
         assert!(get("swift").is_installed(&pm, &dep).unwrap());
     }
 
-    // ── extra_strs ────────────────────────────────────────────────────────────
+    // ── extra_list ────────────────────────────────────────────────────────────
 
     #[test]
-    fn extra_strs_missing_key_returns_empty() {
+    fn extra_list_missing_key_returns_empty() {
         let dep = Dependency::simple("node");
-        assert!(extra_strs(&dep, "global_packages").is_empty());
+        assert!(extra_list(&dep, "global_packages").unwrap().is_empty());
     }
 
     #[test]
-    fn extra_strs_sequence_returns_strings() {
+    fn extra_list_sequence_returns_strings() {
         let mut extra = HashMap::new();
         extra.insert(
             "global_packages".to_string(),
@@ -2885,12 +3157,12 @@ mod tests {
             image: None,
             docker: false,
         };
-        let pkgs = extra_strs(&dep, "global_packages");
+        let pkgs = extra_list(&dep, "global_packages").unwrap();
         assert_eq!(pkgs, vec!["typescript", "eslint"]);
     }
 
     #[test]
-    fn extra_strs_non_sequence_value_returns_empty() {
+    fn extra_list_non_sequence_value_returns_empty() {
         let mut extra = HashMap::new();
         extra.insert(
             "global_packages".to_string(),
@@ -2909,7 +3181,7 @@ mod tests {
             image: None,
             docker: false,
         };
-        assert!(extra_strs(&dep, "global_packages").is_empty());
+        assert!(extra_list(&dep, "global_packages").unwrap().is_empty());
     }
 
     // ── pm_dep ────────────────────────────────────────────────────────────────
@@ -3495,18 +3767,24 @@ mod tests {
 
     fn write_and_read(port: u16, cli_args: Option<&str>) -> String {
         let dir = crate::test_support::tmp_dir();
-        write_mysql_config(&dir, port, cli_args).unwrap();
+        write_mysql_config("apt", &dir, port, cli_args).unwrap();
         std::fs::read_to_string(dir.join("my.cnf")).unwrap()
         // dir is dropped here, cleaning up automatically
     }
 
-    /// Like `write_and_read` but also returns the number of warnings emitted.
-    fn write_and_read_with_warnings(port: u16, cli_args: Option<&str>) -> (String, usize) {
+    /// Like `write_and_read` but also returns the warnings emitted.
+    fn write_and_read_with_messages(port: u16, cli_args: Option<&str>) -> (String, Vec<String>) {
         let mut content = String::new();
-        let warn_count = crate::output::with_warn_capture(|| {
+        let msgs = crate::output::with_warn_messages(|| {
             content = write_and_read(port, cli_args);
         });
-        (content, warn_count)
+        (content, msgs)
+    }
+
+    /// Like `write_and_read` but also returns the number of warnings emitted.
+    fn write_and_read_with_warnings(port: u16, cli_args: Option<&str>) -> (String, usize) {
+        let (content, msgs) = write_and_read_with_messages(port, cli_args);
+        (content, msgs.len())
     }
 
     #[test]
@@ -3522,9 +3800,71 @@ mod tests {
     }
 
     #[test]
+    fn write_mysql_config_valid_and_invalid_args() {
+        let (content, msgs) =
+            write_and_read_with_messages(3306, Some("--innodb-buffer-pool-size=256M bogus"));
+        assert!(content.contains("innodb-buffer-pool-size = 256M"));
+        assert!(!content.contains("bogus"));
+        assert_eq!(
+            msgs,
+            ["skipped cli_args token bogus: not an allowed server option"]
+        );
+    }
+
+    #[test]
+    fn write_mysql_config_dangerous_options_skipped() {
+        let (content, msgs) = write_and_read_with_messages(
+            3306,
+            Some("--bind-address=0.0.0.0 --skip-grant-tables=1"),
+        );
+        assert!(!content.contains("0.0.0.0"));
+        assert!(content.contains("\nbind-address = 127.0.0.1\n"));
+        assert!(!content.contains("skip-grant-tables"));
+        assert_eq!(
+            msgs,
+            [
+                "skipped cli_args token --bind-address=0.0.0.0: not an allowed server option",
+                "skipped cli_args token --skip-grant-tables=1: not an allowed server option",
+            ]
+        );
+    }
+
+    #[test]
+    fn write_mysql_config_skips_unlisted_path_and_plugin_options() {
+        for token in [
+            "--init-file=/tmp/x.sql",
+            "--init_file=/tmp/x.sql",
+            "--plugin-load=x.so",
+            "--plugin-dir=/tmp",
+            "--secure-file-priv=",
+            "--datadir=/tmp",
+            "--socket=/tmp/s",
+            "--user=root",
+            "--general-log-file=/etc/passwd",
+            "--port=1",
+        ] {
+            let (content, warns) = write_and_read_with_warnings(3306, Some(token));
+            assert_eq!(
+                content,
+                "[mysqld]\nport = 3306\n\
+                 bind-address = 127.0.0.1\nloose-mysqlx-bind-address = 127.0.0.1\n",
+                "{token}"
+            );
+            assert_eq!(warns, 1, "{token}");
+        }
+    }
+
+    #[test]
+    fn write_mysql_config_normalizes_underscores() {
+        let content = write_and_read(3306, Some("--sql_mode=ANSI --max_connections=5"));
+        assert!(content.contains("sql-mode = ANSI"));
+        assert!(content.contains("max-connections = 5"));
+    }
+
+    #[test]
     fn write_mysql_config_rejects_bare_key_value_without_double_dash() {
-        let (content, warns) = write_and_read_with_warnings(3306, Some("skip_grant_tables=1"));
-        assert!(!content.contains("skip_grant_tables"));
+        let (content, warns) = write_and_read_with_warnings(3306, Some("max_connections=1"));
+        assert!(!content.contains("max_connections"));
         assert!(warns > 0, "must warn when -- prefix is missing");
     }
 
@@ -3537,51 +3877,214 @@ mod tests {
 
     #[test]
     fn write_mysql_config_skips_args_without_equals() {
-        let (content, warns) = write_and_read_with_warnings(3306, Some("--no-value-here"));
-        assert!(!content.contains("no-value-here"));
+        let (content, warns) = write_and_read_with_warnings(3306, Some("--skip-name-resolve"));
+        assert!(!content.contains("skip-name-resolve"));
         assert!(warns > 0, "must warn when no = is present in arg");
     }
 
     #[test]
     fn write_mysql_config_treats_newline_in_args_as_separator() {
         // \n is whitespace — split_whitespace splits the arg list on it.
-        // "--key=value" is valid and written; "line2" has no -- prefix and warns.
-        let (content, warns) = write_and_read_with_warnings(3306, Some("--key=value\nline2"));
-        assert!(
-            content.contains("key = value"),
-            "Expected valid arg to be written"
-        );
-        assert!(
-            !content.contains("line2"),
-            "Bare token after newline must be skipped"
-        );
-        assert!(warns > 0, "must warn for the bare 'line2' token");
+        let (content, warns) =
+            write_and_read_with_warnings(3306, Some("--max-connections=10\nline2"));
+        assert!(content.contains("max-connections = 10"));
+        assert!(!content.contains("line2"));
+        assert_eq!(warns, 1, "must warn for the bare 'line2' token");
     }
 
     #[test]
     fn write_mysql_config_rejects_value_with_null_byte() {
-        let (content, warns) = write_and_read_with_warnings(3306, Some("--key=val\x00ue"));
-        assert!(!content.contains("val"));
-        assert!(warns > 0, "must warn when value contains null byte");
+        let (content, msgs) = write_and_read_with_messages(3306, Some("--sql-mode=val\x00ue"));
+        assert!(!content.contains("sql-mode"));
+        assert_eq!(
+            msgs,
+            ["skipped cli_args token --sql-mode=val\\0ue: not an allowed server option"],
+            "the NUL is escaped in the warning"
+        );
     }
 
     #[test]
     fn write_mysql_config_carriage_return_splits_token() {
-        // \r is ASCII whitespace; split_whitespace splits "--key=val\rue" into
-        // "--key=val" (accepted) and "ue" (no -- prefix, dropped with a warning).
-        let (content, warns) = write_and_read_with_warnings(3306, Some("--key=val\rue"));
-        assert!(
-            content.contains("key = val"),
-            "portion before \\r is accepted"
-        );
+        // \r is ASCII whitespace; split_whitespace splits "--sql-mode=val\rue" into
+        // "--sql-mode=val" (accepted) and "ue" (no -- prefix, dropped with a warning).
+        let (content, warns) = write_and_read_with_warnings(3306, Some("--sql-mode=val\rue"));
+        assert!(content.contains("sql-mode = val\n"));
         assert!(!content.contains("ue"), "portion after \\r is dropped");
-        assert!(warns > 0, "must warn for the bare 'ue' token");
+        assert_eq!(warns, 1, "must warn for the bare 'ue' token");
     }
 
     #[test]
     fn write_mysql_config_accepts_value_without_newline_or_null() {
         let content = write_and_read(3306, Some("--max-connections=200"));
         assert!(content.contains("max-connections = 200"));
+    }
+
+    #[test]
+    fn mysql_allowlist_entries_are_normalized() {
+        for key in helpers::MYSQL_ALLOWED_ARGS {
+            assert!(
+                key.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_mysql_config_brew_keeps_existing_my_cnf() {
+        let dir = crate::test_support::tmp_dir();
+        let original = "[mysqld]\nbind-address = 127.0.0.1\n";
+        std::fs::write(dir.join("my.cnf"), original).unwrap();
+        let msgs = crate::output::with_warn_messages(|| {
+            write_mysql_config("brew", &dir, 3307, Some("--max-connections=9")).unwrap();
+        });
+        assert_eq!(
+            std::fs::read_to_string(dir.join("my.cnf")).unwrap(),
+            original,
+            "a user's my.cnf must never be overwritten"
+        );
+        let devy = std::fs::read_to_string(dir.join("my.cnf.d").join("devy.cnf")).unwrap();
+        assert_eq!(
+            devy,
+            "[mysqld]\nport = 3307\nmax-connections = 9\n\
+             bind-address = 127.0.0.1\nloose-mysqlx-bind-address = 127.0.0.1\n"
+        );
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("!includedir"), "{msgs:?}");
+        assert!(msgs[0].contains("left it unchanged"), "{msgs:?}");
+    }
+
+    #[test]
+    fn write_mysql_config_brew_silent_when_my_cnf_includes_dir() {
+        let dir = crate::test_support::tmp_dir();
+        let include = dir.join("my.cnf.d");
+        let original = format!("[mysqld]\n\n!includedir {}/\n", include.display());
+        std::fs::write(dir.join("my.cnf"), &original).unwrap();
+        let warns = crate::output::with_warn_capture(|| {
+            write_mysql_config("brew", &dir, 3307, None).unwrap();
+        });
+        assert_eq!(warns, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("my.cnf")).unwrap(),
+            original
+        );
+        assert!(include.join("devy.cnf").is_file());
+    }
+
+    #[test]
+    fn write_mysql_config_brew_creates_missing_my_cnf_with_include() {
+        let dir = crate::test_support::tmp_dir();
+        let warns = crate::output::with_warn_capture(|| {
+            write_mysql_config("brew", &dir, 3307, None).unwrap();
+        });
+        assert_eq!(warns, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("my.cnf")).unwrap(),
+            format!("!includedir {}\n", dir.join("my.cnf.d").display())
+        );
+    }
+
+    #[test]
+    fn write_mysql_config_binds_loopback_after_user_args() {
+        for pm in ["apt", "brew"] {
+            let dir = crate::test_support::tmp_dir();
+            write_mysql_config(pm, &dir, 3307, Some("--max-connections=9")).unwrap();
+            let path = if pm == "brew" {
+                dir.join("my.cnf.d").join("devy.cnf")
+            } else {
+                dir.join("my.cnf")
+            };
+            let text = std::fs::read_to_string(path).unwrap();
+            let user = text.find("max-connections").unwrap();
+            let bind = text.find("bind-address = 127.0.0.1").unwrap();
+            assert!(bind > user, "{pm}: {text}");
+            assert!(
+                text.contains("loose-mysqlx-bind-address = 127.0.0.1"),
+                "{pm}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_mysql_config_brew_warns_only_when_settings_change() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("my.cnf"), "[mysqld]\n").unwrap();
+        let count = |port| {
+            crate::output::with_warn_capture(|| {
+                write_mysql_config("brew", &dir, port, None).unwrap();
+            })
+        };
+        assert_eq!(count(3307), 1);
+        assert_eq!(count(3307), 0, "unchanged settings: no repeat warning");
+        assert_eq!(count(3308), 1);
+    }
+
+    #[test]
+    fn mysql_family_post_setup_keeps_brew_loopback_bind_at_defaults() {
+        let dir = crate::test_support::tmp_dir();
+        let pm = crate::package_manager::MockPackageManager {
+            name: "brew",
+            config_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        let devy_cnf = dir.join("my.cnf.d").join("devy.cnf");
+        helpers::mysql_family_post_setup(&pm, "mysql", 3307, None).unwrap();
+        helpers::mysql_family_post_setup(&pm, "mysql", 3306, None).unwrap();
+        let text = std::fs::read_to_string(&devy_cnf).unwrap();
+        assert!(text.contains("port = 3306"), "{text}");
+        assert!(text.contains("bind-address = 127.0.0.1"), "{text}");
+        assert!(
+            std::fs::read_to_string(dir.join("my.cnf"))
+                .unwrap()
+                .contains("!includedir")
+        );
+    }
+
+    #[test]
+    fn write_mysql_config_brew_defaults_do_not_warn_about_stock_my_cnf() {
+        let dir = crate::test_support::tmp_dir();
+        let stock = "[mysqld]\nbind-address = 127.0.0.1\n";
+        std::fs::write(dir.join("my.cnf"), stock).unwrap();
+        let warns = crate::output::with_warn_capture(|| {
+            write_mysql_config("brew", &dir, 3306, None).unwrap();
+        });
+        assert_eq!(warns, 0);
+        assert_eq!(std::fs::read_to_string(dir.join("my.cnf")).unwrap(), stock);
+    }
+
+    #[test]
+    fn write_mysql_config_brew_recreates_missing_my_cnf_even_when_unchanged() {
+        let dir = crate::test_support::tmp_dir();
+        write_mysql_config("brew", &dir, 3307, None).unwrap();
+        std::fs::remove_file(dir.join("my.cnf")).unwrap();
+        write_mysql_config("brew", &dir, 3307, None).unwrap();
+        assert!(
+            std::fs::read_to_string(dir.join("my.cnf"))
+                .unwrap()
+                .contains("!includedir")
+        );
+    }
+
+    #[test]
+    fn mysql_family_post_setup_leaves_apt_file_alone_at_defaults() {
+        let dir = crate::test_support::tmp_dir();
+        let user_cnf = "[mysqld]\n# the user's own settings\nmax_connections = 7\n";
+        std::fs::write(dir.join("my.cnf"), user_cnf).unwrap();
+        let pm = crate::package_manager::MockPackageManager {
+            name: "apt",
+            config_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        helpers::mysql_family_post_setup(&pm, "mysql", 3306, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("my.cnf")).unwrap(),
+            user_cnf,
+            "at defaults the apt conf.d file must not be rewritten"
+        );
+        assert_eq!(
+            std::fs::read_dir(&*dir).unwrap().count(),
+            1,
+            "nothing else is written"
+        );
     }
 
     // ── run_cmd ───────────────────────────────────────────────────────────────

@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "std::fs::write", reason = "use fs_safe::write_atomic, which refuses symlinks and writes atomically" },
+]

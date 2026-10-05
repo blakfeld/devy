@@ -37,7 +37,7 @@ fn local_user() -> String {
 fn write_config(config_dir: &Path, port: u16) -> Result<()> {
     fs::create_dir_all(config_dir).context("Failed to create postgresql config dir")?;
     let conf = format!("# devy-managed\nport = {port}\n");
-    fs::write(config_dir.join("devy.conf"), conf)
+    crate::fs_safe::write_atomic(&config_dir.join("devy.conf"), conf.as_bytes(), 0o644)
         .context("Failed to write postgresql devy.conf")?;
     Ok(())
 }

@@ -34,6 +34,10 @@ impl Module for ZigModule {
         pm.install_package(&pm_dep(dep, package_name(pm)))
     }
 
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        super::helpers::step_if_exists(project_root, "build.zig.zon", "zig build (build.zig)")
+    }
+
     fn post_setup(
         &self,
         _dep: &Dependency,
@@ -58,7 +62,7 @@ impl Module for ZigModule {
         if !status.success() {
             anyhow::bail!("`zig build` failed — check the output above for details");
         }
-        write_stamp(&stamp_path, &build_zon);
+        write_stamp(&stamp_path, &build_zon)?;
         output::success("Zig project built");
         Ok(())
     }

@@ -126,7 +126,7 @@ pub fn apply(root: &Path, opts: Options) -> Result<Report> {
 fn apply_skill(root: &Path, force: bool) -> Result<Outcome> {
     let path = root.join(SKILL_PATH);
     let content = skill();
-    let existing = read_if_exists(&path)?;
+    let existing = read_if_exists(root, &path)?;
     let outcome = match existing {
         Some(old) if old == content => return Ok(Outcome::UpToDate),
         Some(old) if !force && !old.contains(&marker()) => return Ok(Outcome::NotOurs),
@@ -134,19 +134,20 @@ fn apply_skill(root: &Path, force: bool) -> Result<Outcome> {
         None => Outcome::Wrote,
     };
     let dir = path.parent().context("skill path has no parent")?;
-    std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
-    write_atomic(&path, &content)?;
+    // Never through a symlinked `.claude` or `.claude/skills` a repository committed.
+    crate::fs_safe::ensure_dir_in(root, dir)?;
+    write_atomic(root, &path, &content)?;
     Ok(outcome)
 }
 
 fn apply_agents_md(root: &Path, create: bool) -> Result<Outcome> {
     let path = root.join(AGENTS_MD);
     let block = agents_block();
-    let Some(old) = read_if_exists(&path)? else {
+    let Some(old) = read_if_exists(root, &path)? else {
         if !create {
             return Ok(Outcome::Absent);
         }
-        write_atomic(&path, &format!("{block}\n"))?;
+        write_atomic(root, &path, &format!("{block}\n"))?;
         return Ok(Outcome::Wrote);
     };
     let Some(new) = with_block(&old, &block) else {
@@ -155,7 +156,7 @@ fn apply_agents_md(root: &Path, create: bool) -> Result<Outcome> {
     if new == old {
         return Ok(Outcome::UpToDate);
     }
-    write_atomic(&path, &new)?;
+    write_atomic(root, &path, &new)?;
     Ok(Outcome::Updated)
 }
 
@@ -232,40 +233,77 @@ fn with_block(content: &str, block: &str) -> Option<String> {
     Some(out)
 }
 
-fn read_if_exists(path: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("Failed to read {}", path.display())),
+/// Largest AGENTS.md or skill file devy reads; the guidance it manages is a few KiB.
+const MAX_READ_BYTES: u64 = 1024 * 1024;
+
+/// The content of `path` (a symlink resolved as [`resolve_in_root`] allows), `None` when
+/// it does not exist. Only a regular file of at most [`MAX_READ_BYTES`] is read: never a
+/// FIFO that would block, a device, or a huge file.
+fn read_if_exists(root: &Path, path: &Path) -> Result<Option<String>> {
+    let target = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("Failed to inspect {}", path.display())),
+        Ok(_) => resolve_in_root(root, path, "read")?,
+    };
+    let bytes = crate::fs_safe::read_regular_capped(&target, MAX_READ_BYTES)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .with_context(|| format!("Failed to read {}: not UTF-8", path.display()))
+}
+
+/// `path` itself, or, when it is a symlink, its target, which must be inside `root` and
+/// not under `.git`: a repository's link to a file elsewhere is refused. `verb` names
+/// the operation in the error.
+fn resolve_in_root(root: &Path, path: &Path, verb: &str) -> Result<PathBuf> {
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return Ok(path.to_path_buf());
     }
+    let target = std::fs::canonicalize(path)
+        .with_context(|| format!("Failed to resolve {}", path.display()))?;
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let into_git = target.strip_prefix(&canonical_root).is_ok_and(|rel| {
+        rel.components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case(".git"))
+    });
+    if !target.starts_with(&canonical_root) || into_git {
+        bail!(
+            "refusing to {verb} {}: it links outside the project or into .git",
+            path.display()
+        );
+    }
+    Ok(target)
 }
 
 /// Replaces `path` through a temp file in the same directory, so an interrupted write
 /// never leaves it truncated. An existing file keeps its permissions, and a symlink is
-/// followed so its target is updated rather than the link replaced by a copy.
-fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut tmp_name = target.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
-    let tmp = target.with_file_name(tmp_name);
-    let perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
-    let result = std::fs::write(&tmp, content)
-        .and_then(|()| match perms {
-            Some(perms) => std::fs::set_permissions(&tmp, perms),
-            None => Ok(()),
-        })
-        .and_then(|()| std::fs::rename(&tmp, &target));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+/// followed so its target is updated rather than the link replaced by a copy, but only
+/// when that target is inside `root` (see [`resolve_in_root`]).
+fn write_atomic(root: &Path, path: &Path, content: &str) -> Result<()> {
+    let target = resolve_in_root(root, path, "write")?;
+    crate::fs_safe::write_atomic(&target, content.as_bytes(), existing_mode(&target))
+        .with_context(|| format!("Failed to write {}", path.display()))
+}
+
+/// The permission bits of the file at `path`, or 0644 for a new file.
+fn existing_mode(path: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).map_or(0o644, |m| m.permissions().mode() & 0o7777)
     }
-    result.with_context(|| format!("Failed to write {}", path.display()))
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0o644
+    }
 }
 
 /// The directory holding the nearest devy.yml.
 fn project_root() -> Result<PathBuf> {
     let start = std::env::current_dir().context("Failed to get current directory")?;
-    let config = DevyConfig::find_config(&start)
-        .ok_or_else(|| anyhow::anyhow!("devy.yml not found — are you inside a devy project?"))?;
+    let config = DevyConfig::locate_config(&start)?;
     Ok(config
         .parent()
         .context("devy.yml has no parent directory")?
@@ -624,6 +662,61 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(read(&dir, "shared-skill.md"), skill());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_is_never_written_through_a_symlinked_claude_dir() {
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        std::os::unix::fs::symlink(&*outside, dir.join(".claude")).unwrap();
+        let err = format!("{:#}", apply(&dir, Options::default()).unwrap_err());
+        assert!(err.contains("it is a symbolic link"), "{err}");
+        assert!(!outside.join("skills").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_md_linking_outside_or_into_git_is_refused() {
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        std::fs::write(outside.join("notes.md"), "mine\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("notes.md"), dir.join(AGENTS_MD)).unwrap();
+        let err = format!("{:#}", apply(&dir, Options::default()).unwrap_err());
+        assert!(err.contains("links outside the project"), "{err}");
+        assert_eq!(read(&outside, "notes.md"), "mine\n");
+
+        std::fs::remove_file(dir.join(AGENTS_MD)).unwrap();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/config"), "[core]\n").unwrap();
+        std::os::unix::fs::symlink(".git/config", dir.join(AGENTS_MD)).unwrap();
+        assert!(apply(&dir, Options::default()).is_err());
+        assert_eq!(read(&dir, ".git/config"), "[core]\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_device_link_and_huge_agents_md_are_never_read() {
+        let dir = crate::test_support::tmp_dir();
+        let fifo = dir.join(AGENTS_MD);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success());
+        if made {
+            // Returns promptly instead of blocking on the FIFO.
+            assert!(apply(&dir, Options::default()).is_err());
+            std::fs::remove_file(&fifo).unwrap();
+        }
+        // A link through the project to a device is refused, never read.
+        std::fs::create_dir(dir.join("dev")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.join("dev/zero")).unwrap();
+        std::os::unix::fs::symlink("dev/zero", dir.join(AGENTS_MD)).unwrap();
+        assert!(apply(&dir, Options::default()).is_err());
+        std::fs::remove_file(dir.join(AGENTS_MD)).unwrap();
+        std::fs::write(dir.join(AGENTS_MD), "x".repeat(MAX_READ_BYTES as usize + 1)).unwrap();
+        let err = apply(&dir, Options::default()).unwrap_err();
+        assert!(format!("{err:#}").contains("larger than"), "{err:#}");
     }
 
     #[test]

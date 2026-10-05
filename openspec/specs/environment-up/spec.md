@@ -13,19 +13,21 @@ Defines `devy up`, which brings a project's environment up from `devy.yml`. It i
 
 ### Requirement: Up phase ordering
 `devy up` SHALL run these steps in order:
-1. Print the header `devy up · <name>`, where `<name>` is the `name` from `devy.yml`, or `project` when it is unset.
-2. Run the `before_up` hook.
-3. Ensure the package manager is available.
-4. Load `devy.lock`. This happens even with `--update`.
-5. Validate each dependency's configuration.
-6. Pin versions from the lock (unless `--update`), resolve service ports, and fail on port conflicts.
-7. Install dependencies (phase 1).
-8. Write `devy.lock`.
-9. Write the shell environment.
-10. Report orphaned lock entries.
-11. Start services (phase 2).
-12. Run the `after_up` hook.
-13. Print `✓ <name> is ready`.
+1. Print the header `devy up · <name>`, where `<name>` is the `name` from `devy.yml` with control characters stripped, or `project` when it is unset.
+2. Check project trust, prompting or failing as defined in project-trust.
+3. Check that devy-managed paths (`.devy/`, `.shadowenv.d/`, the virtualenv) are not symlinks or tracked by git, as defined in filesystem-safety.
+4. Run the `before_up` hook.
+5. Ensure the package manager is available.
+6. Load `devy.lock`. This happens even with `--update`.
+7. Validate each dependency's configuration.
+8. Pin versions from the lock (unless `--update`), resolve service ports, and fail on port conflicts.
+9. Install dependencies (phase 1).
+10. Write `devy.lock`, and update the trust record to match it.
+11. Write the shell environment.
+12. Report orphaned lock entries.
+13. Start services (phase 2).
+14. Run the `after_up` hook.
+15. Print `✓ <name> is ready`.
 
 A failure in any step SHALL abort the remaining steps. Each hook run SHALL be preceded by a `Hooks` header.
 
@@ -36,6 +38,10 @@ A failure in any step SHALL abort the remaining steps. Each hook run SHALL be pr
 #### Scenario: Successful run
 - **WHEN** every step succeeds
 - **THEN** the final line is `✓ <name> is ready`
+
+#### Scenario: Untrusted project stops before hooks
+- **WHEN** the project is not trusted and the user declines the prompt
+- **THEN** the `before_up` hook does not run and nothing is installed
 
 ### Requirement: Lock write
 `devy up` SHALL build the lock from every dependency after phase 1, before the environment is written and before any service starts. It SHALL do this even when there are no dependencies, so the first `devy up` in a project with none creates a `devy.lock` with an empty `dependencies` map. When the new lock equals the existing one, devy SHALL leave the file untouched. Otherwise it SHALL write it and print `✓ Lock file written to devy.lock`.

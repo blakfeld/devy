@@ -24,6 +24,57 @@ use std::path::PathBuf;
 use crate::config::{Dependency, DevyConfig, PackageManagerChoice};
 use crate::modules::LaunchSpec;
 
+/// Standard system directories a tool is looked for in when it is not on PATH outside the
+/// project (e.g. a minimal service-manager environment).
+#[cfg(unix)]
+const SYSTEM_TOOL_DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin"];
+#[cfg(not(unix))]
+const SYSTEM_TOOL_DIRS: &[&str] = &[];
+
+/// Resolves a system tool devy runs by name (`docker`, `podman`, `systemctl`,
+/// `journalctl`): the first match on PATH outside the project, else the first standard
+/// system directory that has it. Never a bare name, which `Command` would resolve against
+/// the full PATH — where an activated project environment (or `devy exec`) can put a
+/// repository's own `bin` first. An absolute `name` is returned as is.
+pub(crate) fn system_tool(name: &str) -> Option<PathBuf> {
+    system_tool_in(
+        name,
+        crate::fs_safe::which_outside_project(name),
+        SYSTEM_TOOL_DIRS,
+    )
+}
+
+/// `system_tool` with the PATH lookup result and the fallback directories injected.
+fn system_tool_in(name: &str, on_path: Option<PathBuf>, dirs: &[&str]) -> Option<PathBuf> {
+    let path = std::path::Path::new(name);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    on_path.or_else(|| {
+        dirs.iter()
+            .map(|d| std::path::Path::new(d).join(name))
+            .find(|p| p.is_file())
+    })
+}
+
+/// `system_tool`, or an error naming the tool when it can't be found.
+pub(crate) fn require_system_tool(name: &str) -> Result<PathBuf> {
+    system_tool(name)
+        .ok_or_else(|| anyhow::anyhow!("{}", not_found_message(name, SYSTEM_TOOL_DIRS)))
+}
+
+/// The error for a system tool found neither on PATH outside the project nor in `dirs`.
+fn not_found_message(name: &str, dirs: &[&str]) -> String {
+    if dirs.is_empty() {
+        format!("Failed to run `{name}`: it was not found on PATH (outside the project)")
+    } else {
+        format!(
+            "Failed to run `{name}`: it was not found on PATH (outside the project) or in {}",
+            dirs.join(", ")
+        )
+    }
+}
+
 /// Where a service's log output can be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogSource {
@@ -380,6 +431,7 @@ impl PackageManager for MockPackageManager {
 mod tests {
     use super::*;
     use crate::config::Dependency;
+    use serde_norway as yaml;
 
     struct AvailablePm;
     impl PackageManager for AvailablePm {
@@ -468,7 +520,7 @@ mod tests {
     fn detect_auto_warns_only_when_a_dependency_uses_the_package_manager() {
         let root = std::path::Path::new("/tmp");
         let warnings = |yaml: &str| {
-            let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+            let config: DevyConfig = yaml::from_str(yaml).unwrap();
             crate::output::with_warn_messages(|| {
                 detect(&config, root).unwrap();
             })
@@ -565,6 +617,40 @@ mod tests {
             LogCommandKind::SystemJournal {
                 unit: "redis-server".into()
             }
+        );
+    }
+
+    #[test]
+    fn system_tool_skips_project_paths_and_never_returns_a_bare_name() {
+        let sys = crate::test_support::tmp_dir();
+        std::fs::write(sys.join("devy-tool"), "").unwrap();
+        let sys_dir = sys.to_str().unwrap();
+        // Absolute names are kept; a PATH hit wins; otherwise a system dir; else none.
+        #[cfg(unix)]
+        assert_eq!(
+            system_tool_in("/bin/launchctl", None, &[]),
+            Some(PathBuf::from("/bin/launchctl"))
+        );
+        assert_eq!(
+            system_tool_in("devy-tool", Some("/x/devy-tool".into()), &[sys_dir]),
+            Some(PathBuf::from("/x/devy-tool"))
+        );
+        assert_eq!(
+            system_tool_in("devy-tool", None, &[sys_dir]),
+            Some(sys.join("devy-tool"))
+        );
+        assert_eq!(system_tool_in("devy-missing-tool", None, &[sys_dir]), None);
+        let err = require_system_tool("devy-no-such-tool-xyz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`devy-no-such-tool-xyz`"), "{err}");
+        assert_eq!(
+            not_found_message("t", &["/usr/bin", "/bin"]),
+            "Failed to run `t`: it was not found on PATH (outside the project) or in /usr/bin, /bin"
+        );
+        assert_eq!(
+            not_found_message("t", &[]),
+            "Failed to run `t`: it was not found on PATH (outside the project)"
         );
     }
 }

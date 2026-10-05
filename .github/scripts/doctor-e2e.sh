@@ -9,7 +9,10 @@ set -euo pipefail
 
 DEVY=$1
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# A trust store of our own, so the run never touches the user's.
+STATE=$(mktemp -d)
+export XDG_STATE_HOME="$STATE"
+trap 'rm -rf "$WORK" "$STATE"' EXIT
 cd "$WORK"
 git init -q
 
@@ -35,6 +38,8 @@ dependencies:
     assigned_port: 16399
 EOF
 
+# devy runs a project's code only once it is allowed.
+"$DEVY" allow
 if "$DEVY" up > up.out 2> up.err; then
   echo "devy up should have failed on the port conflict" >&2
   exit 1
@@ -58,6 +63,8 @@ package_manager: nix
 dependencies:
   - jq
 EOF
+# devy.yml changed, so the project must be allowed again.
+"$DEVY" allow
 "$DEVY" up
 test ! -e .devy/last-up-failure.json
 echo "doctor e2e passed"

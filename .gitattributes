@@ -1,3 +1,6 @@
 # Templates devy embeds with include_str! and writes into projects: keep them LF on every
 # checkout so a Windows build writes the same bytes as a Unix one.
 src/commands/agent_setup/*.md text eol=lf
+
+# Captured shadowenv init output the shell hook tests run: keep it byte for byte.
+tests/fixtures/shadowenv-init/* text eol=lf

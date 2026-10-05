@@ -51,6 +51,9 @@ impl Module for MongodbModule {
         data_dir: &std::path::Path,
     ) -> Result<Option<super::LaunchSpec>> {
         let p = port(dep)?;
+        // mongod's Unix socket would otherwise be `/tmp/mongodb-<port>.sock`, shared with
+        // every other user on the machine; keep it in the private socket dir instead.
+        let sockets = super::socket_dir(data_dir, &format!("mongodb-{p}.sock"))?;
         Ok(Some(super::LaunchSpec::new(
             "mongod",
             [
@@ -60,6 +63,8 @@ impl Module for MongodbModule {
                 "127.0.0.1".into(),
                 "--dbpath".into(),
                 super::path_arg(data_dir),
+                "--unixSocketPrefix".into(),
+                super::path_arg(&sockets),
             ],
         )))
     }
@@ -131,6 +136,21 @@ impl Module for MongodbModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nix_launch_keeps_the_unix_socket_out_of_tmp() {
+        let dir = crate::test_support::tmp_dir();
+        let spec = MongodbModule
+            .nix_launch(&Dependency::simple("mongodb"), &dir)
+            .unwrap()
+            .unwrap();
+        let i = spec
+            .args
+            .iter()
+            .position(|a| a == "--unixSocketPrefix")
+            .expect("--unixSocketPrefix is passed");
+        assert_eq!(spec.args[i + 1], super::super::path_arg(&dir));
+    }
 
     #[test]
     fn mongodb_module_is_service() {

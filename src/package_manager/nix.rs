@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 
 use super::PackageManager;
 use crate::config::Dependency;
+use crate::installers;
 use crate::modules::{LaunchSpec, SeedDir};
 use crate::output;
 
@@ -25,10 +26,11 @@ enum NixStyle {
     Env,
 }
 
-/// Searches PATH then well-known Nix installation directories for a binary.
+/// Searches PATH (ignoring entries inside the project root) then well-known Nix
+/// installation directories for a binary.
 /// Returns `None` only if the binary cannot be found anywhere.
 fn find_nix_binary(name: &str) -> Option<PathBuf> {
-    if let Ok(p) = which::which(name) {
+    if let Some(p) = crate::fs_safe::which_outside_project(name) {
         return Some(p);
     }
     // Standard paths for Nix installations that may not be on PATH in non-login shells:
@@ -50,9 +52,12 @@ fn find_nix_binary(name: &str) -> Option<PathBuf> {
         .find(|p| p.exists())
 }
 
-/// Resolves a Nix binary by name, falling back to the bare name if not found.
+/// Resolves a Nix binary by name, falling back to its Determinate/multi-user location
+/// when not found. Never a bare name: `Command` would search the full PATH, including
+/// the project directories `find_nix_binary` skips.
 fn resolve_nix_binary(name: &str) -> PathBuf {
-    find_nix_binary(name).unwrap_or_else(|| PathBuf::from(name))
+    find_nix_binary(name)
+        .unwrap_or_else(|| PathBuf::from(format!("/nix/var/nix/profiles/default/bin/{name}")))
 }
 
 impl NixPackageManager {
@@ -68,6 +73,11 @@ impl NixPackageManager {
 
     fn profile_bin(&self) -> PathBuf {
         self.profile_path.join("bin")
+    }
+
+    /// The project root (`profile_path` is `<root>/.devy/nix-profile`).
+    fn project_root(&self) -> Option<&Path> {
+        self.profile_path.parent().and_then(Path::parent)
     }
 
     /// Resolves the `nix` binary on every call so post-bootstrap installs are
@@ -291,11 +301,7 @@ fn read_env_manifest(path: &Path) -> EnvManifest {
 /// Writes `manifest` to a temp file beside `path`, then renames it into place.
 fn write_env_manifest(path: &Path, manifest: &EnvManifest) -> Result<()> {
     let body = serde_json::to_vec_pretty(manifest).context("Failed to serialize nix-env attrs")?;
-    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
-    std::fs::write(&tmp, body).with_context(|| format!("Failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("Failed to write {}", path.display()))
+    crate::fs_safe::write_atomic(path, &body, 0o644)
 }
 
 /// Finds the `nix-env -q --json` entry for nixpkgs attribute `attr`: `Some` when it's
@@ -387,6 +393,42 @@ fn program_arguments(launch: &LaunchSpec, exec_dir: &Path) -> Vec<String> {
     std::iter::once(exec_dir.join(&launch.exec).to_string_lossy().into_owned())
         .chain(launch.args.iter().cloned())
         .collect()
+}
+
+/// Refuses a unit whose command line, environment or working directory holds a control
+/// character. Unit files are line-oriented (systemd also ends a line at a lone `\r` or
+/// NUL), so one in a devy.yml value such as a password — or in the project path that
+/// becomes `WorkingDirectory=` — could otherwise inject directives. Errors name the
+/// variable or argument position, never the value.
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+fn ensure_no_control_chars(
+    program: &[String],
+    env: &[(String, String)],
+    working_dir: Option<&Path>,
+) -> Result<()> {
+    if working_dir.is_some_and(|d| d.to_string_lossy().chars().any(char::is_control)) {
+        bail!("service working directory contains a control character (newline, CR, NUL, …)");
+    }
+    if let Some(i) = program.iter().position(|a| a.chars().any(char::is_control)) {
+        bail!("service argument {i} contains a control character (newline, CR, NUL, …)");
+    }
+    if let Some((k, _)) = env
+        .iter()
+        .find(|(k, v)| k.chars().any(char::is_control) || v.chars().any(char::is_control))
+    {
+        bail!(
+            "service environment variable {} contains a control character (newline, CR, NUL, …)",
+            k.escape_debug()
+        );
+    }
+    Ok(())
+}
+
+/// Writes a unit or plist readable only by the user: it can hold credentials from
+/// devy.yml (MinIO keys, the Meilisearch master key).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_private_unit(path: &Path, contents: &str) -> Result<()> {
+    crate::fs_safe::write_atomic(path, contents.as_bytes(), 0o600)
 }
 
 /// The launch environment plus a PATH that finds the project profile's binaries first,
@@ -518,7 +560,8 @@ fn seed_dir(from: &Path, seed: &SeedDir) -> Result<()> {
         }
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("could not read {}", file.display()))?;
-        std::fs::write(&file, text.replace(&rewrite.from, &rewrite.to))
+        let rewritten = text.replace(&rewrite.from, &rewrite.to);
+        crate::fs_safe::write_atomic(&file, rewritten.as_bytes(), 0o644)
             .with_context(|| format!("could not write {}", file.display()))?;
     }
     std::fs::rename(&staging, to)
@@ -629,10 +672,11 @@ fn launchagent_path(name: &str) -> Result<PathBuf> {
     Ok(launchagent_dir()?.join(format!("sh.devy.{name}.plist")))
 }
 
-/// Where the launchd agent for `name` writes stdout and stderr: `$TMPDIR/devy-<name>.log`.
+/// Where the launchd agent for `name` writes stdout and stderr: `<name>.log` in devy's
+/// private per-user directory (`fs_safe::user_dir`), which `write_launchagent` creates.
 #[cfg(any(test, target_os = "macos"))]
 fn launchagent_log_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("devy-{name}.log"))
+    crate::fs_safe::user_dir_path().join(format!("{name}.log"))
 }
 
 /// The user journal of the systemd unit for `name`, which has no log file of its own.
@@ -668,21 +712,30 @@ fn write_launchagent(
 ) -> Result<()> {
     let dir = launchagent_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    // launchd opens the log file as the user; its directory must be private to them.
+    crate::fs_safe::user_dir()?;
 
+    let program = program_arguments(launch, exec_dir);
+    let env = unit_environment(launch, profile_bin);
+    ensure_no_control_chars(&program, &env, launch.working_dir.as_deref())?;
     let plist = launchagent_plist(
         &format!("sh.devy.{name}"),
-        &program_arguments(launch, exec_dir),
-        &unit_environment(launch, profile_bin),
+        &program,
+        &env,
         launch.working_dir.as_deref(),
         &launchagent_log_path(name),
     );
-    let path = launchagent_path(name)?;
-    std::fs::write(&path, plist).with_context(|| format!("Failed to write {}", path.display()))
+    write_private_unit(&launchagent_path(name)?, &plist)
 }
+
+/// launchctl's fixed, SIP-protected location: never looked up on PATH, where a project
+/// environment could shadow it.
+#[cfg(target_os = "macos")]
+const LAUNCHCTL: &str = "/bin/launchctl";
 
 #[cfg(target_os = "macos")]
 fn launchctl(args: &[&str]) -> Result<()> {
-    let status = Command::new("launchctl")
+    let status = Command::new(LAUNCHCTL)
         .args(args)
         .status()
         .context("Failed to run launchctl")?;
@@ -695,7 +748,7 @@ fn launchctl(args: &[&str]) -> Result<()> {
 /// Whether launchd knows the agent at all (loaded), running or not.
 #[cfg(target_os = "macos")]
 fn is_loaded_macos(name: &str) -> bool {
-    Command::new("launchctl")
+    Command::new(LAUNCHCTL)
         .args(["list", &format!("sh.devy.{name}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -707,7 +760,7 @@ fn is_loaded_macos(name: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn is_running_macos(name: &str) -> Result<bool> {
     let label = format!("sh.devy.{name}");
-    let out = Command::new("launchctl")
+    let out = Command::new(LAUNCHCTL)
         .args(["list", &label])
         .output()
         .context("Failed to run launchctl list")?;
@@ -767,6 +820,9 @@ fn systemd_quote(s: &str, exec: bool) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
+            // systemd also ends a line at a lone CR; callers reject control characters,
+            // but never emit a raw one.
+            '\r' => out.push_str("\\r"),
             '%' => out.push_str("%%"),
             '$' if exec => out.push_str("$$"),
             c => out.push(c),
@@ -838,19 +894,23 @@ fn write_systemd_unit(
     let dir = systemd_user_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create {}", dir.display()))?;
 
-    let unit = systemd_unit(
-        name,
-        &program_arguments(launch, exec_dir),
-        &unit_environment(launch, profile_bin),
-        launch.working_dir.as_deref(),
-    );
-    let path = systemd_unit_path(name)?;
-    std::fs::write(&path, unit).with_context(|| format!("Failed to write {}", path.display()))
+    let program = program_arguments(launch, exec_dir);
+    let env = unit_environment(launch, profile_bin);
+    ensure_no_control_chars(&program, &env, launch.working_dir.as_deref())?;
+    let unit = systemd_unit(name, &program, &env, launch.working_dir.as_deref());
+    write_private_unit(&systemd_unit_path(name)?, &unit)
+}
+
+/// `systemctl` from PATH outside the project or a system directory (see
+/// `package_manager::system_tool`), never a project-local shim.
+#[cfg(target_os = "linux")]
+fn systemctl_program() -> Result<std::path::PathBuf> {
+    super::require_system_tool("systemctl")
 }
 
 #[cfg(target_os = "linux")]
 fn systemctl_user(args: &[&str]) -> Result<()> {
-    let status = Command::new("systemctl")
+    let status = Command::new(systemctl_program()?)
         .arg("--user")
         .args(args)
         .status()
@@ -864,7 +924,7 @@ fn systemctl_user(args: &[&str]) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn is_running_linux(name: &str) -> Result<bool> {
     let unit = format!("devy-{name}");
-    let status = Command::new("systemctl")
+    let status = Command::new(systemctl_program()?)
         .args(["--user", "is-active", "--quiet", &unit])
         .status()
         .context("Failed to run systemctl is-active")?;
@@ -943,6 +1003,11 @@ impl NixPackageManager {
     }
 }
 
+/// Arguments for the Determinate Systems installer: a non-interactive install.
+fn bootstrap_args() -> Vec<std::ffi::OsString> {
+    ["install", "--no-confirm"].map(Into::into).to_vec()
+}
+
 impl PackageManager for NixPackageManager {
     fn name(&self) -> &str {
         "nix"
@@ -957,24 +1022,16 @@ impl PackageManager for NixPackageManager {
     }
 
     fn bootstrap(&self) -> Result<()> {
-        output::step(
-            "Installing Nix via the Determinate Installer \
-             (https://install.determinate.systems). \
-             Transport is secured with TLS; install Nix manually: https://nixos.org/download/",
-        );
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(concat!(
-                "curl --proto '=https' --tlsv1.2 --connect-timeout 30 --max-time 300 -sSf -L ",
-                "https://install.determinate.systems/nix",
-                " | sh -s -- install --no-confirm"
-            ))
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .context("Failed to run Nix install script")?;
-
+        output::step(&format!(
+            "Installing Nix via the Determinate Installer ({}), verified against its pinned SHA-256",
+            installers::NIX.url
+        ));
+        let status = installers::run_script(
+            &installers::NIX,
+            installers::Interpreter::Sh,
+            &bootstrap_args(),
+            &[],
+        )?;
         if !status.success() {
             bail!("Nix installation failed");
         }
@@ -1060,7 +1117,14 @@ impl PackageManager for NixPackageManager {
 
     fn start_service(&self, name: &str, launch: Option<&LaunchSpec>) -> Result<()> {
         let launch = launch.ok_or_else(|| unsupported_service(name))?;
-        let profile_bin = self.profile_bin();
+        // The unit runs binaries from the profile: it must be a real link into the store,
+        // and the unit names the verified store path, so a link swapped later (e.g. by a
+        // `git pull`) isn't followed on the next restart.
+        let verified = match self.project_root() {
+            Some(root) => crate::fs_safe::verified_nix_profile(root)?,
+            None => None,
+        };
+        let profile_bin = verified.map_or_else(|| self.profile_bin(), |p| p.join("bin"));
         let package_bin = launch
             .exec_package
             .as_deref()
@@ -1112,6 +1176,13 @@ impl PackageManager for NixPackageManager {
     /// This ensures `devy up` activates the project's Nix packages without touching
     /// the user's global profile or requiring a manual PATH change.
     fn path_prepends(&self, _project_root: &Path) -> Vec<String> {
+        // A `.devy/nix-profile` that isn't a link into /nix/store never goes on PATH.
+        if let Some(root) = self.project_root()
+            && let Err(e) = crate::fs_safe::verified_nix_profile(root)
+        {
+            output::warn(&format!("{e:#}"));
+            return Vec::new();
+        }
         vec![self.profile_bin().to_string_lossy().into_owned()]
     }
 }
@@ -1122,10 +1193,10 @@ mod tests {
     use crate::package_manager::{LogCommandKind, LogSource};
 
     #[test]
-    fn launchagent_log_path_is_in_tmpdir() {
+    fn launchagent_log_path_is_in_private_user_dir() {
         assert_eq!(
             launchagent_log_path("redis"),
-            std::env::temp_dir().join("devy-redis.log")
+            crate::fs_safe::user_dir_path().join("redis.log")
         );
     }
 
@@ -1227,6 +1298,39 @@ mod tests {
                 .contains("not yet supported with the nix backend"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn ensure_no_control_chars_rejects_cr_nul_and_newline_without_echoing_value() {
+        let program = vec!["/bin/meilisearch".to_string()];
+        for bad in ["x\rExecStartPre=/bin/sh", "x\0y", "x\ny"] {
+            let env = vec![("MEILI_MASTER_KEY".to_string(), bad.to_string())];
+            let err = ensure_no_control_chars(&program, &env, None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("MEILI_MASTER_KEY"), "{err}");
+            assert!(!err.contains("ExecStartPre"), "{err}");
+        }
+        let bad_args = vec!["/bin/x".to_string(), "a\rb".to_string()];
+        assert!(ensure_no_control_chars(&bad_args, &[], None).is_err());
+        let ok_env = vec![("K".to_string(), "p@ss w\"o%rd$".to_string())];
+        assert!(ensure_no_control_chars(&program, &ok_env, Some(Path::new("/srv/app"))).is_ok());
+        let err = ensure_no_control_chars(
+            &program,
+            &ok_env,
+            Some(Path::new("/srv/app\nExecStartPre=/bin/sh")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("working directory"), "{err}");
+        assert!(!err.contains("ExecStartPre"), "{err}");
+    }
+
+    #[test]
+    fn systemd_quote_escapes_carriage_return() {
+        let q = systemd_quote("a\rb", false);
+        assert!(!q.contains('\r'));
+        assert_eq!(q, "\"a\\rb\"");
     }
 
     #[cfg(unix)]
@@ -1919,6 +2023,50 @@ mod tests {
         // fake-init exists only in exec_dir, not in the profile bin.
         run_init("mysql", &launch, &exec_dir, &profile_bin).unwrap();
         assert!(marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_runs_pinned_determinate_installer_with_install_no_confirm() {
+        use crate::installers::{self, Interpreter, test_hooks};
+        assert!(
+            installers::NIX
+                .url
+                .starts_with("https://install.determinate.systems/nix/tag/v")
+        );
+        test_hooks::clear();
+        test_hooks::serve(&installers::NIX, b"exit 0\n");
+        let result = pm_with_missing_profile().bootstrap();
+        let runs = test_hooks::runs();
+        test_hooks::clear();
+        result.unwrap();
+        assert_eq!(
+            runs,
+            vec![(
+                installers::NIX.name,
+                Interpreter::Sh,
+                vec!["install".into(), "--no-confirm".into()]
+            )]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_failure_reports_nix_installation_failed() {
+        use crate::installers::{self, test_hooks};
+        test_hooks::clear();
+        test_hooks::serve(&installers::NIX, b"exit 3\n");
+        let err = pm_with_missing_profile().bootstrap().unwrap_err();
+        test_hooks::clear();
+        assert_eq!(err.to_string(), "Nix installation failed");
+    }
+
+    #[test]
+    fn bootstrap_without_a_verified_download_fails_before_running_anything() {
+        use crate::installers::test_hooks;
+        test_hooks::clear();
+        assert!(pm_with_missing_profile().bootstrap().is_err());
+        assert!(test_hooks::runs().is_empty());
     }
 
     fn pm_with_missing_profile() -> NixPackageManager {

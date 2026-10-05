@@ -1,15 +1,14 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use which::which;
 
 use crate::config::Dependency;
 use crate::output;
 use crate::package_manager::PackageManager;
 
 use super::helpers::{stamp_matches, write_stamp};
-use super::{Module, pm_dep, run_cmd};
+use super::{Module, pm_dep};
 
 // Last updated: 2026-05 — bump when a new Ruby stable is released.
 // Check: https://www.ruby-lang.org/en/downloads/
@@ -26,10 +25,49 @@ fn rbenv_root() -> Option<String> {
     std::env::var("HOME").ok().map(|h| format!("{h}/.rbenv"))
 }
 
-fn rbenv_version_installed(version: &str) -> Result<bool> {
+/// Checks a Ruby version before it is passed to `rbenv install` or `rbenv local`.
+///
+/// Neither command accepts `--` as an end-of-options marker: `rbenv install` treats
+/// everything after `--` as configure arguments, and `rbenv local` would write `--` itself
+/// to `.ruby-version`. So instead of a separator, devy accepts only plain version names:
+/// an ASCII letter or digit followed by letters, digits, `.`, `_` or `-`. That rejects
+/// option-like values and also any path — ruby-build sources a definition argument that
+/// names an existing file, so `./x` or `../x` would run a repo-controlled script.
+/// (Config validation also checks versions; this is defense in depth.)
+fn rbenv_version_arg(version: &str) -> Result<&str> {
+    if !crate::validate::toolchain(version) {
+        anyhow::bail!("invalid Ruby version '{version}'");
+    }
+    Ok(version)
+}
+
+/// Builds an `rbenv` command for `install`/`prefix` that runs in the filesystem root, so a
+/// bare version name can never resolve to a file in the repository or in a world-writable
+/// directory such as `/tmp` (ruby-build looks for a definition file relative to the working
+/// directory first). Files in `/` are writable only by root.
+fn rbenv_outside_project(rbenv: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(rbenv);
+    cmd.args(args).current_dir(RBENV_CWD);
+    cmd
+}
+
+/// `rbenv` on PATH outside the project, or in the verified project nix profile (where the
+/// nix backend installs it), so a repository can't plant one that `devy status` or
+/// `devy check` would run (both reach `is_installed` without the trust gate).
+fn rbenv_program() -> Option<PathBuf> {
+    crate::fs_safe::which_with_project_profile("rbenv")
+}
+
+fn require_rbenv() -> Result<PathBuf> {
+    rbenv_program()
+        .context("rbenv was not found on PATH outside the project or in the project's nix profile")
+}
+
+const RBENV_CWD: &str = "/";
+
+fn rbenv_version_installed(rbenv: &Path, version: &str) -> Result<bool> {
     use std::process::Stdio;
-    let status = Command::new("rbenv")
-        .args(["prefix", version])
+    let status = rbenv_outside_project(rbenv, &["prefix", rbenv_version_arg(version)?])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -42,7 +80,9 @@ pub(crate) fn rbenv_has_any_version(stdout: &str) -> bool {
 }
 
 fn rbenv_local() -> Option<String> {
-    let out = Command::new("rbenv").arg("local").output().ok()?;
+    // `rbenv local` reads `.ruby-version` in the working directory, so this one runs in the
+    // project; the program itself still comes from outside it.
+    let out = Command::new(rbenv_program()?).arg("local").output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -64,6 +104,15 @@ impl Module for RubyModule {
         Some("rbenv")
     }
 
+    /// winget installs RubyInstaller; elsewhere rbenv builds Ruby, after the backend
+    /// installs rbenv (and ruby-build, with `sudo apt-get`) when it is missing.
+    fn install_route(&self, backend: &str) -> String {
+        match backend {
+            "winget" => backend.to_string(),
+            _ => format!("rbenv via {backend}"),
+        }
+    }
+
     fn nix_attr(&self, _dep: &Dependency) -> Option<String> {
         Some("ruby".to_string())
     }
@@ -72,14 +121,13 @@ impl Module for RubyModule {
         if pm.name() == "winget" {
             return pm.is_package_installed(&pm_dep(dep, &winget_package_id(dep)));
         }
-        if which("rbenv").is_err() {
+        let Some(rbenv) = rbenv_program() else {
             return Ok(false);
-        }
+        };
         match &dep.version {
-            Some(v) => rbenv_version_installed(v),
+            Some(v) => rbenv_version_installed(&rbenv, v),
             None => {
-                let out = Command::new("rbenv")
-                    .args(["versions", "--bare"])
+                let out = rbenv_outside_project(&rbenv, &["versions", "--bare"])
                     .output()
                     .context("Failed to run `rbenv versions --bare`")?;
                 Ok(out.status.success()
@@ -93,7 +141,7 @@ impl Module for RubyModule {
             return pm.install_package(&pm_dep(dep, &winget_package_id(dep)));
         }
 
-        if which("rbenv").is_err() {
+        if rbenv_program().is_none() {
             match pm.name() {
                 "apt" => {
                     pm.install_package(&Dependency::simple("rbenv"))?;
@@ -106,7 +154,16 @@ impl Module for RubyModule {
         }
 
         let version = dep.version.as_deref().unwrap_or(DEFAULT_RUBY_VERSION);
-        run_cmd("rbenv", &["install", "--skip-existing", version])?;
+        let args = ["install", "--skip-existing", rbenv_version_arg(version)?];
+        let status = rbenv_outside_project(&require_rbenv()?, &args)
+            .status()
+            .context("Failed to start `rbenv`")?;
+        if !status.success() {
+            anyhow::bail!(
+                "`rbenv {}` failed — check the output above for details",
+                args.join(" ")
+            );
+        }
         Ok(())
     }
 
@@ -128,13 +185,21 @@ impl Module for RubyModule {
             .unwrap_or_default()
     }
 
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        super::helpers::step_if_exists(
+            project_root,
+            "Gemfile",
+            "bundle install (Gemfile, gem native extensions)",
+        )
+    }
+
     fn post_setup(
         &self,
         dep: &Dependency,
         _pm: &dyn PackageManager,
         project_root: &Path,
     ) -> Result<()> {
-        if which("rbenv").is_ok() {
+        if let Some(rbenv) = rbenv_program() {
             let version_to_set = match dep.version.as_deref() {
                 Some(v) => Some(v),
                 None => {
@@ -146,8 +211,8 @@ impl Module for RubyModule {
                 }
             };
             if let Some(version) = version_to_set {
-                let status = Command::new("rbenv")
-                    .args(["local", version])
+                let status = Command::new(&rbenv)
+                    .args(["local", rbenv_version_arg(version)?])
                     .current_dir(project_root)
                     .status()
                     .with_context(|| format!("Failed to run `rbenv local {version}`"))?;
@@ -194,13 +259,14 @@ impl Module for RubyModule {
         if !status.success() {
             anyhow::bail!("`bundle install` failed — check the output above for details");
         }
-        std::fs::create_dir_all(
+        crate::fs_safe::ensure_dir_in(
+            project_root,
             stamp_path
                 .parent()
                 .expect(".bundle/.devy_stamp always has a parent"),
         )
         .context("Failed to create .bundle directory for stamp")?;
-        write_stamp(&stamp_path, &manifest);
+        write_stamp(&stamp_path, &manifest)?;
         output::success("bundle install complete");
         Ok(())
     }
@@ -225,6 +291,57 @@ impl Module for RubyModule {
 mod tests {
     use super::*;
     use crate::package_manager::MockPackageManager;
+    use which::which;
+
+    #[test]
+    fn rbenv_version_arg_accepts_versions() {
+        assert_eq!(rbenv_version_arg("3.3.6").unwrap(), "3.3.6");
+        assert_eq!(rbenv_version_arg("system").unwrap(), "system");
+    }
+
+    #[test]
+    fn rbenv_version_arg_accepts_named_versions() {
+        assert!(rbenv_version_arg("jruby-9.4.5.0").is_ok());
+        assert!(rbenv_version_arg("3.4.0-preview1").is_ok());
+        assert!(rbenv_version_arg("truffleruby_24").is_ok());
+    }
+
+    #[test]
+    fn rbenv_version_arg_rejects_option_like_values() {
+        assert!(rbenv_version_arg("--unset").is_err());
+        assert!(rbenv_version_arg("-f").is_err());
+        assert!(rbenv_version_arg("").is_err());
+    }
+
+    #[test]
+    fn rbenv_version_arg_rejects_paths() {
+        for v in [
+            "./x",
+            "/tmp/x",
+            "../x",
+            "3.3.6/../x",
+            ".hidden",
+            "a\\b",
+            "3.3 6",
+        ] {
+            assert!(rbenv_version_arg(v).is_err(), "{v} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rbenv_install_runs_outside_the_project() {
+        let cmd = rbenv_outside_project(
+            Path::new("/usr/local/bin/rbenv"),
+            &["install", "--skip-existing", "3.3.6"],
+        );
+        assert_eq!(cmd.get_program(), "/usr/local/bin/rbenv");
+        let cwd = cmd.get_current_dir().expect("cwd must be set");
+        assert_eq!(cwd, std::path::Path::new("/"));
+        assert_ne!(cwd, std::env::temp_dir());
+        assert_ne!(cwd, std::env::current_dir().unwrap());
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["install", "--skip-existing", "3.3.6"]);
+    }
 
     // ── rbenv_has_any_version ─────────────────────────────────────────────────
 
@@ -399,7 +516,9 @@ mod tests {
         };
         let pm = MockPackageManager::default();
         // Only assert if the version is actually installed — this is an environment check.
-        if rbenv_version_installed(DEFAULT_RUBY_VERSION).unwrap_or(false) {
+        if rbenv_program().is_some_and(|rbenv| {
+            rbenv_version_installed(&rbenv, DEFAULT_RUBY_VERSION).unwrap_or(false)
+        }) {
             RubyModule.post_setup(&dep, &pm, &dir).unwrap();
             let content = std::fs::read_to_string(dir.join(".ruby-version"))
                 .expect(".ruby-version must be written by post_setup");

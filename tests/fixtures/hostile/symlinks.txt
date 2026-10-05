@@ -1,0 +1,14 @@
+# Symlinks the test creates in its copy of tree/ (git cannot portably commit them).
+# Format: <link path in the project> <target, relative to the test's outside dir>
+# A `{a..b}` range in the link path expands to one link per number.
+README.md credentials
+.env.example credentials
+.venv/.devy_stamp victim
+.devy_bun_stamp victim
+.devy_node_local_stamp victim
+.devy_node_global_stamp victim
+.devy_gcloud_components_stamp victim
+devy.lock.{0..1999}.tmp victim
+.devy.lock.{0..49}.tmp victim
+.devy-lock sentinel/created-by-devy
+.devy sentinel/devy-dir

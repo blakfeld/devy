@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use colored::Colorize;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{Dependency, DevyConfig};
 use crate::modules;
+use crate::output::{clean, clean_line, clean_log};
 use crate::package_manager::{self, LogCommand, LogCommandKind, LogSource};
 use crate::service_runner::docker::ContainerRuntime;
 use crate::service_runner::{Runners, ServiceRunner};
@@ -66,6 +67,8 @@ pub fn run(opts: Options) -> Result<()> {
             .context("Failed to install the Ctrl-C handler")?;
     }
     let stdout = std::io::stdout();
+    // Log text keeps its colors only on a terminal; every other escape is always removed.
+    let tty = stdout.is_terminal();
     let result = logs_impl(
         &config,
         &project_root,
@@ -73,6 +76,7 @@ pub fn run(opts: Options) -> Result<()> {
         &opts,
         &mut stdout.lock(),
         &INTERRUPTED,
+        tty,
     );
     // A closed pipe (e.g. `| head`) just ends the output early.
     match result {
@@ -87,6 +91,7 @@ fn is_broken_pipe(e: &anyhow::Error) -> bool {
 }
 
 /// Shows the logs `opts` asks for on `out`. Follow mode runs until `stop` is set.
+/// Log text is cleaned of terminal control sequences; `tty` keeps SGR colors.
 pub(crate) fn logs_impl(
     config: &DevyConfig,
     project_root: &Path,
@@ -94,6 +99,7 @@ pub(crate) fn logs_impl(
     opts: &Options,
     out: &mut dyn Write,
     stop: &AtomicBool,
+    tty: bool,
 ) -> Result<()> {
     let (services, single) = match &opts.name {
         Some(name) => (vec![service::resolve_dep(config, name)?], true),
@@ -123,14 +129,15 @@ pub(crate) fn logs_impl(
     }
 
     if opts.follow {
-        return follow(&sources, single, opts.lines, out, stop);
+        return follow(&sources, single, opts.lines, out, stop, tty);
     }
     for (dep, source) in &sources {
         if !single {
-            writeln!(out, "\n{}", dep.name.bold())?;
+            writeln!(out, "\n{}", clean_line(&dep.name).as_ref().bold())?;
         }
         match collect(source, opts.lines, None)? {
             Tail::Text(text) => {
+                let text = clean_log(&text, tty);
                 out.write_all(text.as_bytes())?;
                 if !text.ends_with('\n') {
                     writeln!(out)?;
@@ -145,9 +152,9 @@ pub(crate) fn logs_impl(
     Ok(())
 }
 
-/// `· <msg>`, as `output::info` prints it.
+/// `· <msg>`, as `output::info` prints it (cleaned).
 pub(crate) fn info(out: &mut dyn Write, msg: &str) -> std::io::Result<()> {
-    writeln!(out, "  {} {}", "·".cyan(), msg)
+    writeln!(out, "  {} {}", "·".cyan(), clean(msg))
 }
 
 /// `· No logs yet for <name>`, with the expected path when the source is one file.
@@ -187,15 +194,44 @@ pub(crate) enum Tail {
     Empty,
 }
 
-/// The last `lines` lines of `dep`'s log, read through its runner as `devy logs` does.
-/// Command sources are killed after `timeout`; an unsupported backend is an error.
+/// The last `lines` lines of `dep`'s log for AI context, read through its runner as
+/// `devy logs` does but filtered by [`for_ai`]. Command sources are killed after
+/// `timeout`; an unsupported backend is an error.
 pub(crate) fn recent(
     runner: &dyn ServiceRunner,
     dep: &Dependency,
+    project_root: &Path,
     lines: u32,
     timeout: Duration,
 ) -> Result<Tail> {
-    collect(&runner.log_source(dep, lines, false)?, lines, Some(timeout))
+    let source = for_ai(runner.log_source(dep, lines, false)?, project_root)?;
+    collect(&source, lines, Some(timeout))
+}
+
+/// `source` without log files that may not go into AI context: a file inside the
+/// project must be a regular, non-symlink file (see [`crate::ai::is_context_path`]), so a
+/// committed `.devy/data/x/x.log -> ~/.ssh/id_ed25519` is never sent.
+/// When every file is dropped, that is an error rather than "no logs yet".
+pub(crate) fn for_ai(source: LogSource, project_root: &Path) -> Result<LogSource> {
+    match source {
+        LogSource::Files(paths) if !paths.is_empty() => {
+            let kept: Vec<PathBuf> = paths
+                .into_iter()
+                // A missing file reads as "no logs yet" and holds nothing to leak.
+                .filter(|p| {
+                    std::fs::symlink_metadata(p).is_err()
+                        || crate::ai::is_context_path(project_root, p)
+                })
+                .collect();
+            if kept.is_empty() {
+                bail!(
+                    "the log files are not regular files in the project (symlinks are never sent to claude)"
+                );
+            }
+            Ok(LogSource::Files(kept))
+        }
+        other => Ok(other),
+    }
 }
 
 /// Reads the last `lines` lines of `source` (built without follow). Command sources are
@@ -280,7 +316,7 @@ pub(crate) struct CmdOutput {
 
 #[cfg_attr(test, mutants::skip)] // spawns real processes
 fn capture(cmd: &LogCommand, timeout: Option<Duration>) -> Result<CmdOutput> {
-    let mut command = Command::new(&cmd.program);
+    let mut command = Command::new(crate::package_manager::require_system_tool(&cmd.program)?);
     command.args(&cmd.args).stdin(Stdio::null());
     let merged = cmd.kind == LogCommandKind::Container;
     let mut merged_reader = None;
@@ -422,7 +458,8 @@ impl FileFollower {
         }
     }
 
-    /// Complete lines written since the last poll.
+    /// Complete lines written since the last poll. At most `MAX_LINE` bytes of a line are
+    /// kept, so a long line without a newline cannot grow memory without bound.
     pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
         let mut file = match std::fs::File::open(&self.path) {
             Ok(f) => f,
@@ -439,15 +476,33 @@ impl FileFollower {
             return Ok(vec![]);
         }
         file.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = Vec::new();
-        (&mut file).take(len - self.offset).read_to_end(&mut buf)?;
-        self.offset += buf.len() as u64;
-        self.partial.extend_from_slice(&buf);
+        // At most `MAX_POLL` bytes per poll; the next poll continues from `offset`.
+        let mut reader = BufReader::new((&mut file).take((len - self.offset).min(MAX_POLL)));
         let mut lines = Vec::new();
-        while let Some(i) = self.partial.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.partial.drain(..=i).collect();
-            let line = String::from_utf8_lossy(&line[..i]);
-            lines.push(line.strip_suffix('\r').unwrap_or(&line).to_string());
+        loop {
+            let buf = match reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if buf.is_empty() {
+                break;
+            }
+            let (chunk, used) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (&buf[..i], i + 1),
+                None => (buf, buf.len()),
+            };
+            let room = MAX_LINE.saturating_sub(self.partial.len());
+            self.partial
+                .extend_from_slice(&chunk[..chunk.len().min(room)]);
+            let newline = used > chunk.len();
+            reader.consume(used);
+            self.offset += used as u64;
+            if newline {
+                let line = String::from_utf8_lossy(&self.partial);
+                lines.push(line.strip_suffix('\r').unwrap_or(&line).to_string());
+                self.partial.clear();
+            }
         }
         Ok(lines)
     }
@@ -461,12 +516,13 @@ fn follow(
     lines: u32,
     out: &mut dyn Write,
     stop: &AtomicBool,
+    tty: bool,
 ) -> Result<()> {
     let prefix = |name: &str| {
         if single {
             String::new()
         } else {
-            format!("{name} | ")
+            format!("{} | ", clean_line(name))
         }
     };
 
@@ -480,7 +536,7 @@ fn follow(
                     .with_context(|| format!("Failed to read {}", path.display()))?;
                 any |= !tail.is_empty();
                 for line in tail {
-                    writeln!(out, "{}{line}", prefix(&dep.name))?;
+                    writeln!(out, "{}{}", prefix(&dep.name), clean_log(&line, tty))?;
                 }
                 followers.push((prefix(&dep.name), FileFollower::new(path.clone(), len)));
             }
@@ -516,13 +572,14 @@ fn follow(
                 let LogSource::Command(cmd) = source else {
                     continue;
                 };
-                let mut child = Command::new(&cmd.program)
-                    .args(&cmd.args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .with_context(|| format!("Failed to run `{}`", cmd.program))?;
+                let mut child =
+                    Command::new(crate::package_manager::require_system_tool(&cmd.program)?)
+                        .args(&cmd.args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .with_context(|| format!("Failed to run `{}`", cmd.program))?;
                 let pipes: [Box<dyn Read + Send>; 2] = [
                     Box::new(child.stdout.take().expect("stdout is piped")),
                     Box::new(child.stderr.take().expect("stderr is piped")),
@@ -532,7 +589,8 @@ fn follow(
                     let tx = tx.clone();
                     let prefix = prefix(&dep.name);
                     scope.spawn(move || {
-                        for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                        let mut reader = BufReader::new(pipe);
+                        while let Some(line) = read_line_lossy(&mut reader) {
                             if tx.send((prefix.clone(), line)).is_err() {
                                 return;
                             }
@@ -541,7 +599,7 @@ fn follow(
                 }
             }
             drop(tx);
-            print_until_stopped(&rx, out, stop)
+            print_until_stopped(&rx, out, stop, tty)
         };
         let result = streamed();
         // Ends the file pollers and the commands, so their threads finish.
@@ -571,16 +629,60 @@ fn follow(
     }
 }
 
+/// Longest line kept from a followed log command; the rest of a longer line is dropped.
+const MAX_LINE: usize = 64 * 1024;
+
+/// Most bytes one `FileFollower::poll` reads, bounding the lines it holds at once.
+const MAX_POLL: u64 = 8 * 1024 * 1024;
+
+/// Reads one line (without its `\n` / `\r\n`), decoding invalid UTF-8 lossily so a
+/// binary byte does not end the stream, and keeping at most `MAX_LINE` bytes of it.
+/// `None` at end of input or on a read error.
+fn read_line_lossy(reader: &mut dyn BufRead) -> Option<String> {
+    let mut line = Vec::new();
+    let mut any = false;
+    loop {
+        let buf = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        if buf.is_empty() {
+            break;
+        }
+        any = true;
+        let (chunk, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (&buf[..i], i + 1),
+            None => (buf, buf.len()),
+        };
+        let room = MAX_LINE.saturating_sub(line.len());
+        line.extend_from_slice(&chunk[..chunk.len().min(room)]);
+        let found = done > chunk.len();
+        reader.consume(done);
+        if found {
+            break;
+        }
+    }
+    if !any {
+        return None;
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
 /// Writes received lines until `stop` is set or every sender is gone.
 fn print_until_stopped(
     rx: &mpsc::Receiver<(String, String)>,
     out: &mut dyn Write,
     stop: &AtomicBool,
+    tty: bool,
 ) -> Result<()> {
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(POLL) {
             Ok((prefix, line)) => {
-                writeln!(out, "{prefix}{line}")?;
+                writeln!(out, "{prefix}{}", clean_log(&line, tty))?;
                 out.flush()?;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -654,6 +756,17 @@ mod tests {
 
     /// Runs `logs_impl` for `deps` with services logging into `dir`.
     fn run_logs(dir: &Path, pm_name: &'static str, deps: &[&str], o: &Options) -> Result<String> {
+        run_logs_on(dir, pm_name, deps, o, false)
+    }
+
+    /// `run_logs`, as if stdout were a terminal when `tty`.
+    fn run_logs_on(
+        dir: &Path,
+        pm_name: &'static str,
+        deps: &[&str],
+        o: &Options,
+        tty: bool,
+    ) -> Result<String> {
         let pm = FilesPm {
             name: pm_name,
             dir: dir.to_path_buf(),
@@ -667,8 +780,111 @@ mod tests {
             o,
             &mut out,
             &AtomicBool::new(false),
+            tty,
         )?;
         Ok(String::from_utf8(out).unwrap())
+    }
+
+    // ── terminal sanitization ────────────────────────────────────────────────
+
+    const HOSTILE_LOG: &str = "\x1b[31mred\x1b[0m \x1b]52;c;ZWNobyBoaQ==\x07\x1b]8;;https://x.example\x1b\\link\x1b]8;;\x1b\\\x1b[2J\x1b[1;1Hend\n";
+
+    #[test]
+    fn logs_keep_sgr_but_strip_other_escapes_on_a_tty() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("redis.log"), HOSTILE_LOG).unwrap();
+        let o = opts(Some("redis"), 10, false);
+        let out = run_logs_on(&dir, "nix", &["redis"], &o, true).unwrap();
+        assert_eq!(out, "\x1b[31mred\x1b[0m linkend\x1b[0m\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn for_ai_drops_symlinked_project_log_files() {
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        std::fs::write(outside.join("id_ed25519"), "PRIVATE\n").unwrap();
+        std::fs::write(outside.join("system.log"), "ok\n").unwrap();
+        std::fs::write(dir.join("real.log"), "ok\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("id_ed25519"), dir.join("pg.log")).unwrap();
+        let source = LogSource::Files(vec![
+            dir.join("real.log"),
+            dir.join("pg.log"),
+            outside.join("system.log"),
+        ]);
+        assert_eq!(
+            for_ai(source, &dir).unwrap(),
+            LogSource::Files(vec![dir.join("real.log"), outside.join("system.log")])
+        );
+        // Dropping every file is an error, not "no logs yet".
+        let only_link = LogSource::Files(vec![dir.join("pg.log")]);
+        let err = format!("{:#}", for_ai(only_link, &dir).unwrap_err());
+        assert!(err.contains("not regular files"), "{err}");
+        // A missing file is kept: it means the service has not logged yet.
+        let missing = LogSource::Files(vec![dir.join("missing.log")]);
+        assert_eq!(for_ai(missing.clone(), &dir).unwrap(), missing);
+    }
+
+    #[test]
+    fn read_line_lossy_survives_invalid_utf8_and_caps_length() {
+        let mut long = vec![b'x'; MAX_LINE + 10];
+        long.push(b'\n');
+        let mut input: Vec<u8> = b"ok\r\nbad\xff\x9bbyte\n".to_vec();
+        input.extend_from_slice(&long);
+        input.extend_from_slice(b"last");
+        let mut reader = BufReader::with_capacity(16, &input[..]);
+        assert_eq!(read_line_lossy(&mut reader).as_deref(), Some("ok"));
+        assert_eq!(
+            read_line_lossy(&mut reader).as_deref(),
+            Some("bad\u{fffd}\u{fffd}byte")
+        );
+        assert_eq!(read_line_lossy(&mut reader).unwrap().len(), MAX_LINE);
+        assert_eq!(read_line_lossy(&mut reader).as_deref(), Some("last"));
+        assert_eq!(read_line_lossy(&mut reader), None);
+    }
+
+    #[test]
+    fn unterminated_escape_in_a_tail_hides_only_its_line() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("redis.log"), "one\x1b]52;junk\ntwo\nthree\x1b]").unwrap();
+        let out = run_logs(&dir, "nix", &["redis"], &opts(Some("redis"), 10, false)).unwrap();
+        assert_eq!(out, "one\ntwo\nthree\n");
+    }
+
+    #[test]
+    fn logs_strip_every_escape_when_not_a_tty() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("redis.log"), HOSTILE_LOG).unwrap();
+        let out = run_logs(&dir, "nix", &["redis"], &opts(Some("redis"), 10, false)).unwrap();
+        assert_eq!(out, "red linkend\n");
+    }
+
+    #[test]
+    fn followed_logs_are_cleaned() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("redis.log"), HOSTILE_LOG).unwrap();
+        let pm = FilesPm {
+            name: "nix",
+            dir: dir.to_path_buf(),
+        };
+        let config = crate::test_support::make_config(&["redis"], HashMap::new());
+        // Already stopped: prints the tail and returns.
+        let stop = AtomicBool::new(true);
+        let mut out = Vec::new();
+        logs_impl(
+            &config,
+            &dir,
+            &package_runners(&pm, &dir),
+            &opts(Some("redis"), 10, true),
+            &mut out,
+            &stop,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[31mred\x1b[0m linkend\x1b[0m\n"
+        );
     }
 
     // ── tail_file ─────────────────────────────────────────────────────────────
@@ -736,6 +952,23 @@ mod tests {
         assert_eq!(f.poll().unwrap(), ["new"]);
         file.write_all(b"ial\n").unwrap();
         assert_eq!(f.poll().unwrap(), ["partial"]);
+    }
+
+    #[test]
+    fn follower_caps_long_lines_and_handles_many_short_ones() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("a.log");
+        let mut data = vec![b'x'; MAX_LINE * 2];
+        data.extend_from_slice(b"\r\nshort\r\n");
+        data.extend_from_slice(&b"y\n".repeat(20_000));
+        std::fs::write(&path, &data).unwrap();
+        let mut f = FileFollower::new(path.clone(), 0);
+        let lines = f.poll().unwrap();
+        assert_eq!(lines.len(), 20_002);
+        assert_eq!(lines[0].len(), MAX_LINE);
+        assert_eq!(lines[1], "short");
+        assert_eq!(lines[20_001], "y");
+        assert!(f.poll().unwrap().is_empty());
     }
 
     #[test]
@@ -953,6 +1186,7 @@ mod tests {
             &opts(Some("mysql"), 100, false),
             &mut Vec::new(),
             &AtomicBool::new(false),
+            false,
         )
         .unwrap_err();
         assert_eq!(err.to_string(), "no logs here");
@@ -1039,6 +1273,7 @@ mod tests {
                 &opts(None, 1, true),
                 &mut out,
                 &stop,
+                false,
             )
             .unwrap();
         });
@@ -1069,6 +1304,7 @@ mod tests {
             &opts(Some("redis"), 10, true),
             &mut out,
             &stop,
+            false,
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "r1\n");

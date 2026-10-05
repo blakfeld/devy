@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use which::which;
+use std::process::Command;
 
 use super::{LogSource, PackageManager};
 use crate::config::Dependency;
+use crate::installers;
 use crate::output;
 
 #[derive(Default)]
@@ -64,29 +64,89 @@ fn parse_brew_version(line: &str) -> Option<String> {
 /// Homebrew supports `name@major` (e.g. `node@20`) and `name@major.minor` (e.g. `python@3.14`)
 /// formula selectors. Lock-injected resolved versions have 3+ components or a build suffix
 /// (e.g. "20.11.0", "3.14.4_1") and are NOT valid formula names.
+///
+/// A version that came from devy.lock never selects a formula: the lock is untrusted input
+/// and a value like `"16"` must not silently switch the install to `node@16`.
 fn brew_formula_name(dep: &Dependency) -> String {
     match &dep.version {
-        Some(v) if is_formula_pin(v) => format!("{}@{}", dep.name, v),
+        Some(v) if !dep.version_from_lock && is_formula_pin(v) => format!("{}@{}", dep.name, v),
         _ => dep.name.clone(),
     }
 }
 
+/// `brew list --versions -- <formula>`
+fn list_versions_args(formula: &str) -> Vec<String> {
+    vec![
+        "list".into(),
+        "--versions".into(),
+        "--".into(),
+        formula.to_string(),
+    ]
+}
+
+/// `brew tap -- <tap>`
+fn tap_args(tap: &str) -> Vec<String> {
+    vec!["tap".into(), "--".into(), tap.to_string()]
+}
+
+/// `brew install -- <formula>`
+fn install_args(formula: &str) -> Vec<String> {
+    vec!["install".into(), "--".into(), formula.to_string()]
+}
+
 /// Returns true when `v` looks like a user-specified version pin rather than a resolved version.
-/// Formula pins have at most 2 dot-separated components and no build suffix (`_N`).
+/// Returns true for a Homebrew formula or cask token: `[a-z0-9][a-z0-9@._+-]*`, not ending
+/// in `.rb`, `.json`, `.tar.gz` or `.tgz` and not containing `.bottle.`. This keeps
+/// `brew install` from loading a local formula file (e.g. `./evil.rb` via a bare
+/// `evil.rb`) or a local bottle (`x.arm64_sonoma.bottle.tar.gz`) from the working directory.
+fn is_formula_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '@' | '.' | '_' | '+' | '-')
+        })
+        && ![".rb", ".json", ".tar.gz", ".tgz"]
+            .iter()
+            .any(|ext| name.ends_with(ext))
+        && !name.contains(".bottle.")
+}
+
+/// Formula pins are one or two dot-separated groups of ASCII digits.
 /// "20" → true, "3.14" → true, "8.0" → true
-/// "20.11.0" → false (3 parts), "3.14.4_1" → false (underscore), "3.14.4" → false (3 parts)
+/// "20.11.0" → false (3 parts), "3.14.4_1" → false (underscore), "evil.rb" → false,
+/// "a/b" → false — so a pin can never turn the formula into a path or a tap reference.
 fn is_formula_pin(v: &str) -> bool {
-    !v.contains('_') && v.split('.').count() <= 2
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() <= 2
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// See `Homebrew::command`.
+fn brew_command(brew: PathBuf) -> Command {
+    let mut cmd = Command::new(brew);
+    cmd.env("HOMEBREW_FORBID_PACKAGES_FROM_PATHS", "1")
+        .current_dir("/");
+    cmd
 }
 
 impl Homebrew {
     fn brew_bin(&self) -> PathBuf {
-        // Prefer the brew on PATH so brew_bin() and is_available() always agree.
-        if let Ok(path) = which("brew") {
+        self.brew_bin_with(std::env::var("HOMEBREW_PREFIX").ok())
+    }
+
+    /// `brew_bin` with the `$HOMEBREW_PREFIX` value injected.
+    fn brew_bin_with(&self, homebrew_prefix: Option<String>) -> PathBuf {
+        // Prefer the brew on PATH (outside the project) so brew_bin() and is_available()
+        // always agree.
+        if let Some(path) = crate::fs_safe::which_outside_project("brew") {
             return path;
         }
-        if let Ok(prefix) = std::env::var("HOMEBREW_PREFIX")
+        // An activated project environment can set HOMEBREW_PREFIX; never let it point
+        // devy at a brew inside the project (or relative to the current directory).
+        if let Some(prefix) = homebrew_prefix
             && !prefix.is_empty()
+            && !crate::fs_safe::is_project_local(std::path::Path::new(&prefix))
         {
             return PathBuf::from(prefix).join("bin").join("brew");
         }
@@ -97,16 +157,26 @@ impl Homebrew {
         }
     }
 
-    fn run(&self, args: &[&str]) -> Result<std::process::Output> {
-        Command::new(self.brew_bin())
-            .args(args)
+    /// A `brew` command that never loads a formula, cask or bottle from a local file
+    /// (`HOMEBREW_FORBID_PACKAGES_FROM_PATHS`) and runs from `/`, so a bare name can't
+    /// resolve to a file in the project.
+    fn command(&self) -> Command {
+        brew_command(self.brew_bin())
+    }
+
+    fn run<S: AsRef<str>>(&self, args: &[S]) -> Result<std::process::Output> {
+        let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
+        self.command()
+            .args(&args)
             .output()
             .with_context(|| format!("Failed to run: brew {}", args.join(" ")))
     }
 
-    fn run_interactive(&self, args: &[&str]) -> Result<()> {
-        let status = Command::new(self.brew_bin())
-            .args(args)
+    fn run_interactive<S: AsRef<str>>(&self, args: &[S]) -> Result<()> {
+        let args: Vec<&str> = args.iter().map(AsRef::as_ref).collect();
+        let status = self
+            .command()
+            .args(&args)
             .status()
             .with_context(|| format!("Failed to run: brew {}", args.join(" ")))?;
         if !status.success() {
@@ -119,15 +189,30 @@ impl Homebrew {
     }
 
     fn fetch_config_dir(&self, service: &str) -> Option<PathBuf> {
-        let output = Command::new(self.brew_bin())
-            .args(["--prefix", service])
+        let output = self
+            .command()
+            .args(config_prefix_args(service))
             .output()
             .ok()?;
         if !output.status.success() {
             return None;
         }
         let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Some(std::path::Path::new(&prefix).join("etc"))
+        // Never a relative (or empty) prefix, which would resolve against the cwd.
+        let prefix = std::path::Path::new(&prefix);
+        (prefix.is_absolute() && !prefix.to_string_lossy().chars().any(char::is_control))
+            .then(|| prefix.join("etc"))
+    }
+}
+
+/// `brew` arguments printing the prefix whose `etc` holds `service`'s config. brew's
+/// mysqld and mariadbd read `$(brew --prefix)/etc/my.cnf`, not the keg's `etc` (which
+/// is ignored and replaced on upgrade), and the kafka, zookeeper and rabbitmq formulae's
+/// services read `$(brew --prefix)/etc/<service>/`, so they use the global prefix.
+fn config_prefix_args(service: &str) -> Vec<&str> {
+    match service {
+        "mysql" | "mariadb" | "kafka" | "zookeeper" | "rabbitmq" => vec!["--prefix"],
+        _ => vec!["--prefix", "--", service],
     }
 }
 
@@ -141,25 +226,20 @@ impl PackageManager for Homebrew {
     }
 
     fn is_available(&self) -> bool {
-        which("brew").is_ok()
+        crate::fs_safe::which_outside_project("brew").is_some()
     }
 
     fn bootstrap(&self) -> Result<()> {
-        output::step("Bootstrapping Homebrew (fetching install script from GitHub via bash)");
-        output::warn("No hash verification is performed. See https://brew.sh for manual install.");
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(concat!(
-                "curl --connect-timeout 30 --max-time 300 -fsSL ",
-                "https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh",
-                " | bash"
-            ))
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .context("Failed to run Homebrew install script")?;
-
+        output::step(&format!(
+            "Bootstrapping Homebrew ({}), verified against its pinned SHA-256",
+            installers::HOMEBREW.url
+        ));
+        let status = installers::run_script(
+            &installers::HOMEBREW,
+            installers::Interpreter::Bash,
+            &[],
+            &[],
+        )?;
         if !status.success() {
             bail!("Homebrew installation failed");
         }
@@ -167,21 +247,32 @@ impl PackageManager for Homebrew {
     }
 
     fn is_package_installed(&self, dep: &Dependency) -> Result<bool> {
-        let pkg = brew_formula_name(dep);
-        let output = self.run(&["list", "--versions", &pkg])?;
+        let output = self.run(&list_versions_args(&brew_formula_name(dep)))?;
         Ok(output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
     }
 
     fn install_package(&self, dep: &Dependency) -> Result<()> {
+        // Dependency names are validated at config load and cannot contain `/`, so the
+        // formula name can never address a tap (`org/tap/formula`). Re-check here as
+        // defense in depth so no such name ever reaches `brew install`.
+        if dep.name.contains('/') {
+            bail!(
+                "Invalid formula name '{}': taps must be set with the `tap` field",
+                dep.name
+            );
+        }
+        if !is_formula_name(&dep.name) {
+            bail!("Invalid formula name '{}'", dep.name);
+        }
         if let Some(tap) = &dep.tap {
             validate_tap(tap)?;
-            self.run_interactive(&["tap", tap])?;
+            self.run_interactive(&tap_args(tap))?;
         }
-        self.run_interactive(&["install", &brew_formula_name(dep)])
+        self.run_interactive(&install_args(&brew_formula_name(dep)))
     }
 
     fn is_service_running(&self, name: &str) -> Result<bool> {
-        let output = self.run(&["services", "info", "--json", name])?;
+        let output = self.run(&["services", "info", "--json", "--", name])?;
         if !output.status.success() {
             return Ok(false);
         }
@@ -193,15 +284,15 @@ impl PackageManager for Homebrew {
         name: &str,
         _launch: Option<&crate::modules::LaunchSpec>,
     ) -> Result<()> {
-        self.run_interactive(&["services", "start", name])
+        self.run_interactive(&["services", "start", "--", name])
     }
 
     fn stop_service(&self, name: &str) -> Result<()> {
-        self.run_interactive(&["services", "stop", name])
+        self.run_interactive(&["services", "stop", "--", name])
     }
 
     fn resolved_version(&self, dep: &Dependency) -> Result<Option<String>> {
-        let output = self.run(&["list", "--versions", &brew_formula_name(dep)])?;
+        let output = self.run(&list_versions_args(&brew_formula_name(dep)))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let line = stdout.trim();
         // Output: "formula 1.2.3" or "formula@major 1.2.3_4" — take second token.
@@ -213,7 +304,7 @@ impl PackageManager for Homebrew {
     }
 
     fn log_source(&self, name: &str, _lines: u32, _follow: bool) -> Result<LogSource> {
-        let output = self.run(&["services", "info", "--json", name])?;
+        let output = self.run(&["services", "info", "--json", "--", name])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
@@ -232,9 +323,12 @@ impl PackageManager for Homebrew {
     }
 }
 
-/// Validates that a tap string has the form `org/repo` with no path components,
-/// URL schemes, or shell-special characters. Prevents arbitrary GitHub repos from
-/// being added via a malicious devy.yml tap field.
+/// Validates that a tap string has the form `org/repo`: exactly one `/`, each part
+/// non-empty, starting with an ASCII letter or digit, limited to ASCII letters, digits,
+/// `-`, `_` and `.`, and not `.` or `..`. This rejects URLs, extra path components,
+/// option-like values and shell metacharacters. It does not restrict *which* GitHub
+/// repository is tapped — any well-formed `org/repo` is accepted, which is why taps are
+/// listed in the project-trust summary.
 pub(crate) fn validate_tap(tap: &str) -> Result<()> {
     let parts: Vec<&str> = tap.split('/').collect();
     if parts.len() != 2 {
@@ -247,9 +341,21 @@ pub(crate) fn validate_tap(tap: &str) -> Result<()> {
         if part.is_empty() {
             bail!("Invalid tap '{}': org and repo must not be empty", tap);
         }
+        if *part == "." || *part == ".." {
+            bail!(
+                "Invalid tap '{}': org and repo must not be '.' or '..'",
+                tap
+            );
+        }
+        if !part.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+            bail!(
+                "Invalid tap '{}': org and repo must start with a letter or digit",
+                tap
+            );
+        }
         if !part
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
         {
             bail!(
                 "Invalid tap '{}': only alphanumeric characters, hyphens, underscores, and dots are allowed",
@@ -263,6 +369,44 @@ pub(crate) fn validate_tap(tap: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use which::which;
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_runs_pinned_install_sh_with_bash() {
+        use crate::installers::{self, Interpreter, test_hooks};
+        test_hooks::clear();
+        test_hooks::serve(&installers::HOMEBREW, b"exit 0\n");
+        let result = Homebrew.bootstrap();
+        let runs = test_hooks::runs();
+        test_hooks::clear();
+        result.unwrap();
+        assert_eq!(
+            runs,
+            vec![(installers::HOMEBREW.name, Interpreter::Bash, vec![])]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_failure_reports_homebrew_installation_failed() {
+        use crate::installers::{self, test_hooks};
+        test_hooks::clear();
+        test_hooks::serve(&installers::HOMEBREW, b"exit 1\n");
+        let err = Homebrew.bootstrap().unwrap_err();
+        test_hooks::clear();
+        assert_eq!(err.to_string(), "Homebrew installation failed");
+    }
+
+    #[test]
+    fn mysql_family_config_uses_global_prefix_not_keg() {
+        assert_eq!(config_prefix_args("mysql"), vec!["--prefix"]);
+        assert_eq!(config_prefix_args("mariadb"), vec!["--prefix"]);
+        assert_eq!(
+            config_prefix_args("postgresql"),
+            vec!["--prefix", "--", "postgresql"]
+        );
+    }
 
     #[test]
     fn brew_log_paths_with_both_keys() {
@@ -328,6 +472,64 @@ mod tests {
         assert!(validate_tap("https://github.com/org/repo").is_err());
     }
 
+    #[test]
+    fn validate_tap_rejects_dot_parts() {
+        assert!(validate_tap("./repo").is_err());
+        assert!(validate_tap("org/..").is_err());
+        assert!(validate_tap("../..").is_err());
+    }
+
+    #[test]
+    fn validate_tap_requires_alphanumeric_first_character() {
+        assert!(validate_tap("-org/repo").is_err());
+        assert!(validate_tap("org/.repo").is_err());
+        assert!(validate_tap("_org/repo").is_err());
+        assert!(validate_tap("org/-repo").is_err());
+    }
+
+    #[test]
+    fn validate_tap_rejects_non_ascii() {
+        assert!(validate_tap("org\u{e9}/repo").is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_invalid_tap() {
+        // Scenario: Invalid tap -- `tap: "evil; rm -rf /"` fails before anything installs.
+        let mut dep = Dependency::simple("mongodb-community");
+        dep.tap = Some("evil; rm -rf /".into());
+        assert!(Homebrew.validate_config(&dep).is_err());
+    }
+
+    #[test]
+    fn valid_tap_and_install_argv_use_separators() {
+        // Scenario: Valid tap -- `brew tap -- mongodb/brew`, then install the formula.
+        let mut dep = Dependency::simple("mongodb-community");
+        dep.tap = Some("mongodb/brew".into());
+        assert!(Homebrew.validate_config(&dep).is_ok());
+        assert_eq!(tap_args("mongodb/brew"), ["tap", "--", "mongodb/brew"]);
+        assert_eq!(
+            install_args(&brew_formula_name(&dep)),
+            ["install", "--", "mongodb-community"]
+        );
+    }
+
+    #[test]
+    fn install_refuses_name_with_slash_before_running_brew() {
+        // Scenario: Tap smuggled through the name. Config loading rejects it first; this is
+        // the backend's own guard, which bails before any `brew` process is spawned.
+        let dep = Dependency::simple("evilorg/tap/formula");
+        let err = Homebrew.install_package(&dep).unwrap_err().to_string();
+        assert!(err.contains("Invalid formula name"), "{err}");
+    }
+
+    #[test]
+    fn list_versions_args_use_separator() {
+        assert_eq!(
+            list_versions_args("node@20"),
+            ["list", "--versions", "--", "node@20"]
+        );
+    }
+
     // ── brew_bin ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -344,23 +546,12 @@ mod tests {
     #[test]
     fn brew_bin_prefers_which_when_prefix_set() {
         // which("brew") takes priority over HOMEBREW_PREFIX — the two must always agree.
-        let _guard = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // HOMEBREW_PREFIX is injected, not set in the environment all tests share.
         let Ok(which_path) = which("brew") else {
             // brew not on PATH; this behaviour is untestable without PATH manipulation
             return;
         };
-        let prev = std::env::var("HOMEBREW_PREFIX").ok();
-        // SAFETY: serialised by ENV_LOCK; HOMEBREW_PREFIX is only read by brew_bin().
-        unsafe { std::env::set_var("HOMEBREW_PREFIX", "/bogus/homebrew") };
-        let result = Homebrew.brew_bin();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOMEBREW_PREFIX", v),
-                None => std::env::remove_var("HOMEBREW_PREFIX"),
-            }
-        }
+        let result = Homebrew.brew_bin_with(Some("/bogus/homebrew".into()));
         assert_eq!(
             result, which_path,
             "brew_bin must return the PATH-resolved brew, not the HOMEBREW_PREFIX path"
@@ -374,37 +565,13 @@ mod tests {
         if which("brew").is_ok() {
             return;
         }
-        let _guard = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("HOMEBREW_PREFIX").ok();
-        // SAFETY: serialised by ENV_LOCK; HOMEBREW_PREFIX is only read by brew_bin().
-        unsafe { std::env::set_var("HOMEBREW_PREFIX", "/custom/homebrew") };
-        let result = Homebrew.brew_bin();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOMEBREW_PREFIX", v),
-                None => std::env::remove_var("HOMEBREW_PREFIX"),
-            }
-        }
+        let result = Homebrew.brew_bin_with(Some("/custom/homebrew".into()));
         assert_eq!(result, PathBuf::from("/custom/homebrew/bin/brew"));
     }
 
     #[test]
     fn brew_bin_falls_back_to_hardcoded_when_prefix_absent() {
-        let _guard = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("HOMEBREW_PREFIX").ok();
-        // SAFETY: serialised by ENV_LOCK; HOMEBREW_PREFIX is only read by brew_bin().
-        unsafe { std::env::remove_var("HOMEBREW_PREFIX") };
-        let result = Homebrew.brew_bin();
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("HOMEBREW_PREFIX", v),
-                None => std::env::remove_var("HOMEBREW_PREFIX"),
-            }
-        }
+        let result = Homebrew.brew_bin_with(None);
         let s = result.to_string_lossy();
         assert!(s.contains("homebrew") || s.contains("local"));
         assert!(s.ends_with("/bin/brew"));
@@ -534,6 +701,34 @@ mod tests {
         assert_eq!(brew_formula_name(&dep), "python");
     }
 
+    #[test]
+    fn brew_formula_name_refuses_lock_formula_selector() {
+        // A lock `resolved_version` of "16" must not switch the install to node@16.
+        let mut dep = Dependency::simple("node");
+        dep.version = Some("16".into());
+        dep.version_from_lock = true;
+        assert_eq!(brew_formula_name(&dep), "node");
+        assert_eq!(
+            install_args(&brew_formula_name(&dep)),
+            ["install", "--", "node"]
+        );
+    }
+
+    #[test]
+    fn brew_formula_name_keeps_config_formula_selector() {
+        let mut dep = Dependency::simple("node");
+        dep.version = Some("16".into());
+        assert_eq!(brew_formula_name(&dep), "node@16");
+    }
+
+    #[test]
+    fn lock_resolved_version_is_not_refused() {
+        let mut dep = Dependency::simple("node");
+        dep.version = Some("20.11.0".into());
+        dep.version_from_lock = true;
+        assert_eq!(brew_formula_name(&dep), "node");
+    }
+
     // ── is_formula_pin ────────────────────────────────────────────────────────
 
     #[test]
@@ -552,6 +747,39 @@ mod tests {
     fn is_formula_pin_rejects_three_parts() {
         assert!(!is_formula_pin("3.14.4"));
         assert!(!is_formula_pin("20.11.0"));
+    }
+
+    #[test]
+    fn is_formula_name_rejects_local_files() {
+        for ok in ["jq", "postgresql@16", "libxml2", "gtk+3", "node.js-ish"] {
+            assert!(is_formula_name(ok), "{ok} must be accepted");
+        }
+        for bad in [
+            "evil.rb",
+            "evil.json",
+            "Evil",
+            "a:b",
+            "a\\b",
+            "",
+            "-x",
+            ".rb",
+        ] {
+            assert!(!is_formula_name(bad), "{bad} must be rejected");
+        }
+        let err = Homebrew
+            .install_package(&Dependency::simple("evil.rb"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid formula name"), "{err}");
+    }
+
+    #[test]
+    fn is_formula_pin_rejects_non_numeric() {
+        assert!(!is_formula_pin("evil.rb"));
+        assert!(!is_formula_pin("a/b"));
+        assert!(!is_formula_pin("3."));
+        assert!(!is_formula_pin(""));
+        assert!(!is_formula_pin("latest"));
     }
 
     #[test]
@@ -575,5 +803,35 @@ mod tests {
     fn parse_brew_version_returns_none_for_single_token() {
         assert!(parse_brew_version("mysql").is_none());
         assert!(parse_brew_version("").is_none());
+    }
+
+    #[test]
+    fn formula_name_rejects_local_bottles_and_archives() {
+        for bad in [
+            "x.arm64_sonoma.bottle.tar.gz",
+            "x.bottle.1.tar.gz",
+            "x.bottle.json",
+            "evil.tar.gz",
+            "evil.tgz",
+            "evil.rb",
+        ] {
+            assert!(!is_formula_name(bad), "{bad} must be rejected");
+            assert!(
+                !crate::validate::dep_name(bad),
+                "{bad} must fail config validation"
+            );
+        }
+        for good in ["python@3.14", "gcc", "libpq", "c++utils", "node.js"] {
+            assert!(is_formula_name(good), "{good}");
+        }
+    }
+
+    #[test]
+    fn brew_commands_forbid_local_packages_and_run_from_root() {
+        let cmd = brew_command(PathBuf::from("/opt/homebrew/bin/brew"));
+        assert_eq!(cmd.get_current_dir(), Some(std::path::Path::new("/")));
+        assert!(cmd.get_envs().any(|(k, v)| {
+            k == "HOMEBREW_FORBID_PACKAGES_FROM_PATHS" && v == Some(std::ffi::OsStr::new("1"))
+        }));
     }
 }

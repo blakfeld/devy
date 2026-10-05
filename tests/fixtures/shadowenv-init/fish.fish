@@ -1,0 +1,11 @@
+function __shadowenv_hook --on-event fish_prompt --on-variable PWD
+  set -l flags --fish
+  if [ -n "$__shadowenv_force_run" ];
+    set -a flags --force
+    set -eg __shadowenv_force_run
+  end
+  @SHADOWENV@ hook $flags | source 2>/dev/null
+end
+
+set -g __shadowenv_force_run 1
+

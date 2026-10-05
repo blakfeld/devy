@@ -1,0 +1,3 @@
+lts/x
+hooks:
+  before_up: touch '@OUT@/markers/nvmrc' #

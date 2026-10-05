@@ -1,27 +1,52 @@
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use which::which;
 
 use super::EnvManager;
 
 pub const ENV_FILE: &str = ".shadowenv.d/500_devy.lisp";
-const ENV_FILENAME: &str = "500_devy.lisp";
+pub(crate) const ENV_FILENAME: &str = "500_devy.lisp";
+
+/// The first line of every `500_devy.lisp` devy writes: a Lisp comment naming a random
+/// nonce, new on each write (`; devy-env <32 lowercase hex digits>`).
+const NONCE_PREFIX: &str = "; devy-env ";
+/// The per-user directory (`<state>/devy/shadowenv/`, beside the trust store) holding an
+/// exact copy of each `500_devy.lisp` devy wrote, named `<nonce>.lisp`. The shell hook
+/// (`devy hook`) and the trust gate compare the project's file with the copy its first
+/// line names: repository content can neither write a copy nor learn the nonce of one
+/// (it is generated on this machine), so a `500_devy.lisp` a pull replaced never matches.
+pub(crate) const COPY_SUBDIR: &str = "shadowenv";
 
 #[derive(Default)]
 pub struct Shadowenv;
 
 impl Shadowenv {
+    /// Writes `.shadowenv.d/500_devy.lisp`, keeping its copy in the per-user state
+    /// directory (see [`COPY_SUBDIR`]).
     pub(crate) fn write_env_file(
         &self,
         dir: &Path,
         vars: &HashMap<String, String>,
         path_prepends: &[String],
     ) -> Result<()> {
+        let copies = copy_dir_for(dir)?;
+        self.write_env_file_in(dir, vars, path_prepends, copies.as_deref())
+    }
+
+    /// [`Shadowenv::write_env_file`] with the copy directory supplied (`None`: no copy).
+    pub(crate) fn write_env_file_in(
+        &self,
+        dir: &Path,
+        vars: &HashMap<String, String>,
+        path_prepends: &[String],
+        copy_dir: Option<&Path>,
+    ) -> Result<()> {
         let shadowenv_dir = dir.join(".shadowenv.d");
-        fs::create_dir_all(&shadowenv_dir).context("Failed to create .shadowenv.d")?;
+        crate::fs_safe::ensure_dir_in(dir, &shadowenv_dir)
+            .context("Failed to create .shadowenv.d")?;
+        // `shadowenv trust` trusts the whole directory, so it must hold only devy's file.
+        refuse_foreign_entries(&shadowenv_dir)?;
 
         let esc = |s: &str| {
             s.replace('\\', "\\\\")
@@ -30,7 +55,8 @@ impl Shadowenv {
                 .replace('\r', "\\r")
                 .replace('\0', "")
         };
-        let mut content = String::from("(provide \"devy\" \"1.0.0\")\n\n");
+        let nonce = crate::fs_safe::random_hex128();
+        let mut content = format!("{NONCE_PREFIX}{nonce}\n(provide \"devy\" \"1.0.0\")\n\n");
 
         // PATH prepends: emit in reverse so the first entry ends up leftmost in PATH.
         for entry in path_prepends.iter().rev() {
@@ -51,13 +77,26 @@ impl Shadowenv {
             content.push_str(&format!("(env/set \"{}\" \"{}\")\n", esc(key), esc(value)));
         }
 
-        fs::write(shadowenv_dir.join(ENV_FILENAME), content)
+        let env_file = shadowenv_dir.join(ENV_FILENAME);
+        // The copy goes first, so the shell hook never sees a file without one.
+        if let Some(copies) = copy_dir {
+            crate::fs_safe::write_atomic(&copy_path(copies, &nonce), content.as_bytes(), 0o600)
+                .context(COPY_ERROR)?;
+        }
+        let previous = read_env_file(&env_file);
+        crate::fs_safe::write_atomic(&env_file, content.as_bytes(), 0o644)
             .context("Failed to write shadowenv environment file")?;
+        // The copy of the file this one replaced is no longer needed.
+        if let (Some(copies), Some(previous)) = (copy_dir, previous.as_deref())
+            && header_nonce(previous.as_bytes()) != Some(nonce.as_str())
+        {
+            remove_copy_of(previous.as_bytes(), copies);
+        }
 
         Ok(())
     }
 
-    fn trust(&self, dir: &Path, bin: &Path) -> Result<()> {
+    fn run_trust(&self, dir: &Path, bin: &Path) -> Result<()> {
         let status = Command::new(bin)
             .args(["trust"])
             .current_dir(dir)
@@ -68,6 +107,82 @@ impl Shadowenv {
         }
         Ok(())
     }
+}
+
+const COPY_ERROR: &str =
+    "Failed to record the shadowenv environment file in devy's state directory";
+
+/// The per-user copy directory for the project at `dir`, created (0700) when missing.
+#[cfg(not(test))]
+fn copy_dir_for(dir: &Path) -> Result<Option<PathBuf>> {
+    crate::trust::Store::locate()
+        .and_then(|store| store.ensure_env_copy_dir(dir))
+        .map(Some)
+        .context(COPY_ERROR)
+}
+
+/// Unit tests never touch the real state directory: they pass a copy directory to
+/// [`Shadowenv::write_env_file_in`] themselves. `tests/cli.rs` covers the real one.
+#[cfg(test)]
+fn copy_dir_for(_dir: &Path) -> Result<Option<PathBuf>> {
+    Ok(None)
+}
+
+/// The nonce on the first line of an env file devy wrote, if it has one.
+fn header_nonce(content: &[u8]) -> Option<&str> {
+    let first = content.split(|b| *b == b'\n').next()?;
+    let nonce = std::str::from_utf8(first.strip_prefix(NONCE_PREFIX.as_bytes())?).ok()?;
+    (nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    .then_some(nonce)
+}
+
+fn copy_path(copy_dir: &Path, nonce: &str) -> PathBuf {
+    copy_dir.join(format!("{nonce}.lisp"))
+}
+
+/// Removes the copy in `copy_dir` that the env file `content` names, but only when it is
+/// byte for byte that file: a `500_devy.lisp` copied from (or naming the nonce of)
+/// another project must not delete that project's copy, which would make its shell hook
+/// remove shadowenv's trust there. Returns whether a copy was removed.
+fn remove_copy_of(content: &[u8], copy_dir: &Path) -> bool {
+    let Some(nonce) = header_nonce(content) else {
+        return false;
+    };
+    let copy = copy_path(copy_dir, nonce);
+    crate::fs_safe::read_regular_capped(&copy, MAX_ENV_FILE_BYTES).is_ok_and(|c| c == content)
+        && std::fs::remove_file(copy).is_ok()
+}
+
+/// Removes the copy of the project's `500_devy.lisp` from `copy_dir` (only when it is
+/// that file's copy), so the shell hook stops accepting the file: `devy allow --revoke`.
+/// Returns whether a copy was removed.
+pub(crate) fn forget_env_file(project_root: &Path, copy_dir: &Path) -> bool {
+    crate::fs_safe::read_regular_capped(&project_root.join(ENV_FILE), MAX_ENV_FILE_BYTES)
+        .is_ok_and(|content| remove_copy_of(&content, copy_dir))
+}
+
+/// Whether the project at `project_root` has a `.shadowenv.d/500_devy.lisp` that is not
+/// the one devy last wrote: not a regular file, or not byte for byte the copy in
+/// `copy_dir` that its first line names. An absent file is not foreign.
+pub(crate) fn env_file_foreign(project_root: &Path, copy_dir: &Path) -> bool {
+    let path = project_root.join(ENV_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+        Ok(meta) if !meta.file_type().is_file() => return true,
+        Ok(_) => {}
+    }
+    let Ok(content) = crate::fs_safe::read_regular_capped(&path, MAX_ENV_FILE_BYTES) else {
+        return true;
+    };
+    let Some(nonce) = header_nonce(&content) else {
+        return true;
+    };
+    crate::fs_safe::read_regular_capped(&copy_path(copy_dir, nonce), MAX_ENV_FILE_BYTES)
+        .map_or(true, |copy| copy != content)
 }
 
 fn unescape(s: &str) -> String {
@@ -122,10 +237,22 @@ fn parse_env_set_line(line: &str) -> Option<(String, String)> {
     Some((unescape(raw_key), unescape(raw_value)))
 }
 
+/// The env file devy wrote is a few KiB; anything larger is not one of ours.
+const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
+
+/// The content of the env file at `path`. `status`, `check` and `doctor` read it without
+/// trust, so it must be a regular file (not a symlink a repository committed, which could
+/// point at `/dev/zero` or a FIFO) of at most [`MAX_ENV_FILE_BYTES`]; anything else
+/// counts as absent.
+fn read_env_file(path: &Path) -> Option<String> {
+    let bytes = crate::fs_safe::read_regular_capped(path, MAX_ENV_FILE_BYTES).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 /// Parses `(env/set "KEY" "VALUE")` lines from the shadowenv lisp file.
-/// Returns `None` if the file does not exist yet.
+/// Returns `None` if the file does not exist yet (or is not a file devy would read).
 pub fn read_vars(path: &Path) -> Option<HashMap<String, String>> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = read_env_file(path)?;
     let mut vars = HashMap::new();
     for line in content.lines() {
         if let Some((key, value)) = parse_env_set_line(line.trim()) {
@@ -136,9 +263,9 @@ pub fn read_vars(path: &Path) -> Option<HashMap<String, String>> {
 }
 
 /// Parses `(env/prepend-to-pathlist "PATH" "ENTRY")` lines from the shadowenv lisp file.
-/// Returns `None` if the file does not exist yet.
+/// Returns `None` if the file does not exist yet (or is not a file devy would read).
 pub fn read_path_prepends(path: &Path) -> Option<Vec<String>> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = read_env_file(path)?;
     let mut entries = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -158,13 +285,98 @@ pub fn read_path_prepends(path: &Path) -> Option<Vec<String>> {
     Some(entries)
 }
 
+/// Fails when `.shadowenv.d` holds an entry shadowenv could evaluate other than devy's
+/// `500_devy.lisp` (for example lisp a repository committed), naming them. Shadowenv
+/// evaluates only `*.lisp` files, so other regular files (the `.gitignore` and
+/// `.trust-<fingerprint>` that `shadowenv trust` writes itself, and the
+/// `.error-<n>-<shell pid>` its hook writes while the directory is untrusted) are fine;
+/// directories, symlinks and any other `*.lisp` are not. The trust digest
+/// (`trust::shadowenv_entries`) and the shell hook's guard draw the same line.
+fn refuse_foreign_entries(shadowenv_dir: &Path) -> Result<()> {
+    let read_err = || format!("Failed to read {}", shadowenv_dir.display());
+    // Never list (or hand shadowenv) a directory a symlink points to: it could be
+    // another project's, trusted or not. `ensure_dir_in` refuses one first; this keeps
+    // the check from depending on that.
+    crate::fs_safe::refuse_symlink(shadowenv_dir)?;
+    let mut foreign = Vec::new();
+    for entry in std::fs::read_dir(shadowenv_dir).with_context(read_err)? {
+        let entry = entry.with_context(read_err)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_file = entry.file_type().with_context(read_err)?.is_file();
+        let is_lisp = name.to_ascii_lowercase().ends_with(".lisp");
+        if name != ENV_FILENAME && (!is_file || is_lisp) {
+            foreign.push(name);
+        }
+    }
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    foreign.sort();
+    // shadowenv trusts the directory, not its content: a signature from an earlier
+    // `devy up` would load the foreign lisp on the next prompt, so it goes first.
+    if let Some(project) = shadowenv_dir.parent() {
+        crate::trust::untrust_shadowenv(project);
+    }
+    bail!(
+        ".shadowenv.d contains files devy did not write ({}); devy removed shadowenv's trust for this project; review and remove them, then run devy allow and devy up",
+        foreign.join(", ")
+    )
+}
+
+/// Removes shadowenv's trust files (`.shadowenv.d/.trust-<fingerprint>`, the signature
+/// `shadowenv trust` writes) for the project at `dir`, so the shell stops applying the
+/// project's environment. shadowenv has no `untrust` command; deleting the signature is
+/// how trust is revoked. Nothing happens when `.shadowenv.d` is missing or is not a real
+/// directory (a symlink is never followed). Returns how many files were removed.
+pub fn remove_trust(dir: &Path) -> Result<usize> {
+    let shadowenv_dir = dir.join(".shadowenv.d");
+    match std::fs::symlink_metadata(&shadowenv_dir) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        _ => return Ok(0),
+    }
+    let read_err = || format!("Failed to read {}", shadowenv_dir.display());
+    let mut removed = 0;
+    // Every signature is removed even when another entry fails, so a `.trust-0/`
+    // directory a repository planted cannot keep the real one in place.
+    let mut first_error = None;
+    for entry in std::fs::read_dir(&shadowenv_dir).with_context(read_err)? {
+        let entry = entry.with_context(read_err)?;
+        if !entry.file_name().to_string_lossy().starts_with(".trust-") {
+            continue;
+        }
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if is_dir {
+            continue; // not a signature shadowenv writes
+        }
+        let path = entry.path();
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                first_error.get_or_insert_with(|| {
+                    anyhow::Error::new(e).context(format!("Failed to remove {}", path.display()))
+                });
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(removed),
+    }
+}
+
+/// The `shadowenv` binary devy runs: on PATH outside the project, or in the project nix
+/// profile once it passes the `/nix/store` check.
+fn shadowenv_bin() -> Option<PathBuf> {
+    crate::fs_safe::which_with_project_profile("shadowenv")
+}
+
 impl EnvManager for Shadowenv {
     fn name(&self) -> &str {
         "shadowenv"
     }
 
     fn is_available(&self) -> bool {
-        which("shadowenv").is_ok()
+        shadowenv_bin().is_some()
     }
 
     fn setup(
@@ -172,21 +384,24 @@ impl EnvManager for Shadowenv {
         dir: &Path,
         vars: &HashMap<String, String>,
         path_prepends: &[String],
+        trust: bool,
     ) -> Result<()> {
         self.write_env_file(dir, vars, path_prepends)?;
-        // After a fresh Nix install the profile bin dir isn't on PATH yet, so
-        // `which` may fail. Fall back to searching the dirs we're about to
-        // prepend — one of them will contain the just-installed shadowenv binary.
-        let bin = which("shadowenv")
-            .ok()
-            .or_else(|| {
-                path_prepends
-                    .iter()
-                    .map(|p| PathBuf::from(p).join("shadowenv"))
-                    .find(|p| p.exists())
+        if !trust {
+            // Only a project the user allowed is handed to shadowenv to load.
+            return Ok(());
+        }
+        // Found outside the project, or in the verified project nix profile (where a
+        // fresh nix-backend install puts it before its bin dir is on PATH), never in any
+        // other project-local directory such as the PATH prepends written above.
+        let bin = shadowenv_bin()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "shadowenv not found on PATH outside the project or in a verified .devy/nix-profile/bin"
+                )
             })
-            .unwrap_or_else(|| PathBuf::from("shadowenv"));
-        self.trust(dir, &bin)?;
+            .context("Failed to run shadowenv trust")?;
+        self.run_trust(dir, &bin)?;
         Ok(())
     }
 
@@ -202,12 +417,83 @@ impl EnvManager for Shadowenv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use which::which;
 
     fn tmp_dir() -> crate::test_support::TempDir {
         crate::test_support::tmp_dir()
     }
 
+    // ── remove_trust ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn remove_trust_deletes_only_trust_files() {
+        let dir = tmp_dir();
+        let sd = dir.join(".shadowenv.d");
+        std::fs::create_dir(&sd).unwrap();
+        std::fs::write(sd.join(".trust-a46f63ff"), "sig").unwrap();
+        std::fs::write(sd.join(".trust-0badc0de"), "sig").unwrap();
+        std::fs::write(sd.join(ENV_FILENAME), "(provide \"devy\")\n").unwrap();
+        std::fs::write(sd.join(".gitignore"), "*\n").unwrap();
+        assert_eq!(remove_trust(&dir).unwrap(), 2);
+        assert!(!sd.join(".trust-a46f63ff").exists());
+        assert!(sd.join(ENV_FILENAME).exists());
+        assert!(sd.join(".gitignore").exists());
+        // Missing directory: nothing to do.
+        assert_eq!(remove_trust(&tmp_dir()).unwrap(), 0);
+    }
+
+    #[test]
+    fn remove_trust_skips_a_planted_directory_and_still_removes_signatures() {
+        let dir = tmp_dir();
+        let sd = dir.join(".shadowenv.d");
+        std::fs::create_dir_all(sd.join(".trust-0")).unwrap();
+        std::fs::write(sd.join(".trust-a46f63ff"), "sig").unwrap();
+        assert_eq!(remove_trust(&dir).unwrap(), 1);
+        assert!(!sd.join(".trust-a46f63ff").exists());
+        assert!(sd.join(".trust-0").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_trust_never_follows_a_symlinked_directory() {
+        let dir = tmp_dir();
+        let outside = tmp_dir();
+        std::fs::write(outside.join(".trust-a46f63ff"), "sig").unwrap();
+        std::os::unix::fs::symlink(&*outside, dir.join(".shadowenv.d")).unwrap();
+        assert_eq!(remove_trust(&dir).unwrap(), 0);
+        assert!(outside.join(".trust-a46f63ff").exists());
+    }
+
     // ── read_vars ─────────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn env_file_symlinks_fifos_and_huge_files_are_not_read() {
+        let dir = tmp_dir();
+        let outside = tmp_dir();
+        let target = outside.join("x.lisp");
+        std::fs::write(&target, "(env/set \"FOO\" \"bar\")\n").unwrap();
+        let link = dir.join("link.lisp");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_vars(&link).is_none());
+        assert!(read_path_prepends(&link).is_none());
+        let zero = dir.join("zero.lisp");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        assert!(read_vars(&zero).is_none());
+        let fifo = dir.join("fifo.lisp");
+        if std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            // Returns promptly instead of blocking.
+            assert!(read_vars(&fifo).is_none());
+        }
+        let huge = dir.join("huge.lisp");
+        std::fs::write(&huge, "x".repeat(MAX_ENV_FILE_BYTES as usize + 1)).unwrap();
+        assert!(read_vars(&huge).is_none());
+        assert_eq!(read_vars(&target).unwrap()["FOO"], "bar");
+    }
 
     #[test]
     fn read_vars_missing_file_returns_none() {
@@ -429,7 +715,7 @@ mod tests {
         let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("KEY".into(), "val".into());
-        let result = shadowenv.setup(&dir, &vars, &[]);
+        let result = shadowenv.setup(&dir, &vars, &[], true);
         assert!(
             result.is_err(),
             "setup must fail when shadowenv binary is absent"
@@ -447,11 +733,210 @@ mod tests {
         let shadowenv = Shadowenv;
         let mut vars = HashMap::new();
         vars.insert("KEY".into(), "val".into());
-        let result = shadowenv.setup(&dir, &vars, &[]);
+        let result = shadowenv.setup(&dir, &vars, &[], true);
         assert!(
             result.is_ok(),
             "setup must succeed when shadowenv is installed"
         );
+    }
+
+    // ── .shadowenv.d contents ─────────────────────────────────────────────────
+
+    #[test]
+    fn foreign_lisp_and_directories_are_refused_before_writing() {
+        for planted in ["000_evil.lisp", "600_X.LISP"] {
+            let dir = tmp_dir();
+            std::fs::create_dir_all(dir.join(".shadowenv.d")).unwrap();
+            std::fs::write(
+                dir.join(".shadowenv.d").join(planted),
+                "(env/set \"X\" \"y\")",
+            )
+            .unwrap();
+            let err = Shadowenv
+                .write_env_file(&dir, &HashMap::new(), &[])
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    ".shadowenv.d contains files devy did not write ({planted}); devy removed shadowenv's trust for this project; review and remove them, then run devy allow and devy up"
+                )
+            );
+            assert!(!dir.join(ENV_FILE).exists());
+        }
+        let dir = tmp_dir();
+        std::fs::create_dir_all(dir.join(".shadowenv.d/nested")).unwrap();
+        assert!(
+            Shadowenv
+                .write_env_file(&dir, &HashMap::new(), &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn foreign_lisp_removes_an_earlier_shadowenv_trust() {
+        let dir = tmp_dir();
+        let d = dir.join(".shadowenv.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".trust-a46f63ff"), "sig").unwrap();
+        std::fs::write(d.join("000_evil.lisp"), "(env/set \"X\" \"y\")").unwrap();
+        assert!(
+            Shadowenv
+                .write_env_file(&dir, &HashMap::new(), &[])
+                .is_err()
+        );
+        assert!(!d.join(".trust-a46f63ff").exists());
+        assert!(d.join("000_evil.lisp").exists());
+    }
+
+    /// A committed `.shadowenv.d` symlink (to another project's trusted directory, say)
+    /// is refused before anything is listed, written or trusted, and the directory it
+    /// points to keeps its files and its signature.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_shadowenv_dir_is_refused_and_its_target_untouched() {
+        let dir = tmp_dir();
+        let other = tmp_dir();
+        let target = other.join(".shadowenv.d");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(".trust-a46f63ff"), "sig").unwrap();
+        std::fs::write(target.join("500_devy.lisp"), "theirs").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(".shadowenv.d")).unwrap();
+        let err = Shadowenv
+            .setup(&dir, &HashMap::new(), &[], true)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("is a symbolic link"), "{err:#}");
+        assert!(refuse_foreign_entries(&dir.join(".shadowenv.d")).is_err());
+        assert_eq!(remove_trust(&dir).unwrap(), 0);
+        assert_eq!(
+            std::fs::read(target.join(".trust-a46f63ff")).unwrap(),
+            b"sig"
+        );
+        assert_eq!(
+            std::fs::read(target.join("500_devy.lisp")).unwrap(),
+            b"theirs"
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 2);
+    }
+
+    /// A `.error-*` that is a symlink is not shadowenv's (its hook would write through
+    /// it): refused like any other foreign entry, and trust goes.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_error_file_is_foreign() {
+        let dir = tmp_dir();
+        let outside = tmp_dir();
+        let d = dir.join(".shadowenv.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".trust-a46f63ff"), "sig").unwrap();
+        std::fs::write(outside.join("victim"), "keep").unwrap();
+        std::os::unix::fs::symlink(outside.join("victim"), d.join(".error-0-4242")).unwrap();
+        let err = Shadowenv
+            .write_env_file(&dir, &HashMap::new(), &[])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains(".error-0-4242"), "{err:#}");
+        assert!(!d.join(".trust-a46f63ff").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("victim")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn files_shadowenv_trust_writes_are_accepted() {
+        let dir = tmp_dir();
+        let d = dir.join(".shadowenv.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".gitignore"), "*").unwrap();
+        std::fs::write(d.join(".trust-a46f63ff"), "sig").unwrap();
+        std::fs::write(d.join(".error-0-123"), "untrusted").unwrap();
+        std::fs::write(d.join(ENV_FILENAME), "old").unwrap();
+        Shadowenv
+            .write_env_file(&dir, &HashMap::new(), &[])
+            .unwrap();
+    }
+
+    /// Rewriting a `500_devy.lisp` that names another project's copy (copied over, or
+    /// forged) leaves that copy alone; `forget_env_file` removes only the project's own.
+    #[test]
+    fn only_the_projects_own_copy_is_removed() {
+        let copies = tmp_dir();
+        let (a, b) = (tmp_dir(), tmp_dir());
+        let vars = HashMap::from([("K".to_string(), "v".to_string())]);
+        Shadowenv
+            .write_env_file_in(&a, &vars, &[], Some(&copies))
+            .unwrap();
+        let a_file = std::fs::read(a.join(ENV_FILE)).unwrap();
+        let a_copy = copy_path(&copies, header_nonce(&a_file).unwrap());
+        // b's file names a's nonce, with other content.
+        std::fs::create_dir_all(b.join(".shadowenv.d")).unwrap();
+        let mut forged = a_file.clone();
+        forged.extend_from_slice(b"(env/set \"X\" \"y\")\n");
+        std::fs::write(b.join(ENV_FILE), &forged).unwrap();
+        Shadowenv
+            .write_env_file_in(&b, &vars, &[], Some(&copies))
+            .unwrap();
+        assert!(a_copy.exists(), "another project's copy must stay");
+        assert!(!forget_env_file(&tmp_dir(), &copies));
+        std::fs::write(b.join(ENV_FILE), &forged).unwrap();
+        assert!(!forget_env_file(&b, &copies));
+        assert!(a_copy.exists());
+        assert!(forget_env_file(&a, &copies));
+        assert!(!a_copy.exists());
+        assert!(env_file_foreign(&a, &copies));
+    }
+
+    #[test]
+    fn env_file_carries_a_fresh_nonce_and_its_copy_replaces_the_last_one() {
+        let dir = tmp_dir();
+        let copies = tmp_dir();
+        let mut vars = HashMap::new();
+        vars.insert("K".to_string(), "v".to_string());
+        Shadowenv
+            .write_env_file_in(&dir, &vars, &[], Some(&copies))
+            .unwrap();
+        let first = std::fs::read(dir.join(ENV_FILE)).unwrap();
+        let nonce1 = header_nonce(&first).unwrap().to_string();
+        assert_eq!(std::fs::read(copy_path(&copies, &nonce1)).unwrap(), first);
+        assert!(!env_file_foreign(&dir, &copies));
+        // The nonce line is a comment: the variables still parse.
+        assert_eq!(read_vars(&dir.join(ENV_FILE)).unwrap()["K"], "v");
+
+        Shadowenv
+            .write_env_file_in(&dir, &vars, &[], Some(&copies))
+            .unwrap();
+        let second = std::fs::read(dir.join(ENV_FILE)).unwrap();
+        let nonce2 = header_nonce(&second).unwrap().to_string();
+        assert_ne!(nonce1, nonce2);
+        assert!(!copy_path(&copies, &nonce1).exists(), "old copy removed");
+        assert!(!env_file_foreign(&dir, &copies));
+        // Without a copy (another machine's file, or a replaced one) it is foreign.
+        assert!(env_file_foreign(&dir, &tmp_dir()));
+        // Absent: nothing to load, so not foreign.
+        assert!(!env_file_foreign(&tmp_dir(), &copies));
+    }
+
+    #[test]
+    fn header_nonce_requires_32_lowercase_hex_digits() {
+        let ok = format!("{NONCE_PREFIX}{}\n(x)", "a".repeat(32));
+        assert_eq!(header_nonce(ok.as_bytes()), Some("a".repeat(32).as_str()));
+        for bad in [
+            format!("{NONCE_PREFIX}{}\n", "A".repeat(32)),
+            format!("{NONCE_PREFIX}{}\n", "a".repeat(31)),
+            format!("{NONCE_PREFIX}../../{}\n", "a".repeat(26)),
+            format!(" {NONCE_PREFIX}{}\n", "a".repeat(32)),
+        ] {
+            assert_eq!(header_nonce(bad.as_bytes()), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn untrusted_setup_writes_the_file_without_running_shadowenv() {
+        let dir = tmp_dir();
+        let mut vars = HashMap::new();
+        vars.insert("K".into(), "v".into());
+        // Succeeds even where shadowenv is not installed: it is never looked up.
+        Shadowenv.setup(&dir, &vars, &[], false).unwrap();
+        assert!(dir.join(ENV_FILE).exists());
     }
 
     // ── read_path_prepends ────────────────────────────────────────────────────

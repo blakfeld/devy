@@ -32,6 +32,14 @@ impl Module for ErlangModule {
         pm.install_package(&pm_dep(dep, package_name(pm)))
     }
 
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        super::helpers::step_if_exists(
+            project_root,
+            "rebar.config",
+            "rebar3 get-deps (rebar.config)",
+        )
+    }
+
     fn post_setup(
         &self,
         _dep: &Dependency,
@@ -58,7 +66,7 @@ impl Module for ErlangModule {
         if !status.success() {
             anyhow::bail!("`rebar3 get-deps` failed — check the output above for details");
         }
-        write_stamp(&stamp_path, &manifest);
+        write_stamp(&stamp_path, &manifest)?;
         output::success("Erlang dependencies fetched");
         Ok(())
     }

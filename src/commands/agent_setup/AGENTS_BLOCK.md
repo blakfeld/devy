@@ -8,4 +8,5 @@ This project's development environment is declared in `{bin}.yml` and managed by
 - Start a stopped service with `{bin} start <name>`. Inspect failures with `{bin} logs <name>` and `{bin} check --json`.
 - Run project commands from `{bin}.yml` as `{bin} <command>`.
 - Don't edit `{bin}.lock` or `.shadowenv.d/` by hand. Change `{bin}.yml` and run `{bin} up`.
+- If `{bin}` says the project is not allowed, stop and ask the user to review `{bin}.yml` and run `{bin} allow`. Never run `{bin} allow` yourself.
 <!-- devy:end -->
