@@ -613,10 +613,10 @@ mod tests {
         );
     }
 
-    /// `nix` with the contents of every string literal removed, leaving the code a Nix
-    /// parser would evaluate: `"…"` strings (with `\` escapes) and `''…''` indented
-    /// strings (with the `'''`, `''$` and `''\` escapes). Antiquotations are not
-    /// followed; the generator escapes every `${` in a value.
+    /// `nix` with the contents of every string literal removed: `"…"` strings (with `\`
+    /// escapes) and `''…''` indented strings (with the `'''`, `''$` and `''\` escapes).
+    /// Comments are not recognised (the generator's comments hold no quotes), and
+    /// antiquotations are not followed (the generator escapes every `${` in a value).
     fn nix_code_outside_strings(nix: &str) -> String {
         let mut code = String::new();
         let mut chars = nix.chars().peekable();
