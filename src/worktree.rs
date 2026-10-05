@@ -244,7 +244,10 @@ fn follow(target: &str, base: &Path, project_root: &Path) -> Option<PathBuf> {
 /// Always false elsewhere, where looking a path up can't reach a share. Call it before any filesystem
 /// access to a path derived from git metadata.
 fn has_link_component(path: &Path) -> bool {
-    cfg!(windows) && walk_finds_link(path, |p| trimmed_by_windows(p) || is_redirecting_link(p))
+    cfg!(windows)
+        && walk_finds_link(path, |p| {
+            trimmed_by_windows(p) || windows_device_name(p) || is_redirecting_link(p)
+        })
 }
 
 /// Whether the last component of `path` ends in a space or a period, which Win32 trims
@@ -255,6 +258,39 @@ fn has_link_component(path: &Path) -> bool {
 fn trimmed_by_windows(path: &Path) -> bool {
     path.file_name()
         .is_some_and(|name| name.to_str().is_none_or(|n| n.ends_with([' ', '.'])))
+}
+
+/// Whether the last component of `path` is a DOS device name (`CON`, `NUL`, `COM1`,
+/// `lpt1.txt`, `CONIN$`, …), which Win32 can open as `\\.\<name>` wherever it appears
+/// last. Every prefix of the path is stat-ed as a last component, so these count as
+/// links; git never writes such names.
+fn windows_device_name(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let Some(name) = name.to_str() else {
+        return true;
+    };
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "con" | "prn" | "aux" | "nul" | "conin$" | "conout$" => true,
+        // `com0`/`lpt0` aren't devices, but refusing them too costs nothing.
+        s => s
+            .strip_prefix("com")
+            .or_else(|| s.strip_prefix("lpt"))
+            .is_some_and(|rest| {
+                let mut c = rest.chars();
+                matches!(
+                    (c.next(), c.next()),
+                    (Some('0'..='9' | '¹' | '²' | '³'), None)
+                )
+            }),
+    }
 }
 
 /// Whether `is_link` holds for any component of `path`, checked from the root down. A
@@ -273,6 +309,11 @@ fn walk_finds_link(path: &Path, is_link: impl Fn(&Path) -> bool) -> bool {
     for component in path.components() {
         match component {
             Component::Prefix(prefix) => match prefix.kind() {
+                // Rust reads `//?/C:` (or `\\?/C:`) as a share on host `?`; Win32 treats
+                // it as a device path, so it is refused (`.` too, defensively).
+                Prefix::UNC(server, _) if matches!(server.as_encoded_bytes(), b"?" | b".") => {
+                    return true;
+                }
                 Prefix::Disk(_)
                 | Prefix::VerbatimDisk(_)
                 | Prefix::UNC(..)
@@ -282,9 +323,25 @@ fn walk_finds_link(path: &Path, is_link: impl Fn(&Path) -> bool) -> bool {
             Component::RootDir => current.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
-                current.pop();
+                // Git never writes `..` above the root, and where Win32 puts the root
+                // depends on the kind of path.
+                if !current.pop() {
+                    return true;
+                }
             }
             Component::Normal(part) => {
+                // Under a verbatim prefix `/` isn't a separator, so `\\?\C:/x/../l` is one
+                // "name" here that hides its own components; Windows names never contain
+                // `/`. A `:` names an NTFS stream (`dir::$INDEX_ALLOCATION` is `dir`), which
+                // git never writes. Refuse both rather than walk them.
+                if cfg!(windows)
+                    && part
+                        .as_encoded_bytes()
+                        .iter()
+                        .any(|b| *b == b'/' || *b == b':')
+                {
+                    return true;
+                }
                 current.push(part);
                 if is_link(&current) {
                     return true;
@@ -349,12 +406,19 @@ enum WindowsOrigin {
 
 /// Classifies `path` by its prefix as Windows reads it (either slash, any case).
 fn windows_origin(path: &str) -> WindowsOrigin {
-    let path = path.replace('/', "\\").to_ascii_lowercase();
-    // `\??\` is the NT object namespace, which Win32 passes through unchanged.
+    let raw = path.to_ascii_lowercase();
+    let path = raw.replace('/', "\\");
+    // `\??\` is the NT object namespace, which Win32 passes through unchanged. Only the
+    // backslash spellings are verbatim: `//?/` or `\\?/` are device paths, whose `..`
+    // Win32 resolves above the drive (`//?/C:/../UNC/host/…` reaches a share).
     let verbatim = ["\\\\?\\", "\\??\\"]
         .iter()
-        .find_map(|prefix| path.strip_prefix(prefix));
+        .find_map(|prefix| raw.strip_prefix(prefix));
     if let Some(rest) = verbatim {
+        // In a verbatim path `/` is not a separator, so it can't be classified here.
+        if rest.contains('/') {
+            return WindowsOrigin::Device;
+        }
         if let Some(unc) = rest.strip_prefix("unc\\") {
             return unc_share(unc);
         }
@@ -366,7 +430,10 @@ fn windows_origin(path: &str) -> WindowsOrigin {
             WindowsOrigin::Device
         };
     }
-    if path == "\\\\?" || path == "\\??" || path == "\\\\." || path.starts_with("\\\\.\\") {
+    if ["\\\\?", "\\??", "\\\\."]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
         return WindowsOrigin::Device;
     }
     match path.strip_prefix("\\\\") {
@@ -821,7 +888,12 @@ mod tests {
             (r"\\host\share\app\.git", share()),
             ("//HOST/Share/app/.git", share()),
             (r"\\?\UNC\host\share\app", share()),
-            (r"//?/unc/HOST/share/app", share()),
+            // Only the backslash spellings are verbatim; the others are device paths.
+            (r"//?/unc/HOST/share/app", Device),
+            ("//?/C:/../UNC/host/share/x", Device),
+            (r"\\?/C:/../UNC/host/share/x", Device),
+            ("/??/C:/x", Device),
+            (r"\\?\C:/x/../lnk", Device),
             (r"\??\UNC\host\share\app", share()),
             (r"\\.\C:\src", Device),
             (r"\\.\pipe\x", Device),
@@ -935,6 +1007,27 @@ mod tests {
         assert!(!trimmed_by_windows(Path::new("/")));
     }
 
+    #[test]
+    fn dos_device_names_count_as_links() {
+        for name in [
+            "COM1", "nul", "nul.txt", "CON ", "Aux.x.y", "lpt9", "conin$", "CONOUT$", "com¹",
+        ] {
+            assert!(windows_device_name(&Path::new("/x").join(name)), "{name}");
+        }
+        for name in [
+            "COM",
+            "com10",
+            "console",
+            "nullable",
+            ".git",
+            "worktrees",
+            "lpt",
+        ] {
+            assert!(!windows_device_name(&Path::new("/x").join(name)), "{name}");
+        }
+        assert!(!windows_device_name(Path::new("/")));
+    }
+
     /// A prefix that isn't a drive or share is never walked into: Rust doesn't split
     /// its components, so nothing below it would be checked.
     #[cfg(windows)]
@@ -942,6 +1035,18 @@ mod tests {
     fn walk_finds_link_refuses_other_prefixes() {
         assert!(walk_finds_link(Path::new(r"\\?\C:/x/../lnk"), |_| false));
         assert!(walk_finds_link(Path::new(r"\\.\C:\x"), |_| false));
+        // Device paths: Rust reads `//?/C:` as a share on host `?`, `//./C:` as DeviceNS.
+        assert!(walk_finds_link(
+            Path::new("//?/C:/../UNC/host/share/x"),
+            |_| false
+        ));
+        assert!(walk_finds_link(Path::new("//./C:/x"), |_| false));
+        // `..` above the root, and NTFS stream syntax.
+        assert!(walk_finds_link(Path::new(r"C:\..\x"), |_| false));
+        assert!(walk_finds_link(
+            Path::new(r"C:\x\lnk::$INDEX_ALLOCATION\y"),
+            |_| false
+        ));
         assert!(!walk_finds_link(Path::new(r"\\?\C:\x"), |_| false));
         assert!(!walk_finds_link(Path::new(r"\\host\share\x"), |_| false));
         assert!(!walk_finds_link(Path::new(r"\\?\UNC\host\share\x"), |_| {
