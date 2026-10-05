@@ -65,6 +65,8 @@ pub const NIX: Installer = Installer {
 };
 
 /// Homebrew `install.sh` at Homebrew/install commit 35da687 (2026-10-02).
+/// Only the brew backend (macOS) bootstraps Homebrew.
+#[cfg(any(test, target_os = "macos"))]
 pub const HOMEBREW: Installer = Installer {
     name: "Homebrew installer",
     url: "https://raw.githubusercontent.com/Homebrew/install/35da6871c4be7d7fdab2fd505fb7fa667926a2a5/install.sh",

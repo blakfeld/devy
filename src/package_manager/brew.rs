@@ -565,8 +565,38 @@ mod tests {
         if which("brew").is_ok() {
             return;
         }
-        let result = Homebrew.brew_bin_with(Some("/custom/homebrew".into()));
-        assert_eq!(result, PathBuf::from("/custom/homebrew/bin/brew"));
+        // An absolute path outside the project on every platform ("/custom/…" is
+        // relative on Windows, so it would be refused as project-local).
+        let project = crate::test_support::tmp_dir();
+        crate::fs_safe::set_project_root(&project);
+        let prefix = crate::test_support::tmp_dir();
+        let result = Homebrew.brew_bin_with(Some(prefix.to_string_lossy().into_owned()));
+        assert_eq!(result, prefix.join("bin").join("brew"));
+    }
+
+    #[test]
+    fn brew_bin_refuses_a_project_local_homebrew_prefix() {
+        // A project's environment can set HOMEBREW_PREFIX; it must never select a brew
+        // inside the project, a relative one, or an empty prefix.
+        if which("brew").is_ok() {
+            return;
+        }
+        let project = crate::test_support::tmp_dir();
+        crate::fs_safe::set_project_root(&project);
+        let inside = project.join("homebrew");
+        for prefix in [
+            inside.to_string_lossy().into_owned(),
+            "rel/homebrew".to_string(),
+            String::new(),
+        ] {
+            let result = Homebrew.brew_bin_with(Some(prefix.clone()));
+            assert_ne!(
+                result,
+                PathBuf::from(&prefix).join("bin").join("brew"),
+                "{prefix:?}"
+            );
+            assert!(!result.starts_with(&*project), "{prefix:?}: {result:?}");
+        }
     }
 
     #[test]
