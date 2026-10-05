@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions (and their `# vX.Y.Z` comments) current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait before proposing a fresh release, so a compromised one is more
+    # likely to be caught and yanked first.
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Wait before proposing a fresh release, so a compromised one is more
+    # likely to be caught and yanked first.
+    cooldown:
+      default-days: 7

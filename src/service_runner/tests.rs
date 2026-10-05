@@ -3,12 +3,13 @@ use super::*;
 use crate::config::ExtraValue;
 use crate::lock::LockedDep;
 use crate::package_manager::MockPackageManager;
+use serde_norway as yaml;
 use std::collections::BTreeMap;
 
 const ROOT: &str = "/src/app";
 
 fn config(yaml: &str) -> DevyConfig {
-    serde_yml::from_str(yaml).unwrap()
+    yaml::from_str(yaml).unwrap()
 }
 
 fn docker_dep(name: &str, port: Option<u16>) -> Dependency {
@@ -440,6 +441,211 @@ fn start_publishes_minio_console_port() {
 }
 
 #[test]
+fn start_refuses_container_from_another_project() {
+    let fake_for_spec = FakeRunner::ok();
+    let dep = docker_dep("redis", Some(51000));
+    let own = docker_runner(&fake_for_spec, "name: app\n", None, false)
+        .run_spec(&dep)
+        .unwrap()
+        .labels;
+    // Same name and even the same config hash, but another project's root (or none).
+    let foreign: Vec<(String, String)> = own
+        .iter()
+        .map(|(k, v)| {
+            if k == PROJECT_LABEL {
+                (k.clone(), "/src/evil".to_string())
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect();
+    let unlabeled: Vec<(String, String)> = own
+        .iter()
+        .filter(|(k, _)| k != PROJECT_LABEL)
+        .cloned()
+        .collect();
+    for (labels, running) in [
+        (foreign.clone(), true),
+        (foreign, false),
+        (unlabeled, false),
+    ] {
+        let state = inspect_json(running, &labels);
+        let fake = FakeRunner::new(move |_| ok(&state));
+        let err = docker_runner(&fake, "name: app\n", None, false)
+            .start(&dep)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("container devy-{}-redis belongs to another project", slug())
+        );
+        assert_eq!(
+            fake.lines().len(),
+            1,
+            "only the inspect: no start, rm or run"
+        );
+    }
+}
+
+#[test]
+fn start_passes_minio_credentials_via_env_file() {
+    let fake = FakeRunner::new(|call| {
+        if call[1] == "container" {
+            fail("No such container")
+        } else {
+            ok("")
+        }
+    });
+    let runner = docker_runner(&fake, "name: app\n", None, false);
+    let mut dep = docker_dep("minio", Some(51000));
+    dep.extra
+        .insert("access_key".into(), ExtraValue::String("me".into()));
+    dep.extra.insert(
+        "secret_key".into(),
+        ExtraValue::String("top-secret-pw".into()),
+    );
+    runner.start(&dep).unwrap();
+    let run = &fake.lines()[1];
+    assert!(run.starts_with("docker run -d"), "{run}");
+    assert!(run.contains("--env-file "), "{run}");
+    assert!(!run.contains("top-secret-pw"), "{run}");
+    assert!(!run.contains("MINIO_ROOT"), "{run}");
+    assert!(run.contains(MINIO_PIN), "{run}");
+}
+
+// ── built-in digest pin ──────────────────────────────────────────────────────
+
+const MINIO_PIN: &str =
+    "pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46";
+const MINIO_TAG: &str = "RELEASE.2026-09-16T00-00-00Z";
+
+fn minio_lock(tag: &str, digest: &str) -> LockFile {
+    let mut lock = redis_lock(tag, digest);
+    let entry = lock.dependencies.remove("redis").unwrap();
+    lock.dependencies.insert("minio".into(), entry);
+    lock
+}
+
+#[test]
+fn default_image_runs_the_pinned_digest() {
+    let fake = FakeRunner::new(|call| {
+        if call[1] == "container" {
+            fail("No such container")
+        } else {
+            ok("")
+        }
+    });
+    let runner = docker_runner(&fake, "name: app\n", None, false);
+    let dep = docker_dep("minio", Some(51000));
+    assert_eq!(runner.reference(&dep).unwrap(), MINIO_PIN);
+    runner.start(&dep).unwrap();
+    let run = &fake.lines()[1];
+    assert!(run.contains(&format!(" {MINIO_PIN} server /data")), "{run}");
+}
+
+#[test]
+fn version_or_image_override_skips_the_digest_pin() {
+    let fake = FakeRunner::ok();
+    let runner = docker_runner(&fake, "name: app\n", None, false);
+    let mut dep = docker_dep("minio", None);
+    dep.version = Some(MINIO_TAG.into());
+    assert_eq!(
+        runner.reference(&dep).unwrap(),
+        format!("pgsty/silo:{MINIO_TAG}")
+    );
+    let mut dep = docker_dep("minio", None);
+    dep.image = Some("mirror.example/pgsty/silo".into());
+    assert_eq!(
+        runner.reference(&dep).unwrap(),
+        format!("mirror.example/pgsty/silo:{MINIO_TAG}")
+    );
+}
+
+#[test]
+fn pinned_digest_round_trips_through_the_lock() {
+    // First run: no lock. The pin is pulled and recorded without asking the runtime.
+    let fake = FakeRunner::new(|call| match call[1].as_str() {
+        "image" => fail("No such image"),
+        _ => ok(""),
+    });
+    let runner = docker_runner(&fake, "name: app\n", None, false);
+    let dep = docker_dep("minio", None);
+    assert!(!runner.is_installed(&dep).unwrap());
+    runner.install(&dep).unwrap();
+    let (version, digest) = runner.resolved(&dep).unwrap();
+    assert_eq!(
+        (version.as_deref(), digest.as_deref()),
+        (Some(MINIO_TAG), Some(MINIO_PIN))
+    );
+    assert_eq!(
+        fake.lines(),
+        vec![
+            format!("docker image inspect {MINIO_PIN}"),
+            format!("docker pull {MINIO_PIN}"),
+        ]
+    );
+    // Next run, from that lock entry (serialized and parsed back): still the pin.
+    let lock =
+        LockFile::parse(&yaml::to_string(&minio_lock(MINIO_TAG, MINIO_PIN)).unwrap()).unwrap();
+    let fake = FakeRunner::ok();
+    let runner = docker_runner(&fake, "name: app\n", Some(&lock), false);
+    assert_eq!(runner.reference(&dep).unwrap(), MINIO_PIN);
+}
+
+#[test]
+fn lock_cannot_replace_the_pinned_digest() {
+    let other = format!("pgsty/silo@sha256:{}", "a".repeat(64));
+    let lock = minio_lock(MINIO_TAG, &other);
+    let fake = FakeRunner::ok();
+    let runner = docker_runner(&fake, "name: app\n", Some(&lock), false);
+    assert_eq!(
+        runner.reference(&docker_dep("minio", None)).unwrap(),
+        MINIO_PIN
+    );
+}
+
+#[test]
+fn update_keeps_the_pinned_digest() {
+    // `--update` re-resolves tags, but a built-in pin changes only with a devy release.
+    let other = format!("pgsty/silo@sha256:{}", "a".repeat(64));
+    let lock = minio_lock("RELEASE.2026-01-01T00-00-00Z", &other);
+    let fake = FakeRunner::ok();
+    let runner = docker_runner(&fake, "name: app\n", Some(&lock), true);
+    let dep = docker_dep("minio", None);
+    assert_eq!(runner.reference(&dep).unwrap(), MINIO_PIN);
+    let (version, digest) = runner.resolved(&dep).unwrap();
+    assert_eq!(
+        (version.as_deref(), digest.as_deref()),
+        (Some(MINIO_TAG), Some(MINIO_PIN))
+    );
+}
+
+#[test]
+fn locked_digest_for_another_repository_is_not_reused() {
+    let lock = minio_lock(MINIO_TAG, MINIO_PIN);
+    let fake = FakeRunner::ok();
+    let runner = docker_runner(&fake, "name: app\n", Some(&lock), false);
+    let mut dep = docker_dep("minio", None);
+    dep.image = Some(format!("minio/minio:{MINIO_TAG}"));
+    assert_eq!(
+        runner.reference(&dep).unwrap(),
+        format!("minio/minio:{MINIO_TAG}")
+    );
+}
+
+#[test]
+fn config_hash_covers_secret_env() {
+    let fake = FakeRunner::ok();
+    let runner = docker_runner(&fake, "name: app\n", None, false);
+    let base = runner.run_spec(&docker_dep("redis", Some(51000))).unwrap();
+    let mut with_secret = base.clone();
+    with_secret.secret_env = vec![("MEILI_MASTER_KEY".into(), "a".into())];
+    let mut other_secret = base.clone();
+    other_secret.secret_env = vec![("MEILI_MASTER_KEY".into(), "b".into())];
+    assert_ne!(config_hash(&base), config_hash(&with_secret));
+    assert_ne!(config_hash(&with_secret), config_hash(&other_secret));
+}
+
+#[test]
 fn podman_warns_for_privileged_host_ports() {
     let fake = FakeRunner::new(|call| {
         if call[1] == "container" {
@@ -474,9 +680,17 @@ fn run_failure_surfaces_cli_error() {
 
 #[test]
 fn is_running_reads_container_state() {
-    let fake = FakeRunner::new(|_| ok(r#"{"State":{"Running":true},"Config":{"Labels":{}}}"#));
+    let state = own_inspect(&docker_dep("redis", None));
+    let fake = FakeRunner::new(move |_| ok(&state));
     assert!(
         docker_runner(&fake, "name: app\n", None, false)
+            .is_running(&docker_dep("redis", None))
+            .unwrap()
+    );
+    // Another project's container under our name doesn't count as ours running.
+    let fake = FakeRunner::new(|_| ok(r#"{"State":{"Running":true},"Config":{"Labels":{}}}"#));
+    assert!(
+        !docker_runner(&fake, "name: app\n", None, false)
             .is_running(&docker_dep("redis", None))
             .unwrap()
     );
@@ -488,23 +702,88 @@ fn is_running_reads_container_state() {
     );
 }
 
+/// Inspect output for `dep`'s container as this project created it.
+fn own_inspect(dep: &Dependency) -> String {
+    let spec_fake = FakeRunner::ok();
+    let labels = docker_runner(&spec_fake, "name: app\n", None, false)
+        .run_spec(dep)
+        .unwrap()
+        .labels;
+    inspect_json(true, &labels)
+}
+
 #[test]
 fn stop_and_remove() {
-    let fake = FakeRunner::ok();
-    let runner = docker_runner(&fake, "name: app\n", None, false);
     let dep = docker_dep("postgres", None);
+    let state = own_inspect(&dep);
+    let fake = FakeRunner::new(move |call| {
+        if call[1] == "container" {
+            ok(&state)
+        } else {
+            ok("")
+        }
+    });
+    let runner = docker_runner(&fake, "name: app\n", None, false);
     runner.stop(&dep).unwrap();
     assert!(runner.remove(&dep, false).unwrap());
     assert!(runner.remove(&dep, true).unwrap());
     let name = format!("devy-{}-postgresql", slug());
+    let actions: Vec<String> = fake
+        .lines()
+        .into_iter()
+        .filter(|l| !l.contains("container inspect"))
+        .collect();
     assert_eq!(
-        fake.lines(),
+        actions,
         vec![
             format!("docker stop {name}"),
             format!("docker rm -f {name}"),
             format!("docker rm -f {name}"),
             format!("docker volume rm {name}"),
         ]
+    );
+}
+
+#[test]
+fn stop_and_remove_proceed_when_container_is_missing() {
+    let fake = FakeRunner::new(|call| {
+        if call[1] == "container" {
+            fail("No such container")
+        } else {
+            ok("")
+        }
+    });
+    let runner = docker_runner(&fake, "name: app\n", None, false);
+    let dep = docker_dep("postgres", None);
+    runner.stop(&dep).unwrap();
+    assert!(runner.remove(&dep, true).unwrap());
+    let name = format!("devy-{}-postgresql", slug());
+    assert!(fake.lines().contains(&format!("docker volume rm {name}")));
+}
+
+#[test]
+fn stop_refuses_and_remove_skips_container_from_another_project() {
+    let state = inspect_json(
+        true,
+        &[(PROJECT_LABEL.to_string(), "/src/evil".to_string())],
+    );
+    let fake = FakeRunner::new(move |_| ok(&state));
+    let runner = docker_runner(&fake, "name: app\n", None, false);
+    let dep = docker_dep("redis", None);
+    let expected = format!("container devy-{}-redis belongs to another project", slug());
+    assert_eq!(runner.stop(&dep).unwrap_err().to_string(), expected);
+    let msgs = crate::output::with_warn_messages(|| {
+        assert!(
+            !runner.remove(&dep, true).unwrap(),
+            "nothing of ours removed"
+        );
+    });
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    assert!(msgs[0].contains("belongs to another project"), "{msgs:?}");
+    assert!(
+        fake.lines().iter().all(|l| l.contains("container inspect")),
+        "no stop, rm or volume rm: {:?}",
+        fake.lines()
     );
 }
 

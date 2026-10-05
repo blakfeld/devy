@@ -33,6 +33,14 @@ impl Module for CrystalModule {
         pm.install_package(&pm_dep(dep, package_name(pm)))
     }
 
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        super::helpers::step_if_exists(
+            project_root,
+            "shard.yml",
+            "shards install (shard.yml postinstall scripts)",
+        )
+    }
+
     fn post_setup(
         &self,
         _dep: &Dependency,
@@ -59,7 +67,7 @@ impl Module for CrystalModule {
         if !status.success() {
             anyhow::bail!("`shards install` failed — check the output above for details");
         }
-        write_stamp(&stamp_path, &manifest);
+        write_stamp(&stamp_path, &manifest)?;
         output::success("Crystal dependencies installed");
         Ok(())
     }

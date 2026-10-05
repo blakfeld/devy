@@ -4,6 +4,7 @@
 Defines the `devy` command-line surface: the built-in subcommands, how user-defined commands are dispatched, the output conventions, and how errors map to exit codes.
 
 ## Requirements
+
 ### Requirement: Built-in subcommands
 The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`, `stop`, `restart`, `down`, `status`, `check`, `doctor`, `hook`, `pr`, `export`, `logs` and `ask`, plus the hidden `_commands` and `_services` subcommands used by shell completion, and `--help` SHALL list the visible ones.
 
@@ -11,6 +12,7 @@ The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`
 - **WHEN** the user runs `devy --help`
 - **THEN** the process exits 0
 - **AND** the output lists `up`, `down`, `check`, `doctor`, `init`, `hook`, `status`, `logs` and `ask`
+- **AND** the output does not list `allow`
 
 #### Scenario: Hidden subcommand is not advertised
 - **WHEN** the user runs `devy --help`
@@ -59,10 +61,16 @@ The CLI SHALL treat any subcommand that is not built in as the name of a project
 ### Requirement: Output conventions
 The CLI SHALL print progress to stdout using consistent markers: a blank line plus bold text for section headers, `→` for steps in progress, `✓` for successes, a dimmed `○` for skipped work, and `·` for informational lines. Warnings SHALL go to stderr prefixed with a yellow `!`. `devy check` writes its failure summary to stderr as a red `✗` followed by `<n> issue(s) found`.
 
+Text that comes from outside devy SHALL have C0 control characters (other than newline and tab in multi-line content), DEL and C1 control characters removed before it is printed, whether or not output is a terminal. The one exception is service log output written to a terminal, which SHALL keep SGR color sequences (`ESC [ <digits and ;> m`) while all other escape sequences are removed. Such text includes configuration and lock values, file contents, service logs, child-process error text and model replies.
+
 #### Scenario: Warning goes to stderr
 - **WHEN** a command emits a warning
 - **THEN** the warning appears on stderr as `  ! <message>`
 - **AND** nothing for that warning is written to stdout
+
+#### Scenario: Escape sequence in a dependency name
+- **WHEN** `devy.yml` sets `name: "app\e]52;c;ZWNobyBoaQ==\a"`
+- **THEN** the `devy up` header contains no ESC or BEL characters
 
 ### Requirement: Error reporting and exit codes
 On failure the CLI SHALL print `error: <message chain>` to stderr, with context and causes joined by `: `, and exit with status 1. Successful runs SHALL exit 0, and command-line usage errors SHALL exit 2. When `devy check` finds issues (unrecognized keys, invalid shells, missing installs or environment drift), it SHALL print its own summary and exit 1 without the additional `error:` line. Configuration errors that `check` hits, such as port conflicts, multi-key dependency entries or failed config validation, SHALL still print `error: …` and exit 1.

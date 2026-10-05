@@ -16,12 +16,28 @@ struct Document<'a, T: Serialize> {
 
 /// `body` as a JSON document with the top-level `version` field.
 pub fn render<T: Serialize>(body: &T) -> Result<String> {
-    let mut out = serde_json::to_string_pretty(&Document {
+    let rendered = serde_json::to_string_pretty(&Document {
         version: VERSION,
         body,
     })?;
+    let mut out = escape_c1(&rendered);
     out.push('\n');
     Ok(out)
+}
+
+/// serde_json escapes only U+0000-U+001F; DEL and the C1 controls (U+007F-U+009F) are
+/// escaped too, so repo-controlled strings cannot reach the terminal as 8-bit controls.
+/// They only occur inside JSON strings, where `\u00XX` means the same character.
+fn escape_c1(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if ('\u{7f}'..='\u{9f}').contains(&c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Prints `body` to stdout as the command's only output.
@@ -52,6 +68,20 @@ pub fn disable_color() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c1_controls_are_escaped_and_round_trip() {
+        #[derive(Serialize)]
+        struct Named {
+            name: String,
+        }
+        let name = "x\u{9b}2J\u{7f}\u{1b}y".to_string();
+        let out = render(&Named { name: name.clone() }).unwrap();
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out:?}");
+        assert!(out.contains("\\u009b"), "{out}");
+        let back: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(back["name"], name);
+    }
 
     #[derive(Serialize)]
     struct Body {

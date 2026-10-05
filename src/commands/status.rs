@@ -99,7 +99,8 @@ pub(crate) fn status_report(
             .flat_map(|dep| modules::get(&dep.name).path_prepends(dep, project_root))
             .collect();
         report.env_path =
-            project_env::resolve(config, &report.deps, pm, project_root).path_prepends;
+            project_env::resolve(config, &report.deps, pm, project_root, PortMode::ReadOnly)
+                .path_prepends;
         report.written_vars = env_mgr.read_vars(project_root);
         report.written_paths = env_mgr.read_path_prepends(project_root);
     }
@@ -140,7 +141,7 @@ struct StatusDocument<'a> {
     environment: BTreeMap<&'a str, Option<String>>,
     environment_written: bool,
     path: Vec<PathEntry<'a>>,
-    commands: &'a [CommandInfo],
+    commands: Vec<CommandInfo>,
 }
 
 #[derive(Serialize)]
@@ -187,7 +188,10 @@ impl StatusReport {
                     .written_vars
                     .as_ref()
                     .and_then(|vars| vars.get(key))
-                    .map(|value| redact::value(key, value));
+                    // Cleaned before redaction so an invisible character cannot split a
+                    // credential past the patterns; controls and invisible characters are
+                    // therefore not reported in the JSON value.
+                    .map(|value| redact::value(key, &crate::output::clean(value)));
                 (key.as_str(), written)
             })
             .collect();
@@ -209,7 +213,16 @@ impl StatusReport {
             environment,
             environment_written: self.written_vars.is_some(),
             path,
-            commands: &self.commands,
+            // Redacted like environment values: a command line can carry a token
+            // (`curl -H "Authorization: …"`, `mysql -pSECRET`).
+            commands: self
+                .commands
+                .iter()
+                .map(|c| CommandInfo {
+                    cmd: redact::text(&crate::output::clean(&c.cmd)),
+                    ..c.clone()
+                })
+                .collect(),
         }
     }
 }
@@ -253,6 +266,7 @@ mod tests {
     use crate::env_manager::MockEnvManager;
     use crate::package_manager::MockPackageManager;
     use crate::service_runner::docker::{FakeRunner, fail, ok};
+    use serde_norway as yaml;
     use std::collections::HashMap;
 
     #[test]
@@ -282,8 +296,7 @@ mod tests {
     fn status_impl_probes_docker_services_through_the_container_cli() {
         let dir = crate::test_support::tmp_dir();
         let config: DevyConfig =
-            serde_yml::from_str("service_manager: docker\ndependencies:\n  - redis\n  - jq\n")
-                .unwrap();
+            yaml::from_str("service_manager: docker\ndependencies:\n  - redis\n  - jq\n").unwrap();
         let pm = MockPackageManager {
             installed: true,
             ..Default::default()
@@ -313,7 +326,7 @@ mod tests {
     // ── status --json ────────────────────────────────────────────────────────
 
     fn config(yaml: &str) -> DevyConfig {
-        serde_yml::from_str(yaml).unwrap()
+        yaml::from_str(yaml).unwrap()
     }
 
     fn document(report: &StatusReport) -> serde_json::Value {
@@ -424,6 +437,23 @@ mod tests {
     }
 
     #[test]
+    fn status_json_redacts_secrets_in_commands() {
+        let dir = crate::test_support::tmp_dir();
+        let config = config(concat!(
+            "commands:\n",
+            "  db: \"mysql -uroot -phunter2 app\"\n",
+            "  fetch: \"curl -H 'Authorization: Bearer abc.def.ghi' https://x\"\n",
+            "  push: \"GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123 git push\"\n",
+        ));
+        let doc = document(&report(&config, &Shadowenv, &dir));
+        let text = doc["commands"].to_string();
+        for secret in ["hunter2", "abc.def.ghi", "ghp_abc"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert!(text.contains("mysql -uroot"), "{text}");
+    }
+
+    #[test]
     fn status_json_redacts_secret_environment_values() {
         let dir = crate::test_support::tmp_dir();
         let written: HashMap<String, String> = [
@@ -472,7 +502,8 @@ mod tests {
         )
         .unwrap();
         let deps = config.normalized_dependencies().unwrap();
-        let expected = crate::project_env::resolve(&config, &deps, &pm, &dir).path_prepends;
+        let expected = crate::project_env::resolve(&config, &deps, &pm, &dir, PortMode::ReadOnly)
+            .path_prepends;
         assert_eq!(expected[0], "/p/.devy/nix-profile/bin");
         let doc = document(&report);
         let entries: Vec<&str> = doc["path"]

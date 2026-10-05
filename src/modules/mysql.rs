@@ -6,9 +6,7 @@ use std::time::Duration;
 use crate::config::Dependency;
 use crate::package_manager::PackageManager;
 
-use crate::output;
-
-use super::{Module, write_mysql_config};
+use super::Module;
 
 pub struct MysqlModule;
 
@@ -124,22 +122,7 @@ impl Module for MysqlModule {
         _project_root: &std::path::Path,
     ) -> Result<()> {
         let p = port(dep)?;
-        let args = cli_args(dep);
-        if p != 3306 || args.is_some() {
-            match pm.service_config_dir("mysql") {
-                Some(config_dir) => write_mysql_config(&config_dir, p, args.as_deref())?,
-                // Under nix the port and cli_args go on the command line instead. An
-                // unapplied explicit port is reported by the shared port resolver.
-                None if pm.name() != "nix" && args.is_some() => {
-                    output::warn(&format!(
-                        "cli_args ignored: {} does not support service config dirs",
-                        pm.name()
-                    ));
-                }
-                None => {}
-            }
-        }
-        Ok(())
+        super::helpers::mysql_family_post_setup(pm, "mysql", p, cli_args(dep).as_deref())
     }
 
     fn env_vars(

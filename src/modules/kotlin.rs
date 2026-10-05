@@ -32,6 +32,10 @@ impl Module for KotlinModule {
         pm.install_package(&pm_dep(dep, package_name(pm)))
     }
 
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        super::helpers::gradle_steps(project_root)
+    }
+
     fn post_setup(
         &self,
         _dep: &Dependency,
@@ -69,7 +73,7 @@ impl Module for KotlinModule {
         if !status.success() {
             anyhow::bail!("`{gradlew} dependencies` failed — check the output above for details");
         }
-        write_stamp(&stamp_path, &manifest);
+        write_stamp(&stamp_path, &manifest)?;
         output::success("Gradle dependencies resolved");
         Ok(())
     }

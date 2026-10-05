@@ -3,8 +3,10 @@ use colored::Colorize;
 use serde::Serialize;
 use std::collections::HashMap;
 
+use crate::ai::redact;
 use crate::config::Dependency;
 use crate::modules;
+use crate::output::clean_line;
 use crate::service_runner::{self, Runners, ServiceRunner};
 
 use super::ports::ResolvedPort;
@@ -124,7 +126,11 @@ fn dep_row(dep: &Dependency, port: Option<ResolvedPort>, runners: &Runners) -> R
 
 /// Prints `rows` as the dependency status table and returns the number of issues.
 pub fn render_dep_rows(rows: &[DepRow], bold_errors: bool) -> usize {
-    let name_col = rows.iter().map(|r| r.label.len()).max().unwrap_or(0);
+    let labels: Vec<String> = rows
+        .iter()
+        .map(|r| clean_line(&r.label).into_owned())
+        .collect();
+    let name_col = labels.iter().map(|l| l.len()).max().unwrap_or(0);
     const STATUS_COL: usize = "not installed".len();
     let emphasize = |s: &str| {
         if bold_errors {
@@ -135,7 +141,7 @@ pub fn render_dep_rows(rows: &[DepRow], bold_errors: bool) -> usize {
     };
     let mut issues = 0usize;
 
-    for row in rows {
+    for (row, label) in rows.iter().zip(&labels) {
         let (icon, status) = if row.installed {
             (
                 "✓".green().bold().to_string(),
@@ -157,7 +163,7 @@ pub fn render_dep_rows(rows: &[DepRow], bold_errors: bool) -> usize {
 
         println!(
             "  {}  {:<name_col$}  {:<STATUS_COL$}  {}",
-            icon, row.label, status, service
+            icon, label, status, service
         );
     }
 
@@ -177,29 +183,34 @@ pub fn print_env_table(
     bold_errors: bool,
 ) -> Result<usize> {
     let mut issues = 0usize;
-    let key_col = config_env.keys().map(|k| k.len()).max().unwrap_or(0);
     let mut sorted_keys: Vec<&String> = config_env.keys().collect();
     sorted_keys.sort();
+    // (key, the key as printed), in sorted order.
+    let rows: Vec<(&String, String)> = sorted_keys
+        .iter()
+        .map(|k| (*k, clean_line(k).into_owned()))
+        .collect();
+    let key_col = rows.iter().map(|(_, k)| k.len()).max().unwrap_or(0);
 
     match written_vars {
         None if bold_errors => {
-            for key in &sorted_keys {
+            for (_, shown) in &rows {
                 issues += 1;
                 println!(
                     "  {}  {:<key_col$}  {}",
                     "✗".red().bold(),
-                    key,
+                    shown,
                     "missing".red().bold()
                 );
             }
         }
         None => {
-            for key in &sorted_keys {
-                println!("  {:<key_col$}  {}", key, "(not configured)".dimmed());
+            for (_, shown) in &rows {
+                println!("  {:<key_col$}  {}", shown, "(not configured)".dimmed());
             }
         }
         Some(ref vars) if bold_errors => {
-            for key in &sorted_keys {
+            for (key, shown) in &rows {
                 let (icon, value): (String, String) = if vars.contains_key(*key) {
                     (
                         "✓".green().bold().to_string(),
@@ -212,22 +223,28 @@ pub fn print_env_table(
                         "missing".red().bold().to_string(),
                     )
                 };
-                println!("  {}  {:<key_col$}  {}", icon, key, value);
+                println!("  {}  {:<key_col$}  {}", icon, shown, value);
             }
         }
         Some(vars) => {
-            for key in &sorted_keys {
-                let value = vars
-                    .get(*key)
-                    .map(String::as_str)
-                    .unwrap_or("(not set)")
-                    .dimmed();
-                println!("  {:<key_col$}  {}", key, value);
+            for (key, shown) in &rows {
+                let value = status_value(key, vars.get(*key).map(String::as_str));
+                println!("  {:<key_col$}  {}", shown, value.as_str().dimmed());
             }
         }
     }
 
     Ok(issues)
+}
+
+/// The value `devy status` shows for `key`: `(not set)` when missing, otherwise the value
+/// redacted as `devy status --json` and AI requests redact it (`<redacted>` when the key
+/// names a secret, credential-looking parts otherwise) and cleaned to one line.
+fn status_value(key: &str, value: Option<&str>) -> String {
+    match value {
+        None => "(not set)".to_string(),
+        Some(v) => redact::value(key, &clean_line(v)),
+    }
 }
 
 /// Renders the PATH prepend status table. Shows ✓/✗ in check mode, plain path list in status mode.
@@ -238,6 +255,7 @@ pub fn print_path_table(
     bold_errors: bool,
 ) -> usize {
     let mut issues = 0usize;
+    let shown = |entry: &String| clean_line(entry).into_owned();
     match written {
         None if bold_errors => {
             for entry in configured {
@@ -245,14 +263,14 @@ pub fn print_path_table(
                 println!(
                     "  {}  {}  {}",
                     "✗".red().bold(),
-                    entry,
+                    shown(entry),
                     "missing".red().bold()
                 );
             }
         }
         None => {
             for entry in configured {
-                println!("  {}  {}", entry, "(not configured)".dimmed());
+                println!("  {}  {}", shown(entry), "(not configured)".dimmed());
             }
         }
         Some(ref written_entries) if bold_errors => {
@@ -263,7 +281,7 @@ pub fn print_path_table(
                     println!(
                         "  {}  {}  {}",
                         "✓".green().bold(),
-                        entry,
+                        shown(entry),
                         "configured".green()
                     );
                 } else {
@@ -271,7 +289,7 @@ pub fn print_path_table(
                     println!(
                         "  {}  {}  {}",
                         "✗".red().bold(),
-                        entry,
+                        shown(entry),
                         "missing".red().bold()
                     );
                 }
@@ -282,9 +300,9 @@ pub fn print_path_table(
                 written_entries.iter().map(String::as_str).collect();
             for entry in configured {
                 if written_set.contains(entry.as_str()) {
-                    println!("  {}  {}", entry, "✓".green());
+                    println!("  {}  {}", shown(entry), "✓".green());
                 } else {
-                    println!("  {}  {}", entry, "(not set)".dimmed());
+                    println!("  {}  {}", shown(entry), "(not set)".dimmed());
                 }
             }
         }
@@ -297,6 +315,7 @@ mod tests {
     use super::*;
     use crate::package_manager::MockPackageManager;
     use crate::service_runner::package_runners;
+    use serde_norway as yaml;
     use std::path::Path;
 
     /// Renders the rows for `deps` and returns the issue count, or the query error.
@@ -391,8 +410,7 @@ mod tests {
     fn dep_rows_report_docker_backend() {
         use crate::service_runner::docker::{ContainerRuntime, FakeRunner, ok};
         let config: crate::config::DevyConfig =
-            serde_yml::from_str("service_manager: docker\ndependencies:\n  - redis\n  - jq\n")
-                .unwrap();
+            yaml::from_str("service_manager: docker\ndependencies:\n  - redis\n  - jq\n").unwrap();
         let pm = MockPackageManager {
             installed: true,
             ..Default::default()
@@ -447,6 +465,41 @@ mod tests {
         assert_eq!(rows[0].port.unwrap().source(), "lock");
         assert_eq!(rows[0].backend, Backend::Package);
         assert_eq!(rows[1].port, None, "jq has no port");
+    }
+
+    #[test]
+    fn status_value_masks_secret_keys() {
+        assert_eq!(status_value("API_TOKEN", Some("abc")), "<redacted>");
+        assert_eq!(status_value("db_password", Some("hunter2")), "<redacted>");
+        assert_eq!(status_value("STRIPE_SECRET_KEY", Some("sk")), "<redacted>");
+        assert_eq!(status_value("LOG_LEVEL", Some("debug")), "debug");
+        assert_eq!(status_value("API_TOKEN", None), "(not set)");
+        assert_eq!(status_value("LOG_LEVEL", None), "(not set)");
+        // Credential-looking parts are redacted under any key, as in `--json`.
+        let url = status_value("DATABASE_URL", Some("postgres://app:hunter2@db/app"));
+        assert!(!url.contains("hunter2"), "{url}");
+        // An invisible character cannot split a credential past the patterns.
+        let url = status_value(
+            "DATABASE_URL",
+            Some("postgres://app:\u{feff}hunter2@db/app"),
+        );
+        assert!(!url.contains("hunter2"), "{url}");
+    }
+
+    #[test]
+    fn status_value_is_one_line() {
+        assert_eq!(
+            status_value("LOG_LEVEL", Some("debug\n  FAKE  row")),
+            "debug   FAKE  row"
+        );
+    }
+
+    #[test]
+    fn status_value_cleans_control_sequences() {
+        assert_eq!(
+            status_value("GREETING", Some("hi\x1b]52;c;eA==\x07\x1b[2J!")),
+            "hi!"
+        );
     }
 
     #[test]

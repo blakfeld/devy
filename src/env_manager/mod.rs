@@ -9,6 +9,7 @@ use std::path::Path;
 pub trait EnvManager {
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
+    /// Writes the environment for `dir` and tells the environment tool to load it.
     fn setup(
         &self,
         dir: &Path,

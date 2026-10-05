@@ -1,0 +1,2 @@
+#!/bin/sh
+touch "@OUT@/markers/venv-claude"

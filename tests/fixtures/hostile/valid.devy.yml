@@ -1,0 +1,15 @@
+# Hostile fixture: VALID config (every name passes validation) that is still hostile.
+# The test swaps it in for tree/devy.yml so that `up` reaches the managed-path checks.
+name: "hostile\e]52;c;aG9zdGlsZQ==\a"
+hooks:
+  before_up: "touch '@OUT@/markers/before_up'; exit 1"
+  after_up: "touch '@OUT@/markers/after_up'; exit 1"
+  before_down: "touch '@OUT@/markers/before_down'; exit 1"
+dependencies:
+  - mysql:
+      cli_args: "--init-file=@OUT@/markers/init.sql --plugin-load=@OUT@/evil.so"
+  - python
+environment:
+  BASH_ENV: "@OUT@/bash_env.sh"
+commands:
+  dev: echo dev

@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use which::which;
 
 use crate::config::Dependency;
+use crate::installers;
 use crate::output;
 use crate::package_manager::PackageManager;
 
@@ -12,11 +14,30 @@ use super::helpers::{stamp_matches, write_stamp};
 
 pub struct DenoModule;
 
+/// Arguments for the deno installer: `-s v<version>` when a version is pinned (a version
+/// already starting with `v` is passed as is). The installer ignores arguments starting
+/// with `-` and takes the first other one as the version.
+fn installer_args(version: Option<&str>) -> Vec<OsString> {
+    match version {
+        Some(v) if v.starts_with('v') => vec!["-s".into(), v.into()],
+        Some(v) => vec!["-s".into(), format!("v{v}").into()],
+        None => Vec::new(),
+    }
+}
+
 fn deno_bin() -> Option<String> {
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|home| format!("{home}/.deno/bin/deno"))
+    // The same home the installer runs with (see `installers::user_home`).
+    installers::user_home().map(|home| deno_bin_in(&home))
+}
+
+/// Where the deno installer puts the binary under `home`.
+fn deno_bin_in(home: &std::ffi::OsStr) -> String {
+    format!("{}/.deno/bin/deno", home.to_string_lossy())
+}
+
+/// Whether deno is on PATH or present at `bin` (the installer's location).
+fn installed(bin: Option<&str>) -> bool {
+    which("deno").is_ok() || bin.is_some_and(|b| Path::new(b).exists())
 }
 
 impl Module for DenoModule {
@@ -29,47 +50,30 @@ impl Module for DenoModule {
     }
 
     fn is_installed(&self, _pm: &dyn PackageManager, _dep: &Dependency) -> Result<bool> {
-        let bin_exists = deno_bin()
-            .map(|b| std::path::Path::new(&b).exists())
-            .unwrap_or(false);
-        Ok(which("deno").is_ok() || bin_exists)
+        Ok(installed(deno_bin().as_deref()))
     }
 
     fn install(&self, _pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        #[cfg(test)]
-        let base_script = std::env::var("ENVY_TEST_DENO_INSTALL_SCRIPT")
-            .unwrap_or_else(|_| "curl -fsSL https://deno.land/install.sh | sh".to_string());
-        #[cfg(not(test))]
-        let base_script = "curl -fsSL https://deno.land/install.sh | sh".to_string();
-
-        let version_arg = dep.version.as_deref().map(|v| {
-            if v.starts_with('v') {
-                v.to_string()
-            } else {
-                format!("v{v}")
-            }
-        });
-
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c");
-        if let Some(ref ver) = version_arg {
-            // The installer script accepts the version as its first positional argument.
-            cmd.arg(format!("{base_script} -s {ver}"));
-        } else {
-            cmd.arg(&base_script);
-        }
-
-        let status = cmd
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|e| anyhow::anyhow!("Failed to run Deno installer: {e}"))?;
-
+        let status = installers::run_script(
+            &installers::DENO,
+            installers::Interpreter::Sh,
+            &installer_args(dep.version.as_deref()),
+            // CI=1 skips the script's interactive shell setup, which would run an
+            // unpinned JSR module and offer to edit shell rc files.
+            &[("CI", "1")],
+        )?;
         if !status.success() {
             bail!("Deno installation failed — check the output above for details");
         }
         Ok(())
+    }
+
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        ["deno.json", "deno.jsonc"]
+            .into_iter()
+            .find(|f| project_root.join(f).exists())
+            .map(|f| vec![format!("deno install ({f})")])
+            .unwrap_or_default()
     }
 
     fn post_setup(
@@ -107,7 +111,7 @@ impl Module for DenoModule {
         if !status.success() {
             anyhow::bail!("`deno install` failed — check the output above for details");
         }
-        write_stamp(&stamp_path, &manifest);
+        write_stamp(&stamp_path, &manifest)?;
         output::success("Deno dependencies installed");
         Ok(())
     }
@@ -117,9 +121,15 @@ impl Module for DenoModule {
         _pm: &dyn PackageManager,
         _dep: &Dependency,
     ) -> Result<Option<String>> {
-        let path = deno_bin()
+        // The installer's binary, else one on PATH outside the project — never a bare
+        // name resolved against the full PATH.
+        let Some(path) = deno_bin()
             .filter(|b| std::path::Path::new(b).exists())
-            .unwrap_or_else(|| "deno".to_string());
+            .map(std::path::PathBuf::from)
+            .or_else(|| crate::fs_safe::which_outside_project("deno"))
+        else {
+            return Ok(None);
+        };
         let out = Command::new(path).arg("--version").output();
         // "deno 1.40.0 ..." — take second token of first line
         Ok(out.ok().and_then(|o| {
@@ -151,10 +161,7 @@ mod tests {
 
     #[test]
     fn deno_bin_returns_some_with_non_empty_home() {
-        if std::env::var("HOME")
-            .map(|h| !h.is_empty())
-            .unwrap_or(false)
-        {
+        if installers::user_home().is_some() {
             let bin = deno_bin().unwrap();
             assert!(
                 bin.contains(".deno/bin/deno"),
@@ -165,11 +172,9 @@ mod tests {
 
     #[test]
     fn deno_bin_path_contains_home() {
-        if let Ok(home) = std::env::var("HOME")
-            && !home.is_empty()
-        {
+        if let Some(home) = installers::user_home() {
             let bin = deno_bin().unwrap();
-            assert!(bin.starts_with(&home));
+            assert!(bin.starts_with(&*home.to_string_lossy()));
         }
     }
 
@@ -182,26 +187,22 @@ mod tests {
 
     #[test]
     fn deno_is_installed_true_when_bin_file_exists_and_not_on_path() {
-        // Only runs when deno is NOT on PATH.
+        // Only meaningful when deno is NOT on PATH. Uses a temporary home rather than
+        // the real one, so it never touches the user's ~/.deno and never races the
+        // tests that expect no binary there.
         if which("deno").is_ok() {
             return;
         }
-        if let Some(bin_path) = deno_bin() {
-            let path = std::path::Path::new(&bin_path);
-            if path.exists() {
-                return;
-            }
-            std::fs::create_dir_all(path.parent().unwrap()).ok();
-            std::fs::write(&bin_path, b"#!/bin/sh").ok();
-            let pm = MockPackageManager::default();
-            let dep = Dependency::simple("deno");
-            let result = DenoModule.is_installed(&pm, &dep).unwrap();
-            std::fs::remove_file(&bin_path).ok();
-            assert!(
-                result,
-                "Expected is_installed=true when deno binary exists at {bin_path}"
-            );
-        }
+        let home = crate::test_support::tmp_dir();
+        let bin_path = deno_bin_in(home.as_os_str());
+        assert!(!installed(Some(&bin_path)));
+        let path = Path::new(&bin_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh").unwrap();
+        assert!(
+            installed(Some(&bin_path)),
+            "Expected installed=true when deno binary exists at {bin_path}"
+        );
     }
 
     #[test]
@@ -223,6 +224,21 @@ mod tests {
         assert!(
             !ver.unwrap().is_empty(),
             "Expected non-empty version string"
+        );
+    }
+
+    #[test]
+    fn deno_is_installed_checks_the_installer_location_in_the_user_home() {
+        let home = crate::test_support::tmp_dir();
+        let bin = deno_bin_in(home.as_os_str());
+        assert!(bin.ends_with("/.deno/bin/deno"), "{bin}");
+        // Not there yet: only a deno on PATH can make it count as installed.
+        assert_eq!(installed(Some(&bin)), which("deno").is_ok());
+        std::fs::create_dir_all(home.join(".deno/bin")).unwrap();
+        std::fs::write(&bin, b"").unwrap();
+        assert!(
+            installed(Some(&bin)),
+            "the installer's binary must count as installed"
         );
     }
 
@@ -263,26 +279,67 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn deno_install_fails_when_script_exits_nonzero() {
-        // Uses ENVY_TEST_DENO_INSTALL_SCRIPT to inject a failing script.
-        let _guard = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // SAFETY: serialised by ENV_LOCK; var is only read by DenoModule::install.
-        unsafe {
-            std::env::set_var("ENVY_TEST_DENO_INSTALL_SCRIPT", "exit 1");
-        }
+        use crate::installers::test_hooks;
+        test_hooks::clear();
+        test_hooks::serve(&installers::DENO, b"exit 1\n");
         let pm = MockPackageManager::default();
         let dep = Dependency::simple("deno");
         let result = DenoModule.install(&pm, &dep);
-        unsafe {
-            std::env::remove_var("ENVY_TEST_DENO_INSTALL_SCRIPT");
-        }
+        test_hooks::clear();
         assert!(
             result.is_err(),
             "install must return Err when script exits non-zero"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deno_install_runs_verified_installer_with_pinned_version() {
+        use crate::installers::{Interpreter, test_hooks};
+        test_hooks::clear();
+        test_hooks::serve(&installers::DENO, b"exit 0\n");
+        let pm = MockPackageManager::default();
+        let dep = Dependency {
+            version: Some("1.40.0".into()),
+            ..Dependency::simple("deno")
+        };
+        let result = DenoModule.install(&pm, &dep);
+        let runs = test_hooks::runs();
+        let envs = test_hooks::envs();
+        test_hooks::clear();
+        result.unwrap();
+        assert_eq!(
+            runs,
+            vec![(
+                installers::DENO.name,
+                Interpreter::Sh,
+                vec!["-s".into(), "v1.40.0".into()]
+            )]
+        );
+        assert_eq!(envs, vec![("CI".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn deno_install_without_verified_download_runs_nothing() {
+        use crate::installers::test_hooks;
+        test_hooks::clear();
+        let pm = MockPackageManager::default();
+        assert!(
+            DenoModule
+                .install(&pm, &Dependency::simple("deno"))
+                .is_err()
+        );
+        assert!(test_hooks::runs().is_empty());
+    }
+
+    #[test]
+    fn deno_installer_args() {
+        assert!(installer_args(None).is_empty());
+        assert_eq!(installer_args(Some("1.40.0")), vec!["-s", "v1.40.0"]);
+        assert_eq!(installer_args(Some("v2.0.0")), vec!["-s", "v2.0.0"]);
     }
 
     fn file_mtime_secs(path: &std::path::Path) -> u64 {

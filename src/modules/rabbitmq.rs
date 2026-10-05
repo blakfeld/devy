@@ -39,21 +39,11 @@ impl Module for RabbitmqModule {
         let p = port(dep)?;
         // RabbitMQ derives its distribution port as node port + 20000, which overflows
         // for OS-assigned ports, so pick one and keep it across starts.
-        let dist_file = data_dir.join("dist_port");
-        let dist_port = match std::fs::read_to_string(&dist_file)
-            .ok()
-            .and_then(|s| s.trim().parse::<u16>().ok())
-            .filter(|p| *p != 0)
-        {
-            Some(p) => p,
-            None => {
-                let p = super::helpers::find_available_port()
-                    .context("Failed to find available port for the RabbitMQ distribution")?;
-                std::fs::write(&dist_file, p.to_string())
-                    .with_context(|| format!("Failed to write {}", dist_file.display()))?;
-                p
-            }
-        };
+        let dist_port = super::helpers::persisted_port(
+            &data_dir.join("dist_port"),
+            &[p],
+            "RabbitMQ distribution",
+        )?;
         // A per-project node name keeps this node apart from a system RabbitMQ in epmd.
         let node_name = format!(
             "devy-{:08x}@localhost",
@@ -65,6 +55,13 @@ impl Module for RabbitmqModule {
                 ("RABBITMQ_DIST_PORT".into(), dist_port.to_string()),
                 ("RABBITMQ_NODENAME".into(), node_name),
                 ("RABBITMQ_NODE_IP_ADDRESS".into(), "127.0.0.1".into()),
+                // epmd and the Erlang distribution listener otherwise bind every
+                // interface, letting anyone with the cookie reach the node.
+                ("ERL_EPMD_ADDRESS".into(), "127.0.0.1".into()),
+                (
+                    "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS".into(),
+                    "-kernel inet_dist_use_interface {127,0,0,1}".into(),
+                ),
                 (
                     "RABBITMQ_MNESIA_BASE".into(),
                     super::path_arg(&data_dir.join("mnesia")),
@@ -101,6 +98,23 @@ impl Module for RabbitmqModule {
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
         pm.install_package(&pm_dep(dep, package_name(pm)))
+    }
+
+    fn post_setup_writes_service_config(&self) -> bool {
+        true
+    }
+
+    /// Under Homebrew and apt, keeps AMQP, plugin listeners, epmd and Erlang distribution
+    /// on loopback: see `loopback::secure_rabbitmq`.
+    fn post_setup(
+        &self,
+        dep: &Dependency,
+        pm: &dyn PackageManager,
+        _project_root: &std::path::Path,
+    ) -> Result<()> {
+        let state = super::loopback::default_state_dir(pm);
+        super::loopback::secure_rabbitmq(pm, port(dep)?, state.as_deref());
+        Ok(())
     }
 
     fn is_running(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {

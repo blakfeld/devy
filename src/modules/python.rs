@@ -30,6 +30,15 @@ fn venv_path(dep: &Dependency) -> Cow<'_, str> {
         .unwrap_or(Cow::Borrowed(".venv"))
 }
 
+/// The project-relative virtualenv directory of a `python` dependency.
+/// `./` components are dropped, so `./.venv` and `.venv` name the same directory.
+pub(crate) fn venv_rel_path(dep: &Dependency) -> std::path::PathBuf {
+    std::path::Path::new(&*venv_path(dep))
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
 fn venv_bin_dir() -> &'static str {
     if cfg!(target_os = "windows") {
         "Scripts"
@@ -133,6 +142,30 @@ impl Module for PythonModule {
         vec![venv_dir.join(venv_bin_dir()).display().to_string()]
     }
 
+    fn setup_steps(&self, dep: &Dependency, project_root: &Path) -> Vec<String> {
+        // An `install_cmd` replaces the pip step; the executable-entry summary lists it with the
+        // other install commands.
+        if dep
+            .extra
+            .get("install_cmd")
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            return Vec::new();
+        }
+        match find_manifest(project_root)
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            Some("pyproject.toml") => {
+                vec!["pip install -e . (pyproject.toml build backend)".to_string()]
+            }
+            Some(_) => vec!["pip install -r requirements.txt (requirements.txt)".to_string()],
+            None => Vec::new(),
+        }
+    }
+
     fn post_setup(
         &self,
         dep: &Dependency,
@@ -212,7 +245,7 @@ impl Module for PythonModule {
             anyhow::bail!("Python dependency install failed — check the output above for details");
         }
         if let Some(ref m) = manifest {
-            write_stamp(&stamp_path, m);
+            write_stamp(&stamp_path, m)?;
         }
         output::success("Python dependencies installed");
         Ok(())
@@ -297,6 +330,16 @@ mod tests {
     fn venv_path_default_is_dot_venv() {
         let dep = Dependency::simple("python");
         assert_eq!(venv_path(&dep), ".venv");
+    }
+
+    #[test]
+    fn venv_rel_path_drops_leading_curdir() {
+        let mut dep = Dependency::simple("python");
+        dep.extra.insert(
+            "venv_path".into(),
+            crate::config::ExtraValue::String("./.venv".into()),
+        );
+        assert_eq!(venv_rel_path(&dep), std::path::PathBuf::from(".venv"));
     }
 
     #[test]

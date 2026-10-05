@@ -17,7 +17,7 @@ pub fn run(volumes: bool) -> Result<()> {
 
     if let Some(ref hook) = config.hooks.before_down {
         output::header("Hooks");
-        run_hook("before_down", hook)?;
+        run_hook("before_down", hook, &project_root)?;
     }
 
     let pm = package_manager::detect(&config, &project_root)?;
@@ -33,7 +33,7 @@ pub fn run(volumes: bool) -> Result<()> {
 
     if let Some(ref hook) = config.hooks.after_down {
         output::header("Hooks");
-        run_hook("after_down", hook)?;
+        run_hook("after_down", hook, &project_root)?;
     }
 
     output::blank_line();
@@ -99,6 +99,7 @@ mod tests {
     use crate::package_manager::MockPackageManager;
     use crate::service_runner::docker::{FakeRunner, ok};
     use crate::service_runner::package_runners;
+    use serde_norway as yaml;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -170,10 +171,9 @@ mod tests {
 
     /// Runs `down` on a docker-managed postgres whose container is running.
     fn docker_down(volumes: bool) -> (Vec<String>, String) {
-        let config: DevyConfig = serde_yml::from_str(
-            "name: app\nservice_manager: docker\ndependencies:\n  - postgres\n",
-        )
-        .unwrap();
+        let config: DevyConfig =
+            yaml::from_str("name: app\nservice_manager: docker\ndependencies:\n  - postgres\n")
+                .unwrap();
         let pm = MockPackageManager::default();
         let stopped = std::cell::Cell::new(false);
         let stopped = std::rc::Rc::new(stopped);
@@ -184,7 +184,7 @@ mod tests {
                 ok("")
             }
             "container" => ok(&format!(
-                r#"{{"State":{{"Running":{}}},"Config":{{"Labels":{{}}}}}}"#,
+                r#"{{"State":{{"Running":{}}},"Config":{{"Labels":{{"sh.devy.project":"/src/app"}}}}}}"#,
                 !seen.get()
             )),
             _ => ok(""),
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn down_fails_when_container_runtime_unavailable() {
         let config: DevyConfig =
-            serde_yml::from_str("service_manager: docker\ndependencies:\n  - redis\n").unwrap();
+            yaml::from_str("service_manager: docker\ndependencies:\n  - redis\n").unwrap();
         let pm = MockPackageManager::default();
         let fake = FakeRunner::new(|_| crate::service_runner::docker::fail("daemon down"));
         let runners = Runners::new(

@@ -47,22 +47,47 @@ The system SHALL include one `pkgs.<attr>` entry per dependency. The attribute c
 - **THEN** the export contains no entry for it and no warning is printed
 
 ### Requirement: Environment variables exported as attributes
-The system SHALL emit each `environment:` entry as an attribute of the mkShell. Keys that are not valid bare Nix identifiers MUST be quoted. Values MUST be emitted as Nix double-quoted strings with `\`, `"` and `${` escaped. Quoted keys escape only `"`. Attribute order is unspecified and can differ between runs.
+The system SHALL emit each `environment:` entry as an attribute of the mkShell, in key order, except a key named `packages` or `shellHook` (attributes the export writes itself), which SHALL be left out as a comment with a warning. `devy export` SHALL NOT check any trust record or comment entries out: like `devy up`, the exported shell applies the project's environment (`mkShell` treats some names, such as `preHook`, as code, and others, such as `BASH_ENV`, change how the shell runs), and reviewing `devy.yml` is the user's decision.
+
+Keys that are not valid bare Nix identifiers MUST be quoted. Values MUST be emitted as Nix double-quoted strings with `\`, `"` and `${` escaped. Quoted keys use the same escapes.
 
 #### Scenario: Value containing interpolation syntax
 - **WHEN** `environment` has `GREETING: 'hi ${USER}'`
 - **THEN** the export contains `GREETING = "hi \${USER}";`
 
 #### Scenario: Key needing quotes
-- **WHEN** `environment` has a key `1BAD.KEY`
-- **THEN** the attribute name is emitted quoted as `"1BAD.KEY"`
+- **WHEN** `environment` has the key `rec`, a Nix keyword
+- **THEN** the attribute name is emitted quoted as `"rec"`
+
+#### Scenario: Untrusted project
+- **WHEN** a freshly cloned project's `environment` has `preHook: "touch /tmp/p"` and `FOO: bar`
+- **THEN** the export contains the attributes `preHook = "touch /tmp/p";` and `FOO = "bar";`, nothing is commented out, and no warning about allowing the project is printed
+
+#### Scenario: Value that would end the comment
+- **WHEN** an entry's value contains a newline followed by `shellHook = "touch /tmp/q";`
+- **THEN** the quotes are escaped, so the whole value stays inside its Nix string and adds no `shellHook` attribute
+
+#### Scenario: Trusted project
+- **WHEN** `environment` has `BASH_ENV: /tmp/env.sh`
+- **THEN** the export contains `BASH_ENV = "/tmp/env.sh";` and no warning is printed
 
 ### Requirement: Flake structure and shell hook
 The flake export SHALL set `description = "<name> development environment"`, take `nixpkgs` from `github:NixOS/nixpkgs/nixpkgs-unstable`, and define `devShells.<system>.default` for `x86_64-linux`, `aarch64-linux`, `x86_64-darwin` and `aarch64-darwin`. Both formats MUST include a `shellHook` that echoes `Entered <name> dev shell`, with `<name>` defaulting to `project`.
 
+`<name>` SHALL be escaped for every context it appears in:
+- in a Nix `"…"` string, `\`, `"` and `${` are escaped
+- in the `''…''` shellHook string, `''` and `${` are escaped
+- inside the shellHook, the shell receives `<name>` as a single-quoted word, so `$`, backticks and `\` are not interpreted
+
+Attribute names derived from configuration SHALL be escaped with the same Nix string rules.
+
 #### Scenario: Unnamed project
 - **WHEN** `devy.yml` has no `name` and the user runs `devy export`
 - **THEN** the flake description is `project development environment` and the shellHook echoes `Entered project dev shell`
+
+#### Scenario: Hostile project name
+- **WHEN** `name` is `x"; ${builtins.abort "p"} $(touch /tmp/p) ''`
+- **THEN** the exported file evaluates without error, entering the shell creates no `/tmp/p`, and the shellHook echoes the name literally
 
 ### Requirement: Generated files are valid Nix
 Both export formats SHALL emit balanced braces, so each file parses as a Nix expression. `shell.nix` ends with a single `}` after the `shellHook`. `flake.nix` ends with the lines `          };`, `        });`, `    };` and `}`.

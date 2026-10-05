@@ -33,15 +33,23 @@ fn kraft_mode(dep: &Dependency) -> bool {
         .unwrap_or(false)
 }
 
-/// Escapes a value for a Java `.properties` file.
-fn properties_value(v: &str) -> String {
-    v.replace('\\', "\\\\")
+/// Escapes a value for a Java `.properties` file. A control character (a newline would
+/// end the value and start a new property) is refused rather than escaped.
+fn properties_value(v: &str) -> Result<String> {
+    if v.chars().any(char::is_control) {
+        anyhow::bail!("refusing to write a Kafka property value containing a control character");
+    }
+    Ok(v.replace('\\', "\\\\"))
 }
 
 /// A single-node KRaft config: broker and controller on 127.0.0.1, logs under `data_dir`.
-fn server_properties(port: u16, controller_port: u16, data_dir: &std::path::Path) -> String {
-    let logs = properties_value(&super::path_arg(&data_dir.join("logs")));
-    format!(
+fn server_properties(
+    port: u16,
+    controller_port: u16,
+    data_dir: &std::path::Path,
+) -> Result<String> {
+    let logs = properties_value(&super::path_arg(&data_dir.join("logs")))?;
+    Ok(format!(
         "# devy-managed — rewritten on every start\n\
          process.roles=broker,controller\n\
          node.id=1\n\
@@ -58,7 +66,7 @@ fn server_properties(port: u16, controller_port: u16, data_dir: &std::path::Path
          transaction.state.log.min.isr=1\n\
          share.coordinator.state.topic.replication.factor=1\n\
          share.coordinator.state.topic.min.isr=1\n"
-    )
+    ))
 }
 
 /// Reads the controller port back out of a previously generated `server.properties`.
@@ -168,6 +176,26 @@ impl Module for KafkaModule {
         pm.install_package(&pm_dep(dep, package_name(pm)))
     }
 
+    fn post_setup_writes_service_config(&self) -> bool {
+        true
+    }
+
+    /// Under Homebrew and apt, keeps Kafka (and the ZooKeeper started for it without
+    /// KRaft) on loopback: see `loopback::secure_kafka`.
+    fn post_setup(
+        &self,
+        dep: &Dependency,
+        pm: &dyn PackageManager,
+        _project_root: &std::path::Path,
+    ) -> Result<()> {
+        let state = super::loopback::default_state_dir(pm);
+        super::loopback::secure_kafka(pm, state.as_deref());
+        if !kraft_mode(dep) {
+            super::loopback::secure_zookeeper(pm, state.as_deref());
+        }
+        Ok(())
+    }
+
     fn is_running(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         pm.is_service_running(&self.service_name(dep))
     }
@@ -187,11 +215,9 @@ impl Module for KafkaModule {
             None => super::helpers::find_available_port()
                 .context("Failed to find available port for the Kafka controller")?,
         };
-        std::fs::write(
-            &conf,
-            server_properties(port(dep)?, controller_port, data_dir),
-        )
-        .with_context(|| format!("Failed to write {}", conf.display()))?;
+        let properties = server_properties(port(dep)?, controller_port, data_dir)?;
+        crate::fs_safe::write_atomic(&conf, properties.as_bytes(), 0o644)
+            .with_context(|| format!("Failed to write {}", conf.display()))?;
         let conf_arg = super::path_arg(&conf);
         Ok(Some(super::LaunchSpec {
             // kafka-run-class.sh defaults its own logs into the read-only package.
@@ -608,5 +634,12 @@ mod tests {
             a.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         );
+    }
+
+    #[test]
+    fn server_properties_refuse_control_characters() {
+        let bad = std::path::Path::new("/p/.devy/data/kafka\nlisteners=PLAINTEXT://:9092");
+        assert!(server_properties(9092, 9093, bad).is_err());
+        assert!(server_properties(9092, 9093, std::path::Path::new("/p/data")).is_ok());
     }
 }

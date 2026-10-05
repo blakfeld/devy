@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::{Detector, Draft, package_json};
+use super::{Detector, Draft, is_plain_file, package_json, snippet};
 
 pub struct PackageScripts;
 
@@ -17,7 +17,12 @@ impl Detector for PackageScripts {
         let pm = node_package_manager(dir);
         let builtins = crate::cli::builtin_subcommands();
         for name in scripts.keys() {
-            if builtins.contains(name) {
+            if !crate::validate::command_name(name) {
+                draft.todo(format!(
+                    "package.json script `{}` is not a valid devy command name; add it under another name",
+                    snippet(name)
+                ));
+            } else if builtins.contains(name) {
                 draft.todo(format!(
                     "package.json script `{name}` clashes with `devy {name}`; add it under another name"
                 ));
@@ -38,7 +43,7 @@ fn node_package_manager(dir: &Path) -> &'static str {
     ];
     LOCKFILES
         .iter()
-        .find(|(file, _)| dir.join(file).is_file())
+        .find(|(file, _)| is_plain_file(dir, file))
         .map_or("npm", |(_, pm)| pm)
 }
 
@@ -54,6 +59,20 @@ mod tests {
         let mut draft = Draft::default();
         PackageScripts.detect(&dir, &mut draft);
         draft
+    }
+
+    #[test]
+    fn invalid_script_names_become_todos() {
+        let pkg = r#"{"scripts":{"//":"a comment","_postinstall":"x","dev":"vite"}}"#;
+        let draft = commands(&[("package.json", pkg)]);
+        let names: Vec<&str> = draft.commands.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["dev"]);
+        assert!(
+            draft.todos.iter().any(|t| t.contains("`//`")),
+            "{:?}",
+            draft.todos
+        );
+        assert!(draft.todos.iter().any(|t| t.contains("`_postinstall`")));
     }
 
     #[test]

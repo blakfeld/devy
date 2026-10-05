@@ -33,6 +33,10 @@ impl Module for DartModule {
         pm.install_package(&pm_dep(dep, package_name(pm)))
     }
 
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        super::helpers::step_if_exists(project_root, "pubspec.yaml", "dart pub get (pubspec.yaml)")
+    }
+
     fn post_setup(
         &self,
         _dep: &Dependency,
@@ -59,7 +63,7 @@ impl Module for DartModule {
         if !status.success() {
             anyhow::bail!("`dart pub get` failed — check the output above for details");
         }
-        write_stamp(&stamp_path, &manifest);
+        write_stamp(&stamp_path, &manifest)?;
         output::success("Dart dependencies installed");
         Ok(())
     }

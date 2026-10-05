@@ -23,18 +23,86 @@ fn nix_string_value(s: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
-/// Returns a Nix attribute name, quoting it if it contains characters that are
-/// not valid in a bare Nix identifier.
+/// Escapes `s` for the body of a Nix indented string (`''…''`): `''` becomes `'''`,
+/// `${` becomes `''${`, and a lone `'` right before `${` becomes `''\'` so it cannot
+/// merge with the `''${` escape into a `'''` sequence.
+fn nix_indented_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if rest.starts_with("''") {
+            out.push_str("'''");
+            rest = &rest[2..];
+        } else if rest.starts_with("'${") {
+            out.push_str("''\\'");
+            rest = &rest[1..];
+        } else if rest.starts_with("${") {
+            out.push_str("''${");
+            rest = &rest[2..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// The shellHook line announcing the shell, safe inside a Nix `''…''` string: the shell
+/// receives the message as one single-quoted word, so `$`, backticks and `\` in the
+/// project name are not interpreted. Control characters (newlines in particular, which
+/// Nix's indentation stripping would alter) are replaced with spaces.
+fn shell_hook_echo(project_name: &str) -> String {
+    let name: String = project_name
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let message = format!("Entered {name} dev shell");
+    nix_indented_escape(&format!("echo {}", super::exec::sh_quote(&message)))
+}
+
+/// Nix keywords, which cannot be bare attribute names.
+const NIX_KEYWORDS: &[&str] = &[
+    "assert", "else", "if", "in", "inherit", "let", "or", "rec", "then", "with",
+];
+
+/// Returns a Nix attribute name, quoting it (with the `"…"` string escapes) if it is
+/// not a valid bare Nix identifier.
 fn nix_attr_name(k: &str) -> String {
     let is_bare = !k.is_empty()
+        && !NIX_KEYWORDS.contains(&k)
         && k.bytes().enumerate().all(|(i, b)| {
             b.is_ascii_alphabetic() || b == b'_' || (i > 0 && (b.is_ascii_digit() || b == b'-'))
         });
     if is_bare {
         k.to_string()
     } else {
-        format!("\"{}\"", k.replace('"', "\\\""))
+        nix_string_value(k)
     }
+}
+
+/// Attributes `devy export` emits itself; an `environment` entry with one of these names
+/// would be a duplicate attribute, which Nix rejects.
+const EMITTED_ATTRS: &[&str] = &["packages", "shellHook"];
+
+/// `name = "value";` lines for each `environment` entry, indented by `indent`, in key
+/// order. Keys and values are escaped, so a value can never close its string or add an
+/// attribute of its own.
+fn env_attr_lines(config: &DevyConfig, indent: &str) -> Vec<String> {
+    let mut entries: Vec<(&String, &String)> = config.environment.iter().collect();
+    entries.sort();
+    entries
+        .into_iter()
+        .map(|(k, v)| {
+            if EMITTED_ATTRS.contains(&k.as_str()) {
+                output::warn(&format!(
+                    "environment key {k} would replace the {k} devy export writes; left out of the export"
+                ));
+                format!("{indent}# {k}: left out by devy export (devy writes its own {k})")
+            } else {
+                format!("{indent}{} = {};", nix_attr_name(k), nix_string_value(v))
+            }
+        })
+        .collect()
 }
 
 /// Attributes the exported nixpkgs import must permit despite nixpkgs' license and
@@ -109,11 +177,7 @@ fn permit_predicates(get_name: &str, permitted: &Permitted) -> Option<String> {
 fn generate_shell_nix(config: &DevyConfig) -> String {
     let (pkg_lines, permitted) = collect_pkg_lines(config, "    ");
 
-    let env_lines: Vec<String> = config
-        .environment
-        .iter()
-        .map(|(k, v)| format!("    {} = {};", nix_attr_name(k), nix_string_value(v)))
-        .collect();
+    let env_lines = env_attr_lines(config, "    ");
 
     let project_name = config.name.as_deref().unwrap_or("project");
 
@@ -150,7 +214,8 @@ fn generate_shell_nix(config: &DevyConfig) -> String {
     }
 
     out.push_str(&format!(
-        "  shellHook = ''\n    echo \"Entered {project_name} dev shell\"\n  '';\n"
+        "  shellHook = ''\n    {}\n  '';\n",
+        shell_hook_echo(project_name)
     ));
 
     out.push_str("}\n");
@@ -160,13 +225,10 @@ fn generate_shell_nix(config: &DevyConfig) -> String {
 fn generate_flake_nix(config: &DevyConfig) -> String {
     let (pkg_lines, permitted) = collect_pkg_lines(config, "          ");
 
-    let env_lines: Vec<String> = config
-        .environment
-        .iter()
-        .map(|(k, v)| format!("          {} = {};", nix_attr_name(k), nix_string_value(v)))
-        .collect();
+    let env_lines = env_attr_lines(config, "          ");
 
     let project_name = config.name.as_deref().unwrap_or("project");
+    let description = nix_string_value(&format!("{project_name} development environment"));
 
     let pkgs_expr = match permit_predicates("nixpkgs.lib.getName", &permitted) {
         Some(predicates) => format!("import nixpkgs {{ inherit system; {predicates} }}"),
@@ -175,7 +237,7 @@ fn generate_flake_nix(config: &DevyConfig) -> String {
     let mut out = format!(
         "# Generated by `devy export --format=flake`. Edit to taste.\n\
          {{\n\
-           description = \"{project_name} development environment\";\n\
+           description = {description};\n\
          \n\
            inputs.nixpkgs.url = \"github:NixOS/nixpkgs/nixpkgs-unstable\";\n\
          \n\
@@ -209,14 +271,15 @@ fn generate_flake_nix(config: &DevyConfig) -> String {
     }
 
     out.push_str(&format!(
-        "            shellHook = ''\n\
-               echo \"Entered {project_name} dev shell\"\n            '';\n"
+        "            shellHook = ''\n              {}\n            '';\n",
+        shell_hook_echo(project_name)
     ));
 
     out.push_str("          };\n        });\n    };\n}\n");
     out
 }
 
+/// Writes the export for `config` into `out_path`.
 pub(crate) fn export_impl(
     config: &DevyConfig,
     format: ExportFormat,
@@ -232,7 +295,7 @@ pub(crate) fn export_impl(
         output::warn(&format!("{} already exists — overwriting", dest.display()));
     }
 
-    std::fs::write(&dest, &content)
+    crate::fs_safe::write_atomic(&dest, content.as_bytes(), 0o644)
         .with_context(|| format!("Failed to write {}", dest.display()))?;
 
     output::success(&format!("Wrote {}", dest.display()));
@@ -250,9 +313,10 @@ pub fn run(format: ExportFormat) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::DevyConfig;
+    use serde_norway as yaml;
 
     fn config_from_yaml(yaml: &str) -> DevyConfig {
-        serde_yml::from_str(yaml).unwrap()
+        yaml::from_str(yaml).unwrap()
     }
 
     #[test]
@@ -374,6 +438,152 @@ mod tests {
     }
 
     #[test]
+    fn nix_attr_name_escapes_string_metacharacters() {
+        assert_eq!(nix_attr_name(r"a\b"), r#""a\\b""#);
+        assert_eq!(nix_attr_name("${x}"), r#""\${x}""#);
+        assert_eq!(nix_attr_name(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(nix_attr_name("let"), "\"let\"");
+    }
+
+    #[test]
+    fn nix_indented_escape_cases() {
+        assert_eq!(nix_indented_escape("plain"), "plain");
+        assert_eq!(nix_indented_escape("a''b"), "a'''b");
+        assert_eq!(nix_indented_escape("${x}"), "''${x}");
+        assert_eq!(nix_indented_escape("'${x}"), "''\\'''${x}");
+        assert_eq!(nix_indented_escape("'''"), "''''");
+        assert_eq!(nix_indented_escape("$x 'y'"), "$x 'y'");
+    }
+
+    #[test]
+    fn shell_hook_echo_single_quotes_name() {
+        assert_eq!(shell_hook_echo("app"), "echo 'Entered app dev shell'");
+        assert_eq!(
+            shell_hook_echo("$(id) `id` \\"),
+            "echo 'Entered $(id) `id` \\ dev shell'"
+        );
+        assert_eq!(
+            shell_hook_echo("o'neil"),
+            "echo 'Entered o'\\'''neil dev shell'"
+        );
+        assert_eq!(shell_hook_echo("${x}"), "echo 'Entered ''${x} dev shell'");
+        assert_eq!(
+            shell_hook_echo("a\n    b\r"),
+            "echo 'Entered a     b  dev shell'"
+        );
+    }
+
+    const HOSTILE_NAME: &str = r#"x"; ${builtins.abort "p"} $(touch /tmp/p) ''"#;
+
+    #[test]
+    fn hostile_name_is_escaped_in_both_formats() {
+        let config = DevyConfig {
+            name: Some(HOSTILE_NAME.into()),
+            ..config_from_yaml("dependencies:\n  - redis\n")
+        };
+        let flake = generate_flake_nix(&config);
+        assert!(
+            flake.contains(
+                r#"description = "x\"; \${builtins.abort \"p\"} $(touch /tmp/p) '' development environment";"#
+            ),
+            "{flake}"
+        );
+        for out in [generate_shell_nix(&config), flake] {
+            assert!(
+                out.contains(
+                    r#"echo 'Entered x"; ''${builtins.abort "p"} $(touch /tmp/p) '\''''\''' dev shell'"#
+                ),
+                "{out}"
+            );
+            assert!(!out.contains("\"; ${builtins"), "{out}");
+        }
+    }
+
+    /// Writes `content` to `file` in a temp dir and evaluates `expr` (a function of the
+    /// file's path `p`) with `nix-instantiate --eval --strict --json`.
+    fn nix_eval(file: &str, content: &str, expr: &str) -> serde_json::Value {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join(file);
+        std::fs::write(&path, content).unwrap();
+        let parse = std::process::Command::new("nix-instantiate")
+            .arg("--parse")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(parse.status.success(), "{parse:?}\n{content}");
+        let out = std::process::Command::new("nix-instantiate")
+            .args(["--eval", "--strict", "--json", "--argstr", "p"])
+            .arg(&path)
+            .arg("-E")
+            .arg(format!("{{ p }}: {expr}"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}\n{content}");
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    #[test]
+    fn hostile_name_evaluates_with_nix() {
+        if which::which("nix-instantiate").is_err() {
+            eprintln!("skipping: nix-instantiate not on PATH");
+            return;
+        }
+        let marker_dir = crate::test_support::tmp_dir();
+        let marker = marker_dir.join("p");
+        for name in [
+            HOSTILE_NAME.to_string(),
+            format!(
+                r#"x"; ${{builtins.abort "p"}} $(touch {m}) `touch {m}` '${{x}} ''' \"#,
+                m = marker.display()
+            ),
+        ] {
+            let config = DevyConfig {
+                name: Some(name.clone()),
+                ..config_from_yaml("dependencies:\n  - redis\n")
+            };
+            let shell_hook = nix_eval(
+                "shell.nix",
+                &generate_shell_nix(&config),
+                "(import p { pkgs = { mkShell = x: x; redis = null; }; }).shellHook",
+            );
+            let flake = nix_eval(
+                "flake.nix",
+                &generate_flake_nix(&config),
+                r#"let
+                     f = import p;
+                     pkgs = { mkShell = x: x; redis = null; };
+                     systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+                     nixpkgs = {
+                       lib.genAttrs = names: fn: builtins.listToAttrs
+                         (map (n: { name = n; value = fn n; }) names);
+                       legacyPackages = builtins.listToAttrs
+                         (map (n: { name = n; value = pkgs; }) systems);
+                     };
+                   in [ f.description
+                        (f.outputs { self = null; inherit nixpkgs; }).devShells.x86_64-linux.default.shellHook ]"#,
+            );
+            assert_eq!(
+                flake[0].as_str().unwrap(),
+                format!("{name} development environment")
+            );
+            for hook in [shell_hook.as_str().unwrap(), flake[1].as_str().unwrap()] {
+                // mkShell runs the hook in bash, whose `echo` leaves `\` alone.
+                let out = std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(hook)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    format!("Entered {name} dev shell\n")
+                );
+                assert!(!marker.exists(), "shellHook ran an embedded command");
+            }
+        }
+    }
+
+    #[test]
     fn export_impl_shell_writes_file() {
         let dir = crate::test_support::tmp_dir();
         let config = config_from_yaml("dependencies:\n  - redis\n");
@@ -401,6 +611,119 @@ mod tests {
             out.contains("API_KEY = \"secret\";"),
             "env var must be properly quoted in flake.nix, got:\n{out}"
         );
+    }
+
+    /// `nix` with the contents of every string literal removed: `"…"` strings (with `\`
+    /// escapes) and `''…''` indented strings (with the `'''`, `''$` and `''\` escapes).
+    /// Comments are not recognised (the generator's comments hold no quotes), and
+    /// antiquotations are not followed (the generator escapes every `${` in a value).
+    fn nix_code_outside_strings(nix: &str) -> String {
+        let mut code = String::new();
+        let mut chars = nix.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '\\' => {
+                                chars.next();
+                            }
+                            '"' => break,
+                            _ => {}
+                        }
+                    }
+                    code.push_str("\"\"");
+                }
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c != '\'' || chars.peek() != Some(&'\'') {
+                            continue;
+                        }
+                        chars.next();
+                        match chars.peek() {
+                            Some('\'' | '$') => {
+                                chars.next();
+                            }
+                            Some('\\') => {
+                                chars.next();
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    code.push_str("''''");
+                }
+                _ => code.push(c),
+            }
+        }
+        code
+    }
+
+    #[test]
+    fn nix_code_outside_strings_drops_string_contents() {
+        assert_eq!(
+            nix_code_outside_strings(r#"a = "x\" b = y"; c = ''p''' '''$ ''\n q''; d"#),
+            r#"a = ""; c = ''''; d"#
+        );
+    }
+
+    const HOSTILE_ENV: &str = concat!(
+        "environment:\n",
+        "  preHook: \"touch /tmp/p\"\n",
+        "  BASH_ENV: \"/tmp/evil.sh\"\n",
+        "  NOTE: \"line one\\n\\\"; shellHook = \\\"touch /tmp/q\\\"; x = \\\"\\r\\u0007\"\n",
+        "  FOO: bar\n",
+    );
+
+    #[test]
+    fn export_writes_environment_entries_escaped() {
+        let config = config_from_yaml(HOSTILE_ENV);
+        let mut outputs = Vec::new();
+        let warns = crate::output::with_warn_messages(|| {
+            outputs.push(generate_shell_nix(&config));
+            outputs.push(generate_flake_nix(&config));
+        });
+        assert!(warns.is_empty(), "{warns:?}");
+        for out in outputs {
+            assert!(out.contains("preHook = \"touch /tmp/p\";"), "{out}");
+            assert!(out.contains("BASH_ENV = \"/tmp/evil.sh\";"), "{out}");
+            assert!(out.contains("FOO = \"bar\";"), "{out}");
+            // The quote is escaped, so the value cannot close the string.
+            assert!(out.contains(r#"shellHook = \"touch /tmp/q\";"#), "{out}");
+            // Only devy's own shellHook is live Nix code; the injected one stays inside
+            // NOTE's string. (Values keep literal newlines, so a line-based count cannot
+            // tell the two apart.)
+            assert_eq!(
+                nix_code_outside_strings(&out)
+                    .matches("shellHook =")
+                    .count(),
+                1,
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_leaves_out_attributes_devy_writes() {
+        let config = config_from_yaml("environment:\n  shellHook: x\n  packages: y\n  A: b\n");
+        let warns = crate::output::with_warn_messages(|| {
+            let out = generate_shell_nix(&config);
+            assert_eq!(out.matches("shellHook =").count(), 1, "{out}");
+            assert_eq!(out.matches("packages =").count(), 0, "{out}");
+            assert!(out.contains("A = \"b\";"), "{out}");
+        });
+        assert_eq!(warns.len(), 2, "{warns:?}");
+    }
+
+    #[test]
+    fn export_without_environment_has_no_warning_or_section() {
+        let config = config_from_yaml("dependencies:\n  - redis\n");
+        let warns = crate::output::with_warn_messages(|| {
+            let out = generate_shell_nix(&config);
+            assert!(!out.contains("Environment variables"), "{out}");
+        });
+        assert!(warns.is_empty(), "{warns:?}");
     }
 
     #[test]
@@ -484,7 +807,7 @@ mod tests {
              \n\
              pkgs.mkShell {\n\
              \n  packages = with pkgs; [\n    pkgs.redis\n    pkgs.nodejs\n  ];\n\n\
-             \x20 shellHook = ''\n    echo \"Entered app dev shell\"\n  '';\n}\n"
+             \x20 shellHook = ''\n    echo 'Entered app dev shell'\n  '';\n}\n"
         );
         let flake = generate_flake_nix(&config);
         assert!(

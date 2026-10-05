@@ -35,13 +35,31 @@ pub struct Draft {
     /// `None` means the value must be filled in by hand.
     pub env: Vec<(String, Option<String>)>,
     pub todos: Vec<String>,
+    /// TODOs past [`MAX_TODOS`], rendered as one summary line.
+    pub todos_dropped: usize,
 }
+
+/// Most `# TODO:` lines one draft renders, so a hostile repo cannot bloat the file.
+pub const MAX_TODOS: usize = 50;
+/// Most commands, and most environment entries, one draft takes.
+pub const MAX_ENTRIES: usize = 200;
 
 impl Draft {
     /// Adds a dependency by canonical name. A later detection of the same module only
     /// fills in a missing version, so earlier detectors take precedence.
+    /// A version that fails [`crate::validate::version`] is dropped and noted in a TODO.
     pub fn add_dep(&mut self, name: &str, version: Option<String>) {
         let canonical = modules::canonical_name(name).to_string();
+        let version = match version {
+            Some(v) if !crate::validate::version(&v) => {
+                self.todo(format!(
+                    "dropped invalid version `{}` for {canonical}; set it by hand",
+                    snippet(&v)
+                ));
+                None
+            }
+            other => other,
+        };
         match self.deps.iter_mut().find(|d| d.name == canonical) {
             Some(existing) => {
                 if existing.version.is_none() {
@@ -61,19 +79,48 @@ impl Draft {
         self.deps.iter().any(|d| d.name == canonical)
     }
 
+    /// A name that fails [`crate::validate::command_name`] is skipped with a TODO.
     pub fn add_command(&mut self, name: &str, cmd: String) {
+        if !crate::validate::command_name(name) {
+            self.todo(format!(
+                "`{}` is not a valid devy command name; add it under another name",
+                snippet(name)
+            ));
+            return;
+        }
+        if self.commands.len() >= MAX_ENTRIES {
+            self.todo(format!(
+                "more than {MAX_ENTRIES} commands were found; add the rest by hand"
+            ));
+            return;
+        }
         if !self.commands.iter().any(|(n, _)| n == name) {
             self.commands.push((name.to_string(), cmd));
         }
     }
 
     pub fn add_env(&mut self, key: &str, value: Option<String>) {
+        if self.env.len() >= MAX_ENTRIES {
+            self.todo(format!(
+                "more than {MAX_ENTRIES} environment entries were found; add the rest by hand"
+            ));
+            return;
+        }
         if !self.env.iter().any(|(k, _)| k == key) {
             self.env.push((key.to_string(), value));
         }
     }
 
+    /// Adds a `# TODO:` line. Callers pass project text through [`snippet`]; control
+    /// characters are replaced here as well so no message can span lines.
     pub fn todo(&mut self, msg: String) {
+        if self.todos.len() >= MAX_TODOS {
+            if !self.todos.contains(&msg) {
+                self.todos_dropped += 1;
+            }
+            return;
+        }
+        let msg = one_line(&msg);
         if !self.todos.contains(&msg) {
             self.todos.push(msg);
         }
@@ -91,6 +138,12 @@ impl Draft {
         let mut out = format!("{header}\n");
         for todo in &self.todos {
             out.push_str(&format!("# TODO: {todo}\n"));
+        }
+        if self.todos_dropped > 0 {
+            out.push_str(&format!(
+                "# TODO: {} more items were not listed\n",
+                self.todos_dropped
+            ));
         }
         if self.is_empty() && self.name.is_none() {
             out.push_str(PLAIN_INIT);
@@ -191,13 +244,53 @@ fn dir_name(dir: &Path) -> Option<String> {
     Some(dir.file_name()?.to_string_lossy().into_owned())
 }
 
-/// Reads `dir/name` when it is a regular file. Unreadable files count as absent.
+/// Reads `dir/name` through [`crate::ai::context_file`]: a symlink (such as
+/// `.env.example -> ~/.aws/credentials`), a non-regular file, or anything outside `dir`
+/// counts as absent, and large files are capped.
 pub(crate) fn read(dir: &Path, name: &str) -> Option<String> {
-    let path = dir.join(name);
-    if !path.is_file() {
-        return None;
+    crate::ai::context_file(dir, name)
+}
+
+/// Whether `dir/name` exists as a regular, non-symlink file. Used for files whose
+/// presence alone is evidence (lockfiles, `flake.nix`), so they follow the same rule as
+/// files that are read.
+pub(crate) fn is_plain_file(dir: &Path, name: &str) -> bool {
+    std::fs::symlink_metadata(dir.join(name)).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// Most characters of project-file text copied into one `# TODO:` comment.
+pub(crate) const SNIPPET_MAX: usize = 120;
+
+/// `s` made safe to copy into a `# TODO:` comment: CR, LF and every other control
+/// character become a space, and the result is cut to [`SNIPPET_MAX`] characters (with
+/// a trailing `…` when cut), so the TODO stays on one comment line.
+pub(crate) fn snippet(s: &str) -> String {
+    let clean = one_line(s);
+    if clean.chars().count() <= SNIPPET_MAX {
+        return clean;
     }
-    std::fs::read_to_string(path).ok()
+    let mut cut: String = clean.chars().take(SNIPPET_MAX - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// `s` on one line, cleaned as everything devy prints is ([`crate::output::clean_line`]:
+/// escape sequences, control characters and invisible or bidi formatting characters
+/// removed). Characters that some YAML parsers and editors treat as line breaks (CR,
+/// NEL, VT, FF, U+2028, U+2029) become a space first, so words they separated stay
+/// apart.
+fn one_line(s: &str) -> String {
+    let breaks_mapped: String = s
+        .chars()
+        .map(|c| match c {
+            '\r' | '\u{85}' | '\u{b}' | '\u{c}' | '\u{2028}' | '\u{2029}' => '\n',
+            c => c,
+        })
+        .collect();
+    crate::output::clean_line(&breaks_mapped)
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 pub(crate) fn package_json(dir: &Path) -> Option<serde_json::Value> {
@@ -235,6 +328,192 @@ pub(crate) mod test_util {
 mod tests {
     use super::test_util::fixture;
     use super::*;
+
+    #[test]
+    fn read_caps_large_files_at_a_char_boundary() {
+        let dir = crate::test_support::tmp_dir();
+        // 3-byte chars, so the limit falls inside one.
+        let big = "\u{20ac}".repeat(crate::ai::CONTEXT_READ_LIMIT as usize / 3 + 10);
+        std::fs::write(dir.join("big.txt"), &big).unwrap();
+        let got = read(&dir, "big.txt").unwrap();
+        assert!(
+            got.len() as u64 <= crate::ai::CONTEXT_READ_LIMIT
+                && got.len() as u64 > crate::ai::CONTEXT_READ_LIMIT - 3
+        );
+        assert!(big.starts_with(&got));
+        std::fs::write(dir.join("small.txt"), "abc").unwrap();
+        assert_eq!(read(&dir, "small.txt").as_deref(), Some("abc"));
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(read(&sub, "../small.txt"), None);
+        let abs = dir.join("small.txt");
+        assert_eq!(read(&sub, abs.to_str().unwrap()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_refuses_every_symlink() {
+        let outside = crate::test_support::tmp_dir();
+        std::fs::write(outside.join("history"), "secret\n").unwrap();
+        let dir = crate::test_support::tmp_dir();
+        std::os::unix::fs::symlink(outside.join("history"), dir.join("Gemfile")).unwrap();
+        assert_eq!(read(&dir, "Gemfile"), None);
+        // A symlink to a file inside the project is a symlink too.
+        std::fs::write(dir.join("real"), "ok\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("inside")).unwrap();
+        assert_eq!(read(&dir, "inside"), None);
+        assert_eq!(read(&dir, "real").as_deref(), Some("ok\n"));
+        // So is a symlinked directory along the path, even one pointing inside.
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("f"), "ok\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("sub"), dir.join("linked")).unwrap();
+        assert_eq!(read(&dir, "linked/f"), None);
+        assert_eq!(read(&dir, "sub/f").as_deref(), Some("ok\n"));
+        // Directories and other non-regular files are absent.
+        assert_eq!(read(&dir, "sub"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_env_example_contributes_nothing() {
+        let home = crate::test_support::tmp_dir();
+        std::fs::create_dir(home.join(".aws")).unwrap();
+        std::fs::write(
+            home.join(".aws").join("credentials"),
+            "[default]\nAWS_ACCESS_KEY_ID=AKIAEXAMPLE\nREGION=us-east-1\n",
+        )
+        .unwrap();
+        let dir = fixture(&[("package.json", r#"{"name":"x"}"#)]);
+        std::os::unix::fs::symlink(
+            home.join(".aws").join("credentials"),
+            dir.join(".env.example"),
+        )
+        .unwrap();
+        let draft = detect(&dir);
+        assert!(draft.env.is_empty(), "{:?}", draft.env);
+        let out = draft.render(DETECT_HEADER);
+        assert!(!out.contains("AWS") && !out.contains("REGION"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_evidence_files_are_ignored() {
+        let dir = fixture(&[(
+            "docker-compose.yml",
+            "services:\n  db:\n    image: postgres:16\n",
+        )]);
+        let outside = crate::test_support::tmp_dir();
+        std::fs::write(outside.join("flake.nix"), "{}\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("flake.nix"), dir.join("flake.nix")).unwrap();
+        let draft = detect(&dir);
+        assert!(draft.deps.iter().all(|d| d.docker), "{draft:?}");
+    }
+
+    #[test]
+    fn newline_injection_through_nvmrc_stays_on_one_todo_line() {
+        let dir = fixture(&[(".nvmrc", "lts/x\nhooks:\n  before_up: id #\n")]);
+        let out = detect(&dir).render(DETECT_HEADER);
+        let config = parse(&out);
+        assert!(config.hooks.before_up.is_none(), "{out}");
+        assert!(!out.lines().any(|l| l.starts_with("hooks")), "{out}");
+        let todo: Vec<&str> = out.lines().filter(|l| l.contains("before_up")).collect();
+        assert_eq!(todo.len(), 1, "{out}");
+        assert!(
+            todo[0].starts_with("# TODO: `.nvmrc` names `lts/x hooks:"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn todos_and_entries_are_capped() {
+        let tools: String = (0..5000).map(|i| format!("tool{i} 1\n")).collect();
+        let env: String = (0..5000)
+            .map(|i| format!("K{i}_URL=localhost:6379\n"))
+            .collect();
+        let dir = fixture(&[
+            (".tool-versions", &tools),
+            (".env.example", &env),
+            (
+                "docker-compose.yml",
+                "services:\n  r:\n    image: redis:7\n",
+            ),
+        ]);
+        let draft = detect(&dir);
+        assert_eq!(draft.todos.len(), MAX_TODOS);
+        assert!(draft.todos_dropped > 4000, "{}", draft.todos_dropped);
+        assert_eq!(draft.env.len(), MAX_ENTRIES);
+        let out = draft.render(DETECT_HEADER);
+        assert!(out.contains("more items were not listed"), "{out}");
+        parse(&out);
+    }
+
+    #[test]
+    fn snippet_strips_control_characters_and_truncates() {
+        assert_eq!(snippet("a\r\nb\tc\u{1b}[31m\u{2028}d"), "a  b c d");
+        // Invisible and bidi formatting characters that `output` strips are gone too.
+        assert_eq!(snippet("x\u{ad}\u{2060}\u{e0041}\u{202e}y\u{85}z"), "xy z");
+        let long = "x".repeat(500);
+        let cut = snippet(&long);
+        assert_eq!(cut.chars().count(), SNIPPET_MAX);
+        assert!(cut.ends_with('…'));
+        assert_eq!(snippet(&"y".repeat(SNIPPET_MAX)), "y".repeat(SNIPPET_MAX));
+        let mut draft = Draft::default();
+        draft.todo("line one\nhooks: x".into());
+        assert_eq!(draft.todos, ["line one hooks: x"]);
+    }
+
+    #[test]
+    fn invalid_versions_and_command_names_become_todos() {
+        let mut draft = Draft::default();
+        draft.add_dep("node", Some("22; rm -rf /".into()));
+        draft.add_dep("ruby", Some("../x".into()));
+        draft.add_dep("go", Some("1.22".into()));
+        draft.add_command("$(id)", "npm run x".into());
+        draft.add_command("dev", "npm run dev".into());
+        assert_eq!(draft.deps[0].version, None);
+        assert_eq!(draft.deps[1].version, None);
+        assert_eq!(draft.deps[2].version.as_deref(), Some("1.22"));
+        assert_eq!(
+            draft.commands,
+            [("dev".to_string(), "npm run dev".to_string())]
+        );
+        assert_eq!(draft.todos.len(), 3, "{:?}", draft.todos);
+        assert!(draft.todos[0].contains("`22; rm -rf /`") && draft.todos[0].contains("node"));
+        assert!(draft.todos[2].contains("`$(id)`"));
+        let out = draft.render(DETECT_HEADER);
+        assert!(
+            crate::commands::check::static_issues(&parse(&out))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hostile_tool_versions_and_compose_text_are_sanitized() {
+        let long_tool = format!("evil{}", "z".repeat(300));
+        let dir = fixture(&[
+            (".tool-versions", &format!("{long_tool} 1\n")),
+            (
+                "docker-compose.yml",
+                "services:\n  \"a\\nhooks: x\":\n    image: \"myorg/api\\rbefore_up: y\"\n",
+            ),
+        ]);
+        let out = detect(&dir).render(DETECT_HEADER);
+        for line in out.lines().filter(|l| l.starts_with("# TODO:")) {
+            assert!(line.chars().count() <= 2 * SNIPPET_MAX + 80, "{line}");
+        }
+        assert!(
+            !out.lines()
+                .any(|l| l.starts_with("hooks") || l.starts_with("before_up")),
+            "{out}"
+        );
+        assert!(
+            out.contains("`a hooks: x` uses image `myorg/api before_up: y`"),
+            "{out}"
+        );
+        parse(&out);
+    }
+
     use crate::config::DevyConfig;
 
     fn parse(yaml: &str) -> DevyConfig {

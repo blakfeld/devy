@@ -304,23 +304,26 @@ mod tests {
     static CD_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_tempdir<F: FnOnce() -> R, R>(f: F) -> R {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "devy_cli_{}_{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        // A fresh, empty directory (removed on drop, even if `f` panics). The current
+        // directory is process-wide: CD_LOCK only orders these tests, and while one runs,
+        // other tests' `fs_safe::project_root()` fallback (no recorded root) sees `dir`.
+        // That is harmless for them because `dir` is an empty leaf of the temp dir.
+        let dir = crate::test_support::tmp_dir();
         let _guard = CD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let orig = std::env::current_dir().ok();
-        std::env::set_current_dir(&dir).unwrap();
-        let result = f();
-        if let Some(o) = orig {
-            let _ = std::env::set_current_dir(o);
+        // Declared after `dir`, so it restores the working directory before `dir` is
+        // removed — also when `f` panics, which would otherwise leave the process in a
+        // deleted directory.
+        struct RestoreCwd(Option<std::path::PathBuf>);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                if let Some(o) = &self.0 {
+                    let _ = std::env::set_current_dir(o);
+                }
+            }
         }
-        let _ = std::fs::remove_dir_all(&dir);
-        result
+        let _restore = RestoreCwd(std::env::current_dir().ok());
+        std::env::set_current_dir(&dir).unwrap();
+        f()
     }
 
     #[test]

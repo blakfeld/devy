@@ -1,0 +1,17 @@
+# Hostile fixture: INVALID config. `devy check` must reject it at load.
+# @OUT@ is replaced by the test with a test-owned directory outside the project.
+name: "hostile\e]52;c;aG9zdGlsZQ==\a"
+hooks:
+  before_up: "touch '@OUT@/markers/before_up'; exit 1"
+  after_up: "touch '@OUT@/markers/after_up'; exit 1"
+  before_down: "touch '@OUT@/markers/before_down'; exit 1"
+dependencies:
+  - ./evil.deb
+  - mysql:
+      cli_args: "--init-file=@OUT@/markers/init.sql --plugin-load=@OUT@/evil.so"
+  - python
+environment:
+  BASH_ENV: "@OUT@/bash_env.sh"
+commands:
+  "$(touch @OUT@/markers/command)": echo hi
+  dev: echo dev

@@ -73,7 +73,7 @@ impl Module for NginxModule {
         data_dir: &std::path::Path,
     ) -> Result<Option<super::LaunchSpec>> {
         let conf = data_dir.join("nginx.conf");
-        std::fs::write(&conf, nginx_conf(port(dep)?, data_dir))
+        crate::fs_safe::write_atomic(&conf, nginx_conf(port(dep)?, data_dir).as_bytes(), 0o644)
             .with_context(|| format!("Failed to write {}", conf.display()))?;
         Ok(Some(super::LaunchSpec::new(
             "nginx",
@@ -91,7 +91,7 @@ impl Module for NginxModule {
     }
 
     fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
-        Ok(Some(super::DockerSpec::new("nginx", "stable", 80)))
+        Ok(Some(super::DockerSpec::new("nginx", "1.30.5", 80)))
     }
 
     fn default_port(&self) -> Option<u16> {

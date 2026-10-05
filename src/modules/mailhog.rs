@@ -18,6 +18,9 @@ fn package_name(pm: &dyn PackageManager) -> &'static str {
     }
 }
 
+/// MailHog's web UI and API port (they share one listener).
+const UI_PORT: u16 = 8025;
+
 fn smtp_port(dep: &Dependency) -> anyhow::Result<u16> {
     super::extra_port(dep, "smtp_port", 1025)
 }
@@ -33,9 +36,18 @@ impl Module for MailhogModule {
         _data_dir: &std::path::Path,
     ) -> Result<Option<super::LaunchSpec>> {
         let p = smtp_port(dep)?;
+        // MailHog's web UI and API otherwise listen on 0.0.0.0, exposing captured mail.
+        let ui = format!("127.0.0.1:{UI_PORT}");
         Ok(Some(super::LaunchSpec::new(
             "MailHog",
-            ["-smtp-bind-addr".into(), format!("127.0.0.1:{p}")],
+            [
+                "-smtp-bind-addr".into(),
+                format!("127.0.0.1:{p}"),
+                "-ui-bind-addr".into(),
+                ui.clone(),
+                "-api-bind-addr".into(),
+                ui,
+            ],
         )))
     }
 
@@ -46,7 +58,7 @@ impl Module for MailhogModule {
     fn docker_spec(&self, _dep: &Dependency) -> Result<Option<super::DockerSpec>> {
         Ok(Some(super::DockerSpec::new(
             "mailhog/mailhog",
-            "latest",
+            "v1.0.1",
             1025,
         )))
     }

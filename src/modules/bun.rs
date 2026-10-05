@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use which::which;
 
 use crate::config::Dependency;
+use crate::installers;
 use crate::output;
 use crate::package_manager::PackageManager;
 
@@ -12,11 +14,36 @@ use super::helpers::{stamp_matches, write_stamp};
 
 pub struct BunModule;
 
+/// Arguments for the bun installer: its positional release tag `bun-v<version>` when a
+/// version is pinned (a leading `v` or `bun-v` is not repeated). `latest` passes nothing
+/// (the installer's default) and `canary` passes the `canary` tag.
+fn installer_args(version: Option<&str>) -> Vec<OsString> {
+    match version {
+        None | Some("latest") => Vec::new(),
+        Some("canary") => vec!["canary".into()],
+        Some(v) => {
+            let bare = v
+                .strip_prefix("bun-v")
+                .or_else(|| v.strip_prefix('v'))
+                .unwrap_or(v);
+            vec![format!("bun-v{bare}").into()]
+        }
+    }
+}
+
 fn bun_bin() -> Option<String> {
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .map(|home| format!("{home}/.bun/bin/bun"))
+    // The same home the installer runs with (see `installers::user_home`).
+    installers::user_home().map(|home| bun_bin_in(&home))
+}
+
+/// Where the bun installer puts the binary under `home`.
+fn bun_bin_in(home: &std::ffi::OsStr) -> String {
+    format!("{}/.bun/bin/bun", home.to_string_lossy())
+}
+
+/// Whether bun is on PATH or present at `bin` (the installer's location).
+fn installed(bin: Option<&str>) -> bool {
+    which("bun").is_ok() || bin.is_some_and(|b| Path::new(b).exists())
 }
 
 impl Module for BunModule {
@@ -29,38 +56,31 @@ impl Module for BunModule {
     }
 
     fn is_installed(&self, _pm: &dyn PackageManager, _dep: &Dependency) -> Result<bool> {
-        let bin_exists = bun_bin()
-            .map(|b| std::path::Path::new(&b).exists())
-            .unwrap_or(false);
-        Ok(which("bun").is_ok() || bin_exists)
+        Ok(installed(bun_bin().as_deref()))
     }
 
     fn install(&self, _pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        #[cfg(test)]
-        let script = std::env::var("ENVY_TEST_BUN_INSTALL_SCRIPT")
-            .unwrap_or_else(|_| "curl -fsSL https://bun.sh/install | bash".to_string());
-        #[cfg(not(test))]
-        let script = "curl -fsSL https://bun.sh/install | bash".to_string();
-
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&script);
-
-        if let Some(ver) = dep.version.as_deref() {
-            // BUN_INSTALL_VERSION controls which release the script fetches.
-            cmd.env("BUN_INSTALL_VERSION", ver);
-        }
-
-        let status = cmd
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|e| anyhow::anyhow!("Failed to run Bun installer: {e}"))?;
-
+        let status = installers::run_script(
+            &installers::BUN,
+            installers::Interpreter::Bash,
+            &installer_args(dep.version.as_deref()),
+            // The installer edits the rc file of the shell `$SHELL` names; bash fills an
+            // unset SHELL from the user database, so name a shell it doesn't recognise and
+            // it only prints PATH instructions.
+            &[("SHELL", "/bin/sh")],
+        )?;
         if !status.success() {
             bail!("Bun installation failed — check the output above for details");
         }
         Ok(())
+    }
+
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        super::helpers::step_if_exists(
+            project_root,
+            "package.json",
+            "bun install (package.json lifecycle scripts)",
+        )
     }
 
     fn post_setup(
@@ -96,7 +116,7 @@ impl Module for BunModule {
         if !status.success() {
             anyhow::bail!("`bun install` failed — check the output above for details");
         }
-        write_stamp(&stamp_path, manifest);
+        write_stamp(&stamp_path, manifest)?;
         output::success("Bun dependencies installed");
         Ok(())
     }
@@ -106,9 +126,15 @@ impl Module for BunModule {
         _pm: &dyn PackageManager,
         _dep: &Dependency,
     ) -> Result<Option<String>> {
-        let path = bun_bin()
+        // The installer's binary, else one on PATH outside the project — never a bare
+        // name resolved against the full PATH.
+        let Some(path) = bun_bin()
             .filter(|b| std::path::Path::new(b).exists())
-            .unwrap_or_else(|| "bun".to_string());
+            .map(std::path::PathBuf::from)
+            .or_else(|| crate::fs_safe::which_outside_project("bun"))
+        else {
+            return Ok(None);
+        };
         let out = Command::new(path).arg("--version").output();
         // "1.0.25" — output is just the version string
         Ok(out.ok().and_then(|o| {
@@ -138,10 +164,7 @@ mod tests {
     #[test]
     fn bun_bin_returns_some_with_non_empty_home() {
         // On any normal system HOME is set and non-empty, so bun_bin() should return Some.
-        if std::env::var("HOME")
-            .map(|h| !h.is_empty())
-            .unwrap_or(false)
-        {
+        if installers::user_home().is_some() {
             let bin = bun_bin().unwrap();
             assert!(
                 bin.contains(".bun/bin/bun"),
@@ -152,11 +175,9 @@ mod tests {
 
     #[test]
     fn bun_bin_path_contains_home() {
-        if let Ok(home) = std::env::var("HOME")
-            && !home.is_empty()
-        {
+        if let Some(home) = installers::user_home() {
             let bin = bun_bin().unwrap();
-            assert!(bin.starts_with(&home));
+            assert!(bin.starts_with(&*home.to_string_lossy()));
         }
     }
 
@@ -169,26 +190,22 @@ mod tests {
 
     #[test]
     fn bun_is_installed_true_when_bin_file_exists_and_not_on_path() {
-        // Only runs when bun is NOT on PATH (to avoid modifying real installations).
+        // Only meaningful when bun is NOT on PATH. Uses a temporary home rather than
+        // the real one, so it never touches the user's ~/.bun and never races the
+        // tests that expect no binary there.
         if which("bun").is_ok() {
             return;
         }
-        if let Some(bin_path) = bun_bin() {
-            let path = std::path::Path::new(&bin_path);
-            if path.exists() {
-                return;
-            }
-            std::fs::create_dir_all(path.parent().unwrap()).ok();
-            std::fs::write(&bin_path, b"#!/bin/sh").ok();
-            let pm = MockPackageManager::default();
-            let dep = Dependency::simple("bun");
-            let result = BunModule.is_installed(&pm, &dep).unwrap();
-            std::fs::remove_file(&bin_path).ok();
-            assert!(
-                result,
-                "Expected is_installed=true when bun binary exists at {bin_path}"
-            );
-        }
+        let home = crate::test_support::tmp_dir();
+        let bin_path = bun_bin_in(home.as_os_str());
+        assert!(!installed(Some(&bin_path)));
+        let path = Path::new(&bin_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh").unwrap();
+        assert!(
+            installed(Some(&bin_path)),
+            "Expected installed=true when bun binary exists at {bin_path}"
+        );
     }
 
     #[test]
@@ -211,6 +228,21 @@ mod tests {
         assert!(
             !ver.unwrap().is_empty(),
             "Expected non-empty version string"
+        );
+    }
+
+    #[test]
+    fn bun_is_installed_checks_the_installer_location_in_the_user_home() {
+        let home = crate::test_support::tmp_dir();
+        let bin = bun_bin_in(home.as_os_str());
+        assert!(bin.ends_with("/.bun/bin/bun"), "{bin}");
+        // Not there yet: only a bun on PATH can make it count as installed.
+        assert_eq!(installed(Some(&bin)), which("bun").is_ok());
+        std::fs::create_dir_all(home.join(".bun/bin")).unwrap();
+        std::fs::write(&bin, b"").unwrap();
+        assert!(
+            installed(Some(&bin)),
+            "the installer's binary must count as installed"
         );
     }
 
@@ -253,26 +285,66 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn bun_install_fails_when_script_exits_nonzero() {
-        // Uses ENVY_TEST_BUN_INSTALL_SCRIPT to inject a failing script.
-        let _guard = crate::test_support::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // SAFETY: serialised by ENV_LOCK; var is only read by BunModule::install.
-        unsafe {
-            std::env::set_var("ENVY_TEST_BUN_INSTALL_SCRIPT", "exit 1");
-        }
+        use crate::installers::test_hooks;
+        test_hooks::clear();
+        test_hooks::serve(&installers::BUN, b"exit 1\n");
         let pm = MockPackageManager::default();
         let dep = Dependency::simple("bun");
         let result = BunModule.install(&pm, &dep);
-        unsafe {
-            std::env::remove_var("ENVY_TEST_BUN_INSTALL_SCRIPT");
-        }
+        test_hooks::clear();
         assert!(
             result.is_err(),
             "install must return Err when script exits non-zero"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bun_install_runs_verified_installer_with_pinned_version() {
+        use crate::installers::{Interpreter, test_hooks};
+        test_hooks::clear();
+        test_hooks::serve(&installers::BUN, b"exit 0\n");
+        let pm = MockPackageManager::default();
+        let dep = Dependency {
+            version: Some("1.1.0".into()),
+            ..Dependency::simple("bun")
+        };
+        let result = BunModule.install(&pm, &dep);
+        let runs = test_hooks::runs();
+        let envs = test_hooks::envs();
+        test_hooks::clear();
+        result.unwrap();
+        assert_eq!(envs, vec![("SHELL".to_string(), "/bin/sh".to_string())]);
+        assert_eq!(
+            runs,
+            vec![(
+                installers::BUN.name,
+                Interpreter::Bash,
+                vec!["bun-v1.1.0".into()]
+            )]
+        );
+    }
+
+    #[test]
+    fn bun_install_without_verified_download_runs_nothing() {
+        use crate::installers::test_hooks;
+        test_hooks::clear();
+        let pm = MockPackageManager::default();
+        assert!(BunModule.install(&pm, &Dependency::simple("bun")).is_err());
+        assert!(test_hooks::runs().is_empty());
+    }
+
+    #[test]
+    fn bun_installer_args() {
+        assert!(installer_args(None).is_empty());
+        assert_eq!(installer_args(Some("1.1.0")), vec!["bun-v1.1.0"]);
+        assert_eq!(installer_args(Some("v1.1.0")), vec!["bun-v1.1.0"]);
+        assert_eq!(installer_args(Some("bun-v1.1.0")), vec!["bun-v1.1.0"]);
+        assert!(installer_args(Some("latest")).is_empty());
+        assert_eq!(installer_args(Some("canary")), vec!["canary"]);
     }
 
     fn file_mtime_secs(path: &std::path::Path) -> u64 {

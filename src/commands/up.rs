@@ -15,14 +15,14 @@ use crate::package_manager;
 use crate::project_env::{self, ProjectEnv};
 use crate::service_runner::docker::ContainerRuntime;
 use crate::service_runner::{self, Runners, ServiceRunner};
+use crate::validate;
 
 #[cfg_attr(test, mutants::skip)] // thin delegation — reads process env and disk; not unit-testable
 pub fn run(update: bool, bootstrap: bool) -> Result<()> {
     // Located separately from parsing so that a devy.yml that fails to load is still
     // recorded: only a missing devy.yml leaves nowhere to write the failure record.
     let start = std::env::current_dir().context("Failed to get current directory")?;
-    let config_path = DevyConfig::find_config(&start)
-        .ok_or_else(|| anyhow::anyhow!("devy.yml not found — are you inside a devy project?"))?;
+    let config_path = DevyConfig::locate_config(&start)?;
     let project_root = config_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("devy.yml has no parent directory"))?
@@ -62,7 +62,7 @@ pub(crate) fn record_outcome(
             Ok(())
         }
         Err(err) => {
-            let record = failure_record::FailureRecord::new(&err, progress);
+            let record = failure_record::FailureRecord::for_project(project_root, &err, progress);
             match failure_record::write(project_root, &record) {
                 Ok(()) => Err(HintedError {
                     inner: err,
@@ -88,6 +88,8 @@ fn run_located(
 ) -> Result<()> {
     progress.enter("load config");
     let config = DevyConfig::load(config_path)?;
+    output::header(&format!("devy up · {}", project_name(&config)));
+
     progress.enter("detect package manager");
     let pm = package_manager::detect(&config, project_root)?;
     progress.backend = Some(pm.name().to_string());
@@ -98,12 +100,10 @@ fn run_located(
     // Uses a dedicated guard file to avoid inode-swap conflicts with write_lock's
     // rename strategy on devy.lock itself.
     let guard_path = project_root.join(".devy-lock");
-    let _guard = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&guard_path)
-        .context("Failed to open process guard file")?;
+    // Opened in place (never replaced, so every process locks the same inode), and never
+    // through a symlink a repository committed at that name.
+    let _guard =
+        crate::fs_safe::open_lock_file(&guard_path).context("Failed to open process guard file")?;
     _guard
         .lock_exclusive()
         .context("Failed to acquire process lock (is another devy process running?)")?;
@@ -124,6 +124,11 @@ fn run_located(
 pub(crate) struct UpOptions {
     pub update: bool,
     pub bootstrap: bool,
+}
+
+/// The project name shown in headers: `name` from devy.yml, or `project`.
+fn project_name(config: &DevyConfig) -> &str {
+    config.name.as_deref().unwrap_or("project")
 }
 
 /// Where `devy up` is, so a failure can be recorded with the step and dependency it
@@ -199,13 +204,23 @@ pub(crate) fn up_tracked(
     progress: &mut UpProgress,
 ) -> Result<()> {
     progress.backend = Some(pm.name().to_string());
-    let project_name = config.name.as_deref().unwrap_or("project");
-    output::header(&format!("devy up · {}", project_name));
+    let project_name = project_name(config);
+    // The header comes first, in `run_located`.
+
+    // Before anything runs or writes: the directories devy writes into and runs from must
+    // not be symlinks, foreign-owned or committed to the repository.
+    progress.enter("check managed paths");
+    let venvs = config
+        .normalized_dependencies()
+        .map(|deps| modules::managed_venvs(&deps))
+        .unwrap_or_default();
+    // A refusal also removes any trust an earlier `devy up` gave `.shadowenv.d`.
+    crate::fs_safe::check_managed_paths(project_root, &venvs)?;
 
     if let Some(ref hook) = config.hooks.before_up {
         progress.enter("before_up hook");
         output::header("Hooks");
-        run_hook("before_up", hook)?;
+        run_hook("before_up", hook, project_root)?;
     }
 
     progress.enter("read dependencies");
@@ -308,7 +323,13 @@ pub(crate) fn up_tracked(
     let ProjectEnv {
         vars: merged_env,
         path_prepends: module_path_prepends,
-    } = project_env::resolve(config, &effective_deps, pm, project_root);
+    } = project_env::resolve(
+        config,
+        &effective_deps,
+        pm,
+        project_root,
+        ports::PortMode::Assign,
+    );
 
     let has_content = !merged_env.is_empty() || !module_path_prepends.is_empty();
     let has_existing_file = env_mgr.read_vars(project_root).is_some();
@@ -338,21 +359,8 @@ pub(crate) fn up_tracked(
                 if count == 1 { "" } else { "s" }
             ));
 
-            let shell = std::env::var("SHELL")
-                .ok()
-                .and_then(|s| s.rsplit('/').next().map(String::from))
-                .filter(|s| matches!(s.as_str(), "sh" | "zsh" | "bash" | "fish" | "powershell"))
-                .unwrap_or_else(|| {
-                    if cfg!(target_os = "windows") {
-                        "powershell".into()
-                    } else {
-                        "zsh".into()
-                    }
-                });
-            output::info_code(
-                "Activate with:",
-                &format!("eval \"$(shadowenv hook {shell})\""),
-            );
+            let shell = std::env::var("SHELL").ok();
+            output::info_code("Activate with:", &activation_hint(shell.as_deref()));
         } else {
             output::success("Environment configuration cleared");
         }
@@ -385,7 +393,7 @@ pub(crate) fn up_tracked(
     if let Some(ref hook) = config.hooks.after_up {
         progress.enter("after_up hook");
         output::header("Hooks");
-        run_hook("after_up", hook)?;
+        run_hook("after_up", hook, project_root)?;
     }
 
     output::blank_line();
@@ -534,8 +542,44 @@ pub(crate) fn start_service_if_needed(runner: &dyn ServiceRunner, dep: &Dependen
     Ok(())
 }
 
+/// The command that loads devy's shell integration (`devy hook`), which sets up shadowenv
+/// behind devy's guard, for the shell named by `$SHELL` (`shell`). `devy hook` supports
+/// zsh, bash and fish; any other or unknown shell gets the zsh form.
+fn activation_hint(shell: Option<&str>) -> String {
+    let bin = env!("CARGO_PKG_NAME");
+    let name = shell
+        .and_then(|s| s.rsplit(['/', '\\']).next())
+        .unwrap_or("");
+    match name {
+        "fish" => format!("{bin} hook fish | source"),
+        "bash" => format!("eval \"$({bin} hook bash)\""),
+        _ => format!("eval \"$({bin} hook zsh)\""),
+    }
+}
+
+/// `value` if it passes `valid`, else `None` with a warning. Resolved versions and digests
+/// are scraped from tool output, and `LockFile::load` rejects an entry that fails these
+/// rules, so recording one would leave a lock that every later command refuses to read.
+fn lockable(
+    dep: &str,
+    field: &str,
+    value: Option<String>,
+    valid: fn(&str) -> bool,
+) -> Option<String> {
+    match value {
+        Some(v) if !valid(&v) => {
+            output::warn(&format!(
+                "{dep}: not recording {field} {v:?} in devy.lock: it is not a valid {field}"
+            ));
+            None
+        }
+        other => other,
+    }
+}
+
 /// Records each dependency's resolved version, source and port. A docker-managed service
 /// records `source: docker`, its image tag as the version and the pulled image's digest.
+/// Leaves the file alone when the lock is already up to date.
 pub(crate) fn write_lock(deps: &[Dependency], runners: &Runners, path: &Path) -> Result<()> {
     let pm = runners.package.pm();
     let mut locked = BTreeMap::new();
@@ -549,6 +593,13 @@ pub(crate) fn write_lock(deps: &[Dependency], runners: &Runners, path: &Path) ->
         } else {
             runners.runner_for(dep).resolved(dep)?
         };
+        let resolved = lockable(&dep.name, "resolved_version", resolved, validate::version);
+        let image_digest = lockable(
+            &dep.name,
+            "image_digest",
+            image_digest,
+            validate::image_digest,
+        );
         let source = if dep.docker {
             service_runner::DOCKER_SOURCE
         } else {
@@ -594,10 +645,72 @@ pub(crate) fn write_lock(deps: &[Dependency], runners: &Runners, path: &Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_hint_uses_devy_hook_for_the_shell() {
+        assert_eq!(
+            activation_hint(Some("/bin/bash")),
+            "eval \"$(devy hook bash)\""
+        );
+        assert_eq!(
+            activation_hint(Some("/usr/local/bin/zsh")),
+            "eval \"$(devy hook zsh)\""
+        );
+        assert_eq!(
+            activation_hint(Some("/opt/homebrew/bin/fish")),
+            "devy hook fish | source"
+        );
+        for other in [None, Some("/bin/sh"), Some("powershell"), Some("")] {
+            assert_eq!(
+                activation_hint(other),
+                "eval \"$(devy hook zsh)\"",
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lockable_drops_values_the_lock_loader_would_reject() {
+        assert_eq!(
+            lockable(
+                "vc",
+                "resolved_version",
+                Some("14.36.32532.0".into()),
+                validate::version
+            ),
+            Some("14.36.32532.0".into())
+        );
+        for bad in [">", "14.36.\u{2026}", "1.0;id"] {
+            assert_eq!(
+                lockable(
+                    "vc",
+                    "resolved_version",
+                    Some(bad.into()),
+                    validate::version
+                ),
+                None,
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            lockable("vc", "resolved_version", None, validate::version),
+            None
+        );
+        assert_eq!(
+            lockable(
+                "redis",
+                "image_digest",
+                Some("redis@sha256:abc".into()),
+                validate::image_digest
+            ),
+            None
+        );
+    }
     use crate::config::Dependency;
     use crate::lock::{LockFile, LockedDep};
     use crate::package_manager::MockPackageManager;
     use crate::service_runner::{PackageRunner, package_runners};
+    use serde_norway as yaml;
     use std::collections::{BTreeMap, HashMap};
 
     fn tmp_path() -> crate::test_support::TempFile {
@@ -1518,7 +1631,7 @@ mod tests {
     #[test]
     fn up_tracked_records_hook_step_without_dependency() {
         let yaml = "hooks:\n  before_up: \"exit 3\"\ndependencies:\n  - jq\n";
-        let config: crate::config::DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: crate::config::DevyConfig = yaml::from_str(yaml).unwrap();
         let (result, progress) = tracked(&config, &MockPackageManager::default());
         assert!(result.is_err());
         assert_eq!(progress.step, Some("before_up hook"));
@@ -1571,6 +1684,7 @@ mod tests {
     #[test]
     fn record_outcome_writes_record_and_hints_on_failure() {
         let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("devy.yml"), "name: x\n").unwrap();
         let err = anyhow::anyhow!("exit 1").context("Failed to install postgres");
         let out = record_outcome(&dir, Err(err), &failed_at_install()).unwrap_err();
         let hinted = out.downcast_ref::<HintedError>().expect("hinted");
@@ -1592,6 +1706,7 @@ mod tests {
     #[test]
     fn record_outcome_replaces_previous_record() {
         let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("devy.yml"), "name: x\n").unwrap();
         let _ = record_outcome(&dir, Err(anyhow::anyhow!("first")), &failed_at_install());
         let _ = record_outcome(&dir, Err(anyhow::anyhow!("second")), &UpProgress::default());
         let record = failure_record::load(&dir).unwrap().unwrap();
@@ -1784,7 +1899,7 @@ mod tests {
             .map(|dep| apply_lock_from_source(dep, lock.as_ref(), &pm))
             .collect();
         ports::resolve_ports(&mut deps, lock.as_ref(), &pm, ports::PortMode::ReadOnly).unwrap();
-        let resolved = project_env::resolve(&config, &deps, &pm, &dir);
+        let resolved = project_env::resolve(&config, &deps, &pm, &dir, ports::PortMode::ReadOnly);
 
         assert_eq!(resolved.vars, *env_mgr.last_vars.borrow());
         assert_eq!(resolved.path_prepends, *env_mgr.last_path_prepends.borrow());
@@ -1971,7 +2086,7 @@ mod tests {
     }
 
     fn up_warnings(yaml: &str, lock_entries: &[(&str, &str)]) -> Vec<String> {
-        let config: crate::config::DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: crate::config::DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             name: "nix",
             installed: true,
@@ -2072,7 +2187,7 @@ mod tests {
     #[test]
     fn up_impl_brew_redis_explicit_port_warns_and_uses_it() {
         let yaml = "dependencies:\n  - redis:\n      port: 6380\n";
-        let config: crate::config::DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: crate::config::DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             name: "brew",
             installed: true,
@@ -2166,6 +2281,18 @@ mod tests {
 
     use crate::service_runner::docker::{FakeRunner, fail, ok};
 
+    /// A well-formed sha256 digest standing in for `label`: its bytes in hex, left-padded
+    /// with zeros to 64 characters (devy.lock rejects malformed digests).
+    fn fake_digest(label: &str) -> String {
+        let hex: String = label.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("{hex:0>64}")
+    }
+
+    /// `<repo>@sha256:<fake_digest(label)>`.
+    fn fake_ref(repo: &str, label: &str) -> String {
+        format!("{repo}@sha256:{}", fake_digest(label))
+    }
+
     /// A container CLI where the daemon answers, images are missing until pulled (then
     /// report `<repo>@sha256:<digest>`), and no containers exist yet.
     fn docker_cli(digest: &'static str) -> FakeRunner {
@@ -2174,7 +2301,7 @@ mod tests {
             "image" => {
                 let reference = call.last().unwrap();
                 let repo = reference.split([':', '@']).next().unwrap();
-                ok(&format!(r#"["{repo}@sha256:{digest}"]"#))
+                ok(&format!(r#"["{}"]"#, fake_ref(repo, digest)))
             }
             "container" => fail("Error: No such container"),
             _ => ok(""),
@@ -2196,7 +2323,7 @@ mod tests {
         lock: Option<LockFile>,
         update: bool,
     ) -> DockerUp {
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let env_mgr = MockEnvManager {
             is_available: true,
             ..Default::default()
@@ -2263,20 +2390,23 @@ mod tests {
         let redis = lock.get("redis").unwrap();
         assert_eq!(redis.source, "docker");
         assert_eq!(redis.resolved_version.as_deref(), Some("7"));
-        assert_eq!(redis.image_digest.as_deref(), Some("redis@sha256:abc"));
+        assert_eq!(
+            redis.image_digest.as_deref(),
+            Some(fake_ref("redis", "abc").as_str())
+        );
         let port = redis
             .assigned_port
             .expect("docker ports are always assigned");
         assert_eq!(
             lock.get("postgresql").unwrap().image_digest.as_deref(),
-            Some("postgres@sha256:abc")
+            Some(fake_ref("postgres", "abc").as_str())
         );
 
         // The container runs the digest just recorded, on the exported host port.
         let run = up
             .lines
             .iter()
-            .find(|l| l.starts_with("docker run") && l.contains("redis@sha256:abc"))
+            .find(|l| l.starts_with("docker run") && l.contains(&fake_ref("redis", "abc")))
             .expect("redis container created from the locked digest");
         assert!(run.contains(&format!("-p 127.0.0.1:{port}:6379")), "{run}");
         assert_eq!(up.env["REDIS_PORT"], port.to_string());
@@ -2382,7 +2512,7 @@ mod tests {
     fn teammate_runs_the_locked_digest() {
         let pm = unavailable_pm();
         let cli = docker_cli("moved");
-        let lock = locked_redis("redis@sha256:locked");
+        let lock = locked_redis(&fake_ref("redis", "locked"));
         let up = docker_up(
             "service_manager: docker\ndependencies:\n  - redis\n",
             &pm,
@@ -2393,7 +2523,7 @@ mod tests {
         up.result.unwrap();
         assert!(
             up.lines
-                .contains(&"docker pull redis@sha256:locked".to_string()),
+                .contains(&format!("docker pull {}", fake_ref("redis", "locked"))),
             "{:?}",
             up.lines
         );
@@ -2414,14 +2544,17 @@ mod tests {
             "service_manager: docker\ndependencies:\n  - redis\n",
             &pm,
             &cli,
-            Some(locked_redis("redis@sha256:old")),
+            Some(locked_redis(&fake_ref("redis", "old"))),
             true,
         );
         up.result.unwrap();
         assert!(up.lines.contains(&"docker pull redis:7".to_string()));
         let lock = up.lock.unwrap();
         let redis = lock.get("redis").unwrap();
-        assert_eq!(redis.image_digest.as_deref(), Some("redis@sha256:new"));
+        assert_eq!(
+            redis.image_digest.as_deref(),
+            Some(fake_ref("redis", "new").as_str())
+        );
         assert_eq!(redis.assigned_port, Some(51000), "--update keeps ports");
     }
 
@@ -2433,7 +2566,7 @@ mod tests {
             "service_manager: docker\ndependencies:\n  - redis: { version: \"7.2\" }\n",
             &pm,
             &cli,
-            Some(locked_redis("redis@sha256:old")),
+            Some(locked_redis(&fake_ref("redis", "old"))),
             false,
         );
         up.result.unwrap();
@@ -2441,7 +2574,10 @@ mod tests {
         let lock = up.lock.unwrap();
         let redis = lock.get("redis").unwrap();
         assert_eq!(redis.resolved_version.as_deref(), Some("7.2"));
-        assert_eq!(redis.image_digest.as_deref(), Some("redis@sha256:v72"));
+        assert_eq!(
+            redis.image_digest.as_deref(),
+            Some(fake_ref("redis", "v72").as_str())
+        );
     }
 
     #[test]
@@ -2557,7 +2693,7 @@ mod tests {
         });
         let pm = MockPackageManager::default();
         let config: DevyConfig =
-            serde_yml::from_str("service_manager: docker\ndependencies:\n  - redis\n").unwrap();
+            yaml::from_str("service_manager: docker\ndependencies:\n  - redis\n").unwrap();
         let dep = config.normalized_dependencies().unwrap().remove(0);
         let runners = Runners::new(
             &pm,
@@ -2580,7 +2716,7 @@ mod tests {
             ..Default::default()
         };
         let cli = docker_cli("abc");
-        let config: DevyConfig = serde_yml::from_str(
+        let config: DevyConfig = yaml::from_str(
             "service_manager: docker\ndependencies:\n  - postgres: { port: 6543 }\n",
         )
         .unwrap();
@@ -2611,7 +2747,7 @@ mod tests {
     fn docker_services_keep_non_config_post_setup_warnings() {
         let pm = MockPackageManager::default();
         let cli = FakeRunner::new(|_| ok("[]"));
-        let config: DevyConfig = serde_yml::from_str(
+        let config: DevyConfig = yaml::from_str(
             "service_manager: docker\ndependencies:\n  - vault: { dev_mode: true }\n",
         )
         .unwrap();

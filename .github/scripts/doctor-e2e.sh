@@ -9,7 +9,10 @@ set -euo pipefail
 
 DEVY=$1
 WORK=$(mktemp -d)
-trap 'rm -rf "$WORK"' EXIT
+# A state directory of our own, so the run never touches the user's.
+STATE=$(mktemp -d)
+export XDG_STATE_HOME="$STATE"
+trap 'rm -rf "$WORK" "$STATE"' EXIT
 cd "$WORK"
 git init -q
 

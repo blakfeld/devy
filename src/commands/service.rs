@@ -98,10 +98,11 @@ pub(crate) fn list_impl(
     output::header("Services");
 
     for service in &services {
+        let label = output::clean_line(&service.label);
         if service.state.running {
-            println!("  {}  {}", "●".green().bold(), service.label);
+            println!("  {}  {}", "●".green().bold(), label);
         } else {
-            println!("  {}  {}", "○".dimmed(), service.label.dimmed());
+            println!("  {}  {}", "○".dimmed(), label.as_ref().dimmed());
         }
     }
 
@@ -259,6 +260,7 @@ mod tests {
     use crate::config::DevyConfig;
     use crate::package_manager::MockPackageManager;
     use crate::service_runner::{PackageRunner, package_runners};
+    use serde_norway as yaml;
     use std::collections::HashMap;
 
     fn make_config(dep_names: &[&str]) -> DevyConfig {
@@ -603,10 +605,8 @@ mod tests {
     use std::rc::Rc;
 
     fn docker_config() -> DevyConfig {
-        serde_yml::from_str(
-            "name: app\nservice_manager: docker\ndependencies:\n  - redis\n  - jq\n",
-        )
-        .unwrap()
+        yaml::from_str("name: app\nservice_manager: docker\ndependencies:\n  - redis\n  - jq\n")
+            .unwrap()
     }
 
     #[test]
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn services_json_reports_docker_service() {
-        let config: DevyConfig = serde_yml::from_str(
+        let config: DevyConfig = yaml::from_str(
             "dependencies:\n  - postgres:\n      service_manager: docker\n  - redis\n",
         )
         .unwrap();
@@ -843,7 +843,7 @@ mod tests {
     #[test]
     fn services_rejects_an_out_of_range_port_like_status() {
         let config: DevyConfig =
-            serde_yml::from_str("dependencies:\n  - redis:\n      port: 70000\n").unwrap();
+            yaml::from_str("dependencies:\n  - redis:\n      port: 70000\n").unwrap();
         let pm = MockPackageManager::default();
         let err = list_impl(
             &config,

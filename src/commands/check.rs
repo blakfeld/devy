@@ -271,6 +271,9 @@ fn collect_into(
             findings
                 .notes
                 .extend(extra_key_issues(dep).into_iter().map(Note::Issue));
+            findings
+                .notes
+                .extend(module_issues(dep).into_iter().map(Note::Issue));
             let warnings = module
                 .config_warnings(dep)
                 .into_iter()
@@ -317,10 +320,14 @@ fn collect_into(
 /// lock: dependency normalization, unrecognized extra keys, invalid shells and conflicts
 /// between explicit ports. Used to validate a config before anything is installed.
 pub(crate) fn static_issues(config: &DevyConfig) -> Result<Vec<String>> {
+    // Configs parsed outside `DevyConfig::load` (AI init and doctor proposals) get the
+    // same value validation here.
+    config.validate()?;
     let deps = config.normalized_dependencies()?;
     let mut issues = Vec::new();
     for dep in &deps {
         issues.extend(extra_key_issues(dep));
+        issues.extend(module_issues(dep));
         issues.extend(shell_issue(dep));
     }
     issues.extend(explicit_port_conflict(&deps));
@@ -344,6 +351,14 @@ fn extra_key_issues(dep: &Dependency) -> Vec<String> {
     keys.sort();
     keys.into_iter()
         .map(|key| format!("{}: unrecognized config key `{key}` — {hint}", dep.name))
+        .collect()
+}
+
+fn module_issues(dep: &Dependency) -> Vec<String> {
+    modules::get(&dep.name)
+        .config_issues(dep)
+        .into_iter()
+        .map(|issue| format!("{}: {issue}", dep.name))
         .collect()
 }
 
@@ -403,6 +418,7 @@ mod tests {
     use crate::config::DevyConfig;
     use crate::env_manager::MockEnvManager;
     use crate::package_manager::MockPackageManager;
+    use serde_norway as yaml;
     use std::collections::HashMap;
 
     fn make_config(dep_names: &[&str], env: HashMap<String, String>) -> DevyConfig {
@@ -498,7 +514,7 @@ mod tests {
     fn check_impl_returns_err_on_unrecognized_extra_key() {
         // minio has known_extra_keys; portx is not in the list — must count as an issue.
         let yaml = "dependencies:\n  - minio:\n      portx: 9001\n";
-        let config: crate::config::DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: crate::config::DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             installed: true,
             service_running: true,
@@ -531,7 +547,7 @@ mod tests {
     fn check_impl_warns_on_extra_key_for_module_with_empty_allowlist() {
         // ruby has no known extra keys (inherits Some(&[]) default) — any extra key must warn.
         let yaml = "dependencies:\n  - ruby:\n      vrsion: \"3.3.0\"\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             installed: true,
             ..Default::default()
@@ -550,7 +566,7 @@ mod tests {
         // config_warnings on MinioModule fires when access_key is configured.
         // check_impl must call it and emit the warning via output::warn.
         let yaml = "dependencies:\n  - minio:\n      access_key: myuser\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             installed: true,
             service_running: true,
@@ -602,7 +618,7 @@ mod tests {
     fn check_impl_warns_on_unhonored_nix_version_without_counting_issue() {
         let dir = crate::test_support::tmp_dir();
         let yaml = "dependencies:\n  - jq:\n      version: \"1.6\"\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             name: "nix",
             installed: true,
@@ -627,7 +643,7 @@ mod tests {
     #[test]
     fn check_impl_does_not_flag_service_manager_or_image_as_module_keys() {
         let yaml = "dependencies:\n  - redis: { service_manager: package, image: mirror/redis }\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             installed: true,
             service_running: true,
@@ -645,7 +661,7 @@ mod tests {
     #[test]
     fn check_impl_rejects_service_manager_on_non_service() {
         let yaml = "dependencies:\n  - node: { service_manager: docker }\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let err = check_impl(
             &config,
             &MockPackageManager::default(),
@@ -662,8 +678,30 @@ mod tests {
     use crate::service_runner::docker::{FakeRunner, fail, ok};
 
     fn docker_check(yaml: &str, cli: &FakeRunner) -> (Result<()>, Vec<String>) {
+        docker_check_in(yaml, cli, &crate::test_support::tmp_dir())
+    }
+
+    /// `docker_check` with every container reported running and owned by the project.
+    fn docker_check_running(yaml: &str) -> (Result<()>, Vec<String>) {
         let dir = crate::test_support::tmp_dir();
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let state = serde_json::json!({
+            "State": {"Running": true},
+            "Config": {"Labels": {"sh.devy.project": dir.to_string_lossy()}},
+        })
+        .to_string();
+        let cli = FakeRunner::new(move |call| match call[1].as_str() {
+            "image" => ok("[{}]"),
+            _ => ok(&state),
+        });
+        docker_check_in(yaml, &cli, &dir)
+    }
+
+    fn docker_check_in(
+        yaml: &str,
+        cli: &FakeRunner,
+        dir: &std::path::Path,
+    ) -> (Result<()>, Vec<String>) {
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             installed: true,
             ..Default::default()
@@ -675,7 +713,7 @@ mod tests {
                 &pm,
                 ContainerRuntime::new(config.container_cli, cli),
                 &MockEnvManager::default(),
-                &dir,
+                dir,
             ));
         });
         (result.unwrap(), warnings)
@@ -701,11 +739,8 @@ mod tests {
 
     #[test]
     fn check_passes_for_running_container() {
-        let cli = FakeRunner::new(|call| match call[1].as_str() {
-            "image" => ok("[{}]"),
-            _ => ok(r#"{"State":{"Running":true},"Config":{"Labels":{}}}"#),
-        });
-        let (result, _) = docker_check("service_manager: docker\ndependencies:\n  - redis\n", &cli);
+        let (result, _) =
+            docker_check_running("service_manager: docker\ndependencies:\n  - redis\n");
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -728,13 +763,8 @@ mod tests {
 
     #[test]
     fn check_no_port_conflict_for_docker_mysql_and_mariadb() {
-        let cli = FakeRunner::new(|call| match call[1].as_str() {
-            "image" => ok("[{}]"),
-            _ => ok(r#"{"State":{"Running":true},"Config":{"Labels":{}}}"#),
-        });
-        let (result, _) = docker_check(
+        let (result, _) = docker_check_running(
             "package_manager: brew\nservice_manager: docker\ndependencies:\n  - mysql\n  - mariadb\n",
-            &cli,
         );
         assert!(result.is_ok(), "{result:?}");
     }
@@ -742,7 +772,7 @@ mod tests {
     #[test]
     fn check_impl_accepts_typescript_global_packages() {
         let yaml = "dependencies:\n  - typescript:\n      global_packages: [eslint]\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             installed: true,
             ..Default::default()
@@ -782,7 +812,7 @@ mod tests {
     fn check_impl_warns_on_unapplied_explicit_port_without_counting_issue() {
         let dir = crate::test_support::tmp_dir();
         let yaml = "dependencies:\n  - redis:\n      port: 6380\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             name: "brew",
             installed: true,
@@ -869,7 +899,7 @@ mod tests {
     #[test]
     fn check_json_warning_does_not_fail() {
         let config: DevyConfig =
-            serde_yml::from_str("dependencies:\n  - jq:\n      version: \"1.6\"\n").unwrap();
+            yaml::from_str("dependencies:\n  - jq:\n      version: \"1.6\"\n").unwrap();
         let pm = MockPackageManager {
             name: "nix",
             installed: true,
@@ -933,7 +963,7 @@ mod tests {
     #[test]
     fn collect_findings_keeps_multi_key_dependency_as_hard_error() {
         let yaml = "dependencies:\n  - node: {}\n    redis: {}\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let findings = collect(&config, &MockPackageManager::default());
         let err = findings
             .hard_error
@@ -946,7 +976,7 @@ mod tests {
     #[test]
     fn collect_findings_lists_issues_and_warnings_as_data() {
         let yaml = "dependencies:\n  - ruby: { vrsion: \"3\" }\n  - mysql\n  - minio: { access_key: me }\nenvironment:\n  FOO: bar\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let pm = MockPackageManager {
             installed: true,
             service_running: false,
@@ -999,7 +1029,7 @@ mod tests {
     #[test]
     fn static_issues_reports_misspelled_port_key() {
         let yaml = "dependencies:\n  - redis: { prot: 6380 }\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let issues = static_issues(&config).unwrap();
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(
@@ -1012,7 +1042,7 @@ mod tests {
     fn static_issues_empty_for_clean_config() {
         let yaml =
             "dependencies:\n  - node:\n      version: \"22\"\n  - redis:\n      port: 6380\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         assert_eq!(static_issues(&config).unwrap(), Vec::<String>::new());
     }
 
@@ -1020,7 +1050,7 @@ mod tests {
     fn static_issues_reports_explicit_port_conflict() {
         let yaml =
             "dependencies:\n  - redis:\n      port: 5432\n  - postgresql:\n      port: 5432\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let issues = static_issues(&config).unwrap();
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("port conflict"), "{issues:?}");
@@ -1036,7 +1066,7 @@ mod tests {
     #[test]
     fn static_issues_reports_invalid_shell() {
         let yaml = "dependencies:\n  - node:\n      shell: not-a-shell\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         let issues = static_issues(&config).unwrap();
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("invalid shell"), "{issues:?}");
@@ -1045,7 +1075,15 @@ mod tests {
     #[test]
     fn static_issues_errs_on_multi_key_dependency() {
         let yaml = "dependencies:\n  - node: {}\n    redis: {}\n";
-        let config: DevyConfig = serde_yml::from_str(yaml).unwrap();
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
         assert!(static_issues(&config).is_err());
+    }
+
+    #[test]
+    fn static_issues_applies_value_validation() {
+        let config: DevyConfig =
+            yaml::from_str("commands:\n  \"$(id>/tmp/p)\": echo hi\n").unwrap();
+        let err = static_issues(&config).unwrap_err().to_string();
+        assert!(err.contains("invalid command name"), "{err}");
     }
 }

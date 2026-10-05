@@ -32,14 +32,24 @@ pub(crate) fn project_environment(
     pm: &dyn PackageManager,
     project_root: &Path,
 ) -> Result<ProjectEnv> {
+    let normalized = config.normalized_dependencies()?;
+    // The environment puts `.devy/nix-profile/bin` and each virtualenv's `bin` first on
+    // PATH, so a repository that commits `.venv/bin/sudo` (or symlinks the profile
+    // elsewhere) would choose what runs. Every consumer gets the same check as `up`.
+    crate::fs_safe::check_managed_paths(project_root, &crate::modules::managed_venvs(&normalized))?;
     let lock = ports::load_lock(project_root)?;
-    let mut deps: Vec<_> = config
-        .normalized_dependencies()?
+    let mut deps: Vec<_> = normalized
         .iter()
         .map(|dep| apply_lock_from_source(dep, lock.as_ref(), pm))
         .collect();
     ports::resolve_ports(&mut deps, lock.as_ref(), pm, PortMode::ReadOnly)?;
-    Ok(project_env::resolve(config, &deps, pm, project_root))
+    Ok(project_env::resolve(
+        config,
+        &deps,
+        pm,
+        project_root,
+        PortMode::ReadOnly,
+    ))
 }
 
 /// The command for `argv` with the project environment applied: its variables set, and
@@ -108,6 +118,7 @@ fn exit_result(status: ExitStatus) -> Result<()> {
 mod tests {
     use super::*;
     use crate::package_manager::MockPackageManager;
+    use serde_norway as yaml;
     use std::collections::HashMap;
 
     fn env(vars: &[(&str, &str)], path_prepends: &[&str]) -> ProjectEnv {
@@ -268,7 +279,7 @@ mod tests {
         }
         .write(&dir.join(crate::lock::PATH))
         .unwrap();
-        let config: DevyConfig = serde_yml::from_str(
+        let config: DevyConfig = yaml::from_str(
             "dependencies:\n  - redis\n  - postgres\nenvironment:\n  LOG_LEVEL: debug\n",
         )
         .unwrap();

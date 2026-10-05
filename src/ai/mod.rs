@@ -10,7 +10,7 @@ pub mod redact;
 
 use anyhow::{Result, anyhow, bail};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -78,7 +78,8 @@ impl Request {
         next
     }
 
-    /// Arguments for a single, tool-less, non-persistent `claude -p` turn.
+    /// Arguments for a single, tool-less, non-persistent `claude -p` turn that loads only
+    /// user-level settings: no project or local settings, hooks or `CLAUDE.md`.
     pub fn args(&self) -> Vec<String> {
         let mut args: Vec<String> = [
             "-p",
@@ -89,6 +90,8 @@ impl Request {
             "--strict-mcp-config",
             "--disable-slash-commands",
             "--no-session-persistence",
+            "--setting-sources",
+            "user",
             "--system-prompt",
         ]
         .map(String::from)
@@ -154,11 +157,9 @@ impl Transport for CliTransport {
     fn run(&self, args: &[String], stdin: &str) -> std::result::Result<Output, String> {
         // An empty working directory keeps the scanned project's .claude settings, hooks
         // and CLAUDE.md out of the session.
-        let cwd = std::env::temp_dir().join(format!("devy-ai-{}", std::process::id()));
-        std::fs::create_dir_all(&cwd).map_err(|e| e.to_string())?;
-        let result = run_with_timeout(&self.program, args, stdin, &cwd);
-        let _ = std::fs::remove_dir_all(&cwd);
-        result
+        // It is a fresh random-named 0700 directory, removed when `cwd` drops.
+        let cwd = crate::fs_safe::PrivateTempDir::new("ai").map_err(|e| format!("{e:#}"))?;
+        run_with_timeout(&self.program, args, stdin, cwd.path())
     }
 }
 
@@ -230,7 +231,9 @@ impl Client {
     /// `claude` is not installed.
     #[cfg_attr(test, mutants::skip)] // reads PATH and process env
     pub fn from_env() -> Result<Self> {
-        let program = which::which("claude").map_err(|_| anyhow!(MISSING_CLI))?;
+        // Never a `claude` the project put on PATH: it would receive the prompt.
+        let program =
+            crate::fs_safe::which_outside_project("claude").ok_or_else(|| anyhow!(MISSING_CLI))?;
         Ok(Self {
             model: model_from_env(),
             transport: Box::new(CliTransport { program }),
@@ -306,6 +309,126 @@ fn reply_model(value: &serde_json::Value) -> Option<String> {
         .iter()
         .max_by_key(|(_, u)| u.get("outputTokens").and_then(|t| t.as_u64()).unwrap_or(0))
         .map(|(model, _)| model.clone())
+}
+
+// ── project context files ────────────────────────────────────────────────────
+
+/// The most of one project file [`context_file`] loads: far above anything detection or
+/// a prompt (`redact::FILE_CAP`) needs, so a hostile repo cannot make devy load a huge
+/// file.
+pub(crate) const CONTEXT_READ_LIMIT: u64 = 1024 * 1024;
+
+/// What a prompt shows in place of a project file that is not a context file.
+pub(crate) const NOT_INCLUDED: &str = "(not included: not a regular file in the project)\n";
+
+/// Reads `root/rel` for AI context or offline detection. The file counts as absent
+/// unless it is a regular file, no component of `rel` is a symlink, and its canonical
+/// path lies inside `root`, so `README.md -> ~/.npmrc` is never read. `rel` must be a
+/// plain relative path (no `..`, root or drive prefix). At most [`CONTEXT_READ_LIMIT`]
+/// bytes are read; a longer file is cut at a character boundary. Unreadable and
+/// non-UTF-8 files count as absent.
+///
+/// Every project file devy reads for `init`, `ask`, `logs --explain` or `doctor` goes
+/// through this function (or [`is_context_path`] when the caller reads it itself).
+pub(crate) fn context_file(root: &Path, rel: &str) -> Option<String> {
+    let rel = Path::new(rel);
+    let meta = context_meta(root, rel)?;
+    let mut file = open_no_follow(&root.join(rel)).ok()?;
+    // The file opened must be the one checked: a swap to a symlink (or anything else)
+    // between the check and the open is refused.
+    let opened = file.metadata().ok()?;
+    if !opened.file_type().is_file() || !same_file(&meta, &opened) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(CONTEXT_READ_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > CONTEXT_READ_LIMIT {
+        bytes.truncate(CONTEXT_READ_LIMIT as usize);
+        let valid = match std::str::from_utf8(&bytes) {
+            Ok(_) => bytes.len(),
+            // Only a character cut by the limit may be incomplete.
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => return None,
+        };
+        bytes.truncate(valid);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Whether `path` may be included in AI context. A path under `root` must pass the same
+/// checks as [`context_file`]; a path elsewhere (a service log under a system log
+/// directory) is not a project file and is allowed.
+pub(crate) fn is_context_path(root: &Path, path: &Path) -> bool {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return context_meta(root, rel).is_some();
+    }
+    // Spelled differently (e.g. `/tmp` vs `/private/tmp`): find the ancestor of `path`
+    // that is the project root and check the rest from there, so symlinks below it are
+    // still seen. Undecidable paths are refused.
+    let (Ok(path), Ok(real_root)) = (std::path::absolute(path), root.canonicalize()) else {
+        return false;
+    };
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.canonicalize().is_ok_and(|a| a == real_root) {
+            return path
+                .strip_prefix(ancestor)
+                .is_ok_and(|rel| context_meta(ancestor, rel).is_some());
+        }
+    }
+    true
+}
+
+/// The `symlink_metadata` of `root/rel` when it is a context file (see [`context_file`]).
+fn context_meta(root: &Path, rel: &Path) -> Option<std::fs::Metadata> {
+    use std::path::Component;
+    if rel.as_os_str().is_empty() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    // No component may be a symlink, including directories such as `.github`.
+    let mut cur = root.to_path_buf();
+    let mut meta = None;
+    for component in rel.components() {
+        cur.push(component);
+        let m = std::fs::symlink_metadata(&cur).ok()?;
+        if m.file_type().is_symlink() {
+            return None;
+        }
+        meta = Some(m);
+    }
+    let meta = meta?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    // Defence in depth against links the checks above cannot see (e.g. a Windows
+    // junction on an ancestor): the real path must stay inside the real root. Volumes
+    // that cannot be canonicalized rely on the component checks alone.
+    if let (Ok(real), Ok(real_root)) = (cur.canonicalize(), root.canonicalize())
+        && !real.starts_with(&real_root)
+    {
+        return None;
+    }
+    Some(meta)
+}
+
+/// Opens `path` for reading without following a symlink at it and without blocking on
+/// a FIFO swapped in after the check (see [`crate::fs_safe::open_read_nofollow`]), so a
+/// swapped-in link or FIFO fails the caller's checks instead of hanging or redirecting.
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    crate::fs_safe::open_read_nofollow(path)
+}
+
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.len() == b.len() && a.modified().ok() == b.modified().ok()
 }
 
 #[cfg(test)]
@@ -395,6 +518,81 @@ mod tests {
     use super::fake::*;
     use super::*;
 
+    #[test]
+    fn context_file_reads_plain_relative_files_only() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("README.md"), "# hi\n").unwrap();
+        assert_eq!(context_file(&dir, "README.md").as_deref(), Some("# hi\n"));
+        assert_eq!(context_file(&dir, "missing"), None);
+        assert_eq!(context_file(&dir, ""), None);
+        assert_eq!(context_file(&dir, "./README.md"), None);
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(context_file(&sub, "../README.md"), None);
+        assert_eq!(
+            context_file(&sub, dir.join("README.md").to_str().unwrap()),
+            None
+        );
+        assert_eq!(context_file(&dir, "sub"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_file_refuses_symlinks_anywhere_on_the_path() {
+        let home = crate::test_support::tmp_dir();
+        std::fs::write(home.join(".npmrc"), "//registry/:_authToken=npm_secret\n").unwrap();
+        let dir = crate::test_support::tmp_dir();
+        std::os::unix::fs::symlink(home.join(".npmrc"), dir.join("README.md")).unwrap();
+        assert_eq!(context_file(&dir, "README.md"), None);
+        assert!(!is_context_path(&dir, &dir.join("README.md")));
+        std::os::unix::fs::symlink(&*home, dir.join(".github")).unwrap();
+        assert_eq!(context_file(&dir, ".github/.npmrc"), None);
+        std::fs::write(dir.join("devy.yml"), "name: x\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("devy.yml"), dir.join("devy.lock")).unwrap();
+        assert_eq!(context_file(&dir, "devy.lock"), None);
+        assert!(is_context_path(&dir, &dir.join("devy.yml")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_file_refuses_fifos() {
+        let dir = crate::test_support::tmp_dir();
+        let status = std::process::Command::new("mkfifo")
+            .arg(dir.join("README.md"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Must return at once instead of blocking on the open.
+        assert_eq!(context_file(&dir, "README.md"), None);
+    }
+
+    #[test]
+    fn is_context_path_allows_files_outside_the_project() {
+        let dir = crate::test_support::tmp_dir();
+        let elsewhere = crate::test_support::tmp_dir();
+        std::fs::write(elsewhere.join("redis.log"), "up\n").unwrap();
+        assert!(is_context_path(&dir, &elsewhere.join("redis.log")));
+        assert!(is_context_path(&dir, &elsewhere.join("missing.log")));
+        assert!(!is_context_path(&dir, &dir.join("missing.log")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_context_path_compares_real_paths() {
+        // The same project spelled through a symlinked parent, like `/tmp` on macOS.
+        let base = crate::test_support::tmp_dir();
+        let real = base.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("alias")).unwrap();
+        std::fs::write(real.join("a.log"), "x\n").unwrap();
+        let outside = crate::test_support::tmp_dir();
+        std::fs::write(outside.join("secret"), "s\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), real.join("b.log")).unwrap();
+        let root = base.join("alias");
+        assert!(is_context_path(&root, &real.join("a.log")));
+        assert!(!is_context_path(&root, &real.join("b.log")));
+    }
+
     fn req() -> Request {
         Request::new(None, "sys".into(), "hello".into())
     }
@@ -427,6 +625,8 @@ mod tests {
         ] {
             assert!(args.contains(&flag.to_string()), "missing {flag}");
         }
+        let i = args.iter().position(|a| a == "--setting-sources").unwrap();
+        assert_eq!(args[i + 1], "user");
         let i = args.iter().position(|a| a == "--system-prompt").unwrap();
         assert_eq!(args[i + 1], "be brief");
         assert!(!args.contains(&"--model".to_string()));

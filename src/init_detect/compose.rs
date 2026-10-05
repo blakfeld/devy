@@ -2,8 +2,17 @@
 
 use std::path::Path;
 
-use super::{Detector, Draft, read, version_of};
+use super::{Detector, Draft, is_plain_file, read, snippet, version_of};
 use crate::modules;
+use crate::yaml_safe::Aliases;
+use serde_norway as yaml;
+
+/// Expansion limit for a compose file: generous for real projects, far below the size
+/// an alias-amplification document would expand to.
+const COMPOSE_BUDGET: Aliases = Aliases::Budget {
+    nodes: 100_000,
+    bytes: 8 * 1024 * 1024,
+};
 
 const FILES: &[&str] = &[
     "compose.yaml",
@@ -21,6 +30,8 @@ const IMAGE_NAMES: &[(&str, &str)] = &[
     ("opensearchproject/opensearch", "opensearch"),
     ("getmeili/meilisearch", "meilisearch"),
     ("minio/minio", "minio"),
+    ("pgsty/minio", "minio"),
+    ("pgsty/silo", "minio"),
     ("mailhog/mailhog", "mailhog"),
     ("hashicorp/vault", "vault"),
 ];
@@ -32,7 +43,11 @@ impl Detector for Compose {
         let Some((file, content)) = FILES.iter().find_map(|f| Some((*f, read(dir, f)?))) else {
             return;
         };
-        let doc: serde_yml::Value = match serde_yml::from_str(&content) {
+        // Compose files commonly share settings through anchors, so they are allowed,
+        // but only while the expanded document stays small.
+        let parsed = crate::yaml_safe::check(&content, file, COMPOSE_BUDGET)
+            .and_then(|()| Ok(yaml::from_str::<yaml::Value>(&content)?));
+        let doc: yaml::Value = match parsed {
             Ok(doc) => doc,
             Err(_) => {
                 draft.todo(format!(
@@ -60,8 +75,9 @@ impl Detector for Compose {
                     draft.add_dep(name, version);
                 }
                 None => draft.todo(format!(
-                    "compose service `{}` uses image `{image}`, which devy has no module for",
-                    service.as_str().unwrap_or("?")
+                    "compose service `{}` uses image `{}`, which devy has no module for",
+                    snippet(service.as_str().unwrap_or("?")),
+                    snippet(image)
                 )),
             }
         }
@@ -93,7 +109,7 @@ fn native_tooling(dir: &Path) -> Option<&'static str> {
         "devbox.json",
         "Brewfile",
     ];
-    if let Some(file) = FILES.iter().find(|f| dir.join(f).is_file()) {
+    if let Some(file) = FILES.iter().find(|f| is_plain_file(dir, f)) {
         return Some(file);
     }
     // Only searched for direnv's nix directives; nothing else from .envrc is used.
@@ -172,6 +188,19 @@ mod tests {
             Some("mysql@8.0".into())
         );
         assert_eq!(mapped("rabbitmq:3-management"), Some("rabbitmq@3".into()));
+        assert_eq!(
+            mapped("pgsty/minio:RELEASE.2026-08-04T00-00-00Z"),
+            Some("minio".into())
+        );
+        assert_eq!(
+            mapped("minio/minio:RELEASE.2024-06-13T22-53-53Z"),
+            Some("minio".into())
+        );
+        assert_eq!(
+            mapped("pgsty/silo:RELEASE.2026-09-16T00-00-00Z"),
+            Some("minio".into())
+        );
+        assert_eq!(mapped("docker.io/pgsty/silo"), Some("minio".into()));
     }
 
     #[test]
@@ -284,5 +313,30 @@ mod tests {
         Compose.detect(&dir, &mut draft);
         assert!(draft.deps.is_empty());
         assert!(draft.todos[0].contains("could not parse"));
+    }
+
+    #[test]
+    fn compose_anchors_are_followed_within_budget() {
+        let compose = "x-db: &db\n  image: postgres:16\nservices:\n  db: *db\n";
+        let draft = detect(&[("compose.yaml", compose)]);
+        assert_eq!(draft.deps.len(), 1, "{draft:?}");
+        assert_eq!(draft.deps[0].name, "postgresql");
+    }
+
+    #[test]
+    fn alias_amplification_compose_becomes_todo() {
+        let items = vec!["x"; 1000].join(",");
+        let mut compose =
+            format!("x-a: &a [{items}]\nservices:\n  db:\n    image: postgres:16\n    l:\n");
+        for _ in 0..1000 {
+            compose.push_str("      - *a\n");
+        }
+        let draft = detect(&[("compose.yaml", &compose)]);
+        assert!(draft.deps.is_empty(), "{draft:?}");
+        assert!(
+            draft.todos[0].contains("could not parse"),
+            "{:?}",
+            draft.todos
+        );
     }
 }

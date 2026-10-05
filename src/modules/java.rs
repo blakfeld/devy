@@ -118,6 +118,17 @@ impl Module for JavaModule {
             .unwrap_or_default()
     }
 
+    fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {
+        if project_root.join("pom.xml").exists() {
+            return if project_root.join("mvnw").exists() {
+                vec!["./mvnw -B dependency:resolve (repository script)".to_string()]
+            } else {
+                vec!["mvn -B dependency:resolve (pom.xml plugins)".to_string()]
+            };
+        }
+        super::helpers::gradle_steps(project_root)
+    }
+
     fn post_setup(
         &self,
         _dep: &Dependency,
@@ -147,7 +158,7 @@ impl Module for JavaModule {
                     "`{mvn} dependency:resolve` failed — check the output above for details"
                 );
             }
-            write_stamp(&stamp_path, &pom);
+            write_stamp(&stamp_path, &pom)?;
             output::success("Maven dependencies resolved");
             return Ok(());
         }
@@ -184,7 +195,7 @@ impl Module for JavaModule {
                     "`{gradlew} dependencies` failed — check the output above for details"
                 );
             }
-            write_stamp(&stamp_path, &manifest);
+            write_stamp(&stamp_path, &manifest)?;
             output::success("Gradle dependencies resolved");
         }
 

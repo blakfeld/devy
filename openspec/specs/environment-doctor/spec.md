@@ -85,14 +85,16 @@ When AI assistance is unavailable or `--no-ai` is given, `devy doctor` SHALL pri
 - **THEN** devy warns `AI diagnosis failed: …` on stderr, still prints the deterministic findings, and exits 0
 
 ### Requirement: Suggested configuration fix
-When the diagnosis proposes a change to `devy.yml`, devy SHALL validate the proposed file before offering it. The file must load as a `devy.yml` and pass the configuration validation that `devy check` treats as hard errors, without counting install, service or environment state. A proposal that fails validation SHALL be discarded with the warning `suggested devy.yml change was invalid and was not offered: <cause>`.
+When the diagnosis proposes a change to `devy.yml`, devy SHALL validate the proposed file before offering it. The file must load as a `devy.yml` and pass the configuration validation that `devy check` treats as hard errors, without counting install, service or environment state. A proposal that fails validation, or that contains terminal control characters, SHALL be discarded with the warning `suggested devy.yml change was invalid and was not offered: <cause>`.
 
-A valid proposal SHALL be printed as a unified diff against the current `devy.yml` under a `Suggested fix` header. devy SHALL then:
-- with `--yes`, write it
+A valid proposal SHALL be printed as a unified diff against the current `devy.yml` under a `Suggested fix` header. If it adds or changes any executable field (any `hooks` entry, `after_install`, `install_cmd`, `tap`, `image`, `commands` entry, a dependency installed through the package manager (added, or with a changed version), or an execution-affecting `environment` key as listed in project-config's executable entry listing), devy SHALL list those entries under `This change adds or alters commands devy will run`. devy SHALL then:
+- with `--yes`, write it only if it changes no executable field; otherwise print `· not applied — this fix changes commands devy runs; review it and re-run without --yes` and leave `devy.yml` unchanged
 - when stdin is a terminal, ask `Apply this change to devy.yml? [y/N]` and write it only on `y` or `yes`, case-insensitively
 - otherwise, print `· not applied — re-run with --yes to apply` and leave `devy.yml` unchanged
 
-An applied change SHALL replace `devy.yml` atomically and print `✓ updated devy.yml — run devy up to apply it`. devy SHALL NOT run `devy up` itself.
+An applied change SHALL replace `devy.yml` atomically without following symlinks and print `✓ updated devy.yml — run devy up to apply it`. devy SHALL NOT run `devy up` itself.
+
+A `devy.yml` that is a symlink or not a regular file in the project SHALL still get the offline checks (read as other commands read it); only sending it to claude SHALL be refused, with an error naming `devy doctor --no-ai`.
 
 #### Scenario: User accepts the fix
 - **WHEN** the diagnosis proposes changing the `mysql` port, the change validates, and the user answers `y`
@@ -109,6 +111,10 @@ An applied change SHALL replace `devy.yml` atomically and print `✓ updated dev
 #### Scenario: Invalid suggestion is discarded
 - **WHEN** the proposed `devy.yml` lists a dependency entry with two keys
 - **THEN** devy warns that the suggestion was invalid, shows no diff and does not prompt
+
+#### Scenario: --yes never adds a hook
+- **WHEN** the proposal adds `hooks.before_up` and the user runs `devy doctor --yes`
+- **THEN** `devy.yml` is unchanged and devy prints the review hint
 
 ### Requirement: Doctor exit codes
 `devy doctor` SHALL exit 0 when it completes, whether or not problems were found or a fix was applied. It SHALL exit 1 with an `error:` line only when it cannot run at all, for example outside a devy project or when writing an accepted `devy.yml` fails. Usage errors SHALL exit 2.

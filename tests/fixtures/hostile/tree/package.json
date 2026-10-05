@@ -1,0 +1,8 @@
+{
+  "name": "hostile",
+  "scripts": {
+    "$(touch @OUT@/markers/script)": "echo pwned",
+    "dev\nhooks:\n  before_up: touch @OUT@/markers/script_newline": "echo pwned",
+    "build": "tsc"
+  }
+}

@@ -2,12 +2,113 @@ use anyhow::{Context, Result, bail};
 use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use which::which;
 
 use super::{LogSource, PackageManager};
 use crate::config::Dependency;
 
 pub struct Apt;
+
+/// Absolute path of `apt-get`. Using a fixed path (rather than a PATH lookup) means a
+/// project-local `apt-get` shim can never be run under sudo.
+const APT_GET: &str = "/usr/bin/apt-get";
+/// Absolute path of `sudo`, for the same reason.
+const SUDO: &str = "/usr/bin/sudo";
+
+/// `systemctl` for the privileged `sudo systemctl start/stop`: a fixed root-owned path,
+/// never a PATH lookup (which could find a user-writable `~/bin/systemctl` and run it as
+/// root). Debian and Ubuntu ship it in `/usr/bin` (merged /usr) or `/bin`.
+fn privileged_systemctl() -> &'static str {
+    privileged_systemctl_from(|p| std::path::Path::new(p).is_file())
+}
+
+fn privileged_systemctl_from(exists: impl Fn(&str) -> bool) -> &'static str {
+    ["/usr/bin/systemctl", "/bin/systemctl"]
+        .into_iter()
+        .find(|p| exists(p))
+        .unwrap_or("/usr/bin/systemctl")
+}
+
+/// `dpkg-query` found on PATH outside the project (so a project-local shim can't answer
+/// "is it installed?"), or its standard location.
+fn dpkg_query() -> PathBuf {
+    crate::fs_safe::which_outside_project("dpkg-query")
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/dpkg-query"))
+}
+
+/// Returns true for a Debian package name, optionally with an `:arch` qualifier
+/// (`[a-z0-9][a-z0-9.+-]*`, e.g. `libssl3:arm64`). This excludes paths and `.deb` files,
+/// which apt-get would otherwise install from disk — as root — even after `--`.
+fn is_debian_package_name(name: &str) -> bool {
+    let (pkg, arch) = match name.split_once(':') {
+        Some((pkg, arch)) => (pkg, Some(arch)),
+        None => (name, None),
+    };
+    let pkg_ok = pkg
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && pkg
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '+' | '-'));
+    let arch_ok = arch
+        .is_none_or(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    // A trailing `-` tells `apt-get install` to *remove* the package, so it is refused;
+    // a trailing `+` means install and must keep working (`g++`). Debian names are at
+    // least two characters long.
+    pkg_ok && arch_ok && pkg.len() >= 2 && !pkg.ends_with('-') && !pkg.ends_with(".deb")
+}
+
+/// Returns true for a Debian version string (`[A-Za-z0-9.+~:-]`, starting with a digit).
+/// A trailing `-` is refused: apt-get reads it on the whole `name=version` argument as
+/// "remove", and a Debian revision after the last hyphen is never empty anyway.
+fn is_debian_version(version: &str) -> bool {
+    !version.ends_with('-')
+        && version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '~' | ':' | '-'))
+}
+
+/// Builds the `apt-get` argv (excluding the program) used to install `dep`.
+/// Package specs follow `--` so a value can never be parsed as an option, and the name
+/// and version are checked against Debian's character sets so they can never name a
+/// local file.
+pub(crate) fn install_args(dep: &Dependency) -> Result<Vec<String>> {
+    if !is_debian_package_name(&dep.name) {
+        bail!("invalid apt package name '{}'", dep.name);
+    }
+    if let Some(ver) = &dep.version
+        && !is_debian_version(ver)
+    {
+        bail!("{}: invalid apt version '{}'", dep.name, ver);
+    }
+    // apt version pinning requires exact Debian version strings; the devy version field
+    // is passed through as-is. Partial versions (e.g. "20") may not resolve — users
+    // relying on PPAs or NodeSource repos should omit the version field and rely on
+    // devy.lock to pin the installed version across machines.
+    let pkg_spec = match &dep.version {
+        Some(ver) => format!("{}={}", dep.name, ver),
+        None => dep.name.clone(),
+    };
+    Ok(vec!["-y".into(), "install".into(), "--".into(), pkg_spec])
+}
+
+/// Builds the full privileged argv (`/usr/bin/sudo /usr/bin/apt-get <args>`).
+pub(crate) fn sudo_apt_get_argv(args: &[String]) -> Vec<String> {
+    let mut argv = vec![SUDO.to_string(), APT_GET.to_string()];
+    argv.extend(args.iter().cloned());
+    argv
+}
+
+/// Builds the `dpkg-query -W` argv (excluding the program) with the given format.
+pub(crate) fn dpkg_query_args(format: &str, name: &str) -> Vec<String> {
+    vec![
+        "-W".into(),
+        format!("-f={format}"),
+        "--".into(),
+        name.to_string(),
+    ]
+}
 
 /// Returns true when systemctl reports a service as "active".
 pub(crate) fn parse_systemctl_status(stdout: &str) -> bool {
@@ -32,6 +133,9 @@ pub(crate) fn installed_version_matches(installed: Option<&str>, required: &str)
 fn service_config_dir_impl(service: &str, pg_base: &std::path::Path) -> Option<PathBuf> {
     match service {
         "mysql" | "mariadb" => Some(PathBuf::from("/etc/mysql/conf.d")),
+        // Their configs live in per-service directories under /etc (see
+        // `modules::loopback`).
+        "kafka" | "zookeeper" | "rabbitmq" => Some(PathBuf::from("/etc")),
         "postgresql" | "postgres" => {
             let mut versions: Vec<(u32, PathBuf)> = std::fs::read_dir(pg_base)
                 .ok()?
@@ -54,10 +158,10 @@ impl Apt {
         Self
     }
 
-    fn run_apt_interactive(&self, args: &[&str]) -> Result<()> {
-        let status = Command::new("sudo")
-            .arg("apt-get")
-            .args(args)
+    fn run_apt_interactive(&self, args: &[String]) -> Result<()> {
+        let argv = sudo_apt_get_argv(args);
+        let status = Command::new(&argv[0])
+            .args(&argv[1..])
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -85,7 +189,7 @@ impl PackageManager for Apt {
     }
 
     fn is_available(&self) -> bool {
-        which("apt-get").is_ok()
+        std::path::Path::new(APT_GET).is_file()
     }
 
     fn bootstrap(&self) -> Result<()> {
@@ -93,8 +197,8 @@ impl PackageManager for Apt {
     }
 
     fn is_package_installed(&self, dep: &Dependency) -> Result<bool> {
-        let output = Command::new("dpkg-query")
-            .args(["-W", "-f=${Status}|${Version}", &dep.name])
+        let output = Command::new(dpkg_query())
+            .args(dpkg_query_args("${Status}|${Version}", &dep.name))
             .output()
             .with_context(|| format!("Failed to query dpkg for {}", dep.name))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -111,20 +215,12 @@ impl PackageManager for Apt {
     }
 
     fn install_package(&self, dep: &Dependency) -> Result<()> {
-        // apt version pinning requires exact Debian version strings; the devy version field
-        // is passed through as-is. Partial versions (e.g. "20") may not resolve — users
-        // relying on PPAs or NodeSource repos should omit the version field and rely on
-        // devy.lock to pin the installed version across machines.
-        let pkg_spec = match &dep.version {
-            Some(ver) => format!("{}={}", dep.name, ver),
-            None => dep.name.clone(),
-        };
-        self.run_apt_interactive(&["-y", "install", &pkg_spec])
+        self.run_apt_interactive(&install_args(dep)?)
     }
 
     fn is_service_running(&self, name: &str) -> Result<bool> {
-        let output = Command::new("systemctl")
-            .args(["is-active", name])
+        let output = Command::new(super::require_system_tool("systemctl")?)
+            .args(["is-active", "--", name])
             .output()
             .with_context(|| format!("Failed to check systemctl status for {name}"))?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -136,8 +232,9 @@ impl PackageManager for Apt {
         name: &str,
         _launch: Option<&crate::modules::LaunchSpec>,
     ) -> Result<()> {
-        let status = Command::new("sudo")
-            .args(["systemctl", "start", name])
+        let status = Command::new(SUDO)
+            .arg(privileged_systemctl())
+            .args(["start", "--", name])
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -150,8 +247,9 @@ impl PackageManager for Apt {
     }
 
     fn stop_service(&self, name: &str) -> Result<()> {
-        let status = Command::new("sudo")
-            .args(["systemctl", "stop", name])
+        let status = Command::new(SUDO)
+            .arg(privileged_systemctl())
+            .args(["stop", "--", name])
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -164,8 +262,8 @@ impl PackageManager for Apt {
     }
 
     fn resolved_version(&self, dep: &Dependency) -> Result<Option<String>> {
-        let output = Command::new("dpkg-query")
-            .args(["-W", "-f=${Version}", &dep.name])
+        let output = Command::new(dpkg_query())
+            .args(dpkg_query_args("${Version}", &dep.name))
             .output()
             .with_context(|| format!("Failed to query version for {}", dep.name))?;
         Ok(parse_dpkg_version(
@@ -198,6 +296,132 @@ mod tests {
         assert_eq!(
             cmd.args,
             ["-u", "redis-server", "-n", "100", "--no-pager", "-o", "cat"]
+        );
+    }
+
+    #[test]
+    fn apt_install_uses_absolute_sudo_and_separator() {
+        // Scenario: apt receives a separator.
+        let mut dep = Dependency::simple("redis-server");
+        dep.version = Some("7.0.15-1".into());
+        assert_eq!(
+            sudo_apt_get_argv(&install_args(&dep).unwrap()),
+            [
+                "/usr/bin/sudo",
+                "/usr/bin/apt-get",
+                "-y",
+                "install",
+                "--",
+                "redis-server=7.0.15-1"
+            ]
+        );
+    }
+
+    /// Scenario "Planted sudo": `<project_root>/bin/sudo` first on PATH is never run.
+    #[cfg(unix)]
+    #[test]
+    fn planted_sudo_on_project_path_is_not_used() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::tmp_dir();
+        let system = crate::test_support::tmp_dir();
+        let project_bin = root.join("bin");
+        let system_bin = system.join("bin");
+        for (dir, tools) in [
+            (&project_bin, &["sudo", "apt-get", "dpkg-query"][..]),
+            (&system_bin, &["dpkg-query"][..]),
+        ] {
+            std::fs::create_dir(dir).unwrap();
+            for tool in tools {
+                let script = dir.join(tool);
+                std::fs::write(&script, "#!/bin/sh\ntouch \"$0.ran\"\n").unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        // The project's bin comes first on PATH, as an activated environment would put it.
+        let path = std::env::join_paths([project_bin.as_path(), system_bin.as_path()]).unwrap();
+
+        // The privileged argv names absolute programs, so PATH is never consulted: running
+        // it with the hostile PATH could only ever reach /usr/bin/sudo.
+        let argv = sudo_apt_get_argv(&install_args(&Dependency::simple("jq")).unwrap());
+        assert_eq!(&argv[..2], [SUDO, APT_GET]);
+        assert!(
+            argv[..2]
+                .iter()
+                .all(|p| std::path::Path::new(p).is_absolute())
+        );
+
+        // The unprivileged lookup skips the project's shim and finds the system one.
+        let found = crate::fs_safe::which_outside_project_in("dpkg-query", &path, Some(&root))
+            .expect("system dpkg-query");
+        assert_eq!(found, system_bin.join("dpkg-query"));
+        // Through sh rather than exec'ing the just-written file, which can fail with
+        // ETXTBSY while another test thread forks.
+        let status = Command::new("/bin/sh").arg(&found).status().unwrap();
+        assert!(status.success());
+        assert!(system_bin.join("dpkg-query.ran").exists());
+        for tool in ["sudo", "apt-get", "dpkg-query"] {
+            assert!(
+                !project_bin.join(format!("{tool}.ran")).exists(),
+                "planted {tool} must never run"
+            );
+        }
+    }
+
+    #[test]
+    fn apt_install_without_version_passes_bare_name() {
+        let dep = Dependency::simple("redis-server");
+        assert_eq!(
+            install_args(&dep).unwrap(),
+            ["-y", "install", "--", "redis-server"]
+        );
+    }
+
+    #[test]
+    fn apt_install_accepts_arch_and_epoch() {
+        let mut dep = Dependency::simple("libssl3:arm64");
+        dep.version = Some("1:3.0.13-0ubuntu3~22.04+b1".into());
+        assert_eq!(
+            install_args(&dep).unwrap()[3],
+            "libssl3:arm64=1:3.0.13-0ubuntu3~22.04+b1"
+        );
+        assert!(install_args(&Dependency::simple("g++")).is_ok());
+    }
+
+    #[test]
+    fn apt_install_rejects_local_package_files() {
+        // Scenario: Local package file rejected — sudo is never invoked.
+        for name in [
+            "./evil.deb",
+            "evil.deb",
+            "/tmp/x",
+            "-oDPkg::Pre-Invoke=id",
+            "Redis",
+            "",
+            "redis-server-",
+            "postgresql-:amd64",
+            "x",
+        ] {
+            assert!(
+                install_args(&Dependency::simple(name)).is_err(),
+                "{name} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn apt_install_rejects_path_like_versions() {
+        for ver in ["../x.deb", "1.0/x", "1.0;id", "-1", "", "1-", "1.0-1-"] {
+            let mut dep = Dependency::simple("redis");
+            dep.version = Some(ver.into());
+            assert!(install_args(&dep).is_err(), "{ver} must be rejected");
+        }
+    }
+
+    #[test]
+    fn dpkg_query_args_use_separator() {
+        assert_eq!(
+            dpkg_query_args("${Status}|${Version}", "redis-server"),
+            ["-W", "-f=${Status}|${Version}", "--", "redis-server"]
         );
     }
 
@@ -344,5 +568,16 @@ mod tests {
             service_config_dir_impl("mysql", &base),
             Some(PathBuf::from("/etc/mysql/conf.d"))
         );
+    }
+
+    #[test]
+    fn privileged_systemctl_is_a_fixed_absolute_path() {
+        assert_eq!(privileged_systemctl_from(|_| true), "/usr/bin/systemctl");
+        assert_eq!(
+            privileged_systemctl_from(|p| p == "/bin/systemctl"),
+            "/bin/systemctl"
+        );
+        assert_eq!(privileged_systemctl_from(|_| false), "/usr/bin/systemctl");
+        assert!(privileged_systemctl().starts_with('/'));
     }
 }

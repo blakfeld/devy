@@ -164,6 +164,28 @@ impl<'a> DockerRunner<'a> {
         format!("devy-{}-{}", self.slug, modules::canonical_name(&dep.name))
     }
 
+    /// The `sh.devy.project` label value marking this project's containers.
+    fn project_label(&self) -> String {
+        self.project_root.to_string_lossy().into_owned()
+    }
+
+    /// Whether a container lacks this project's `sh.devy.project` label.
+    fn is_foreign(&self, state: &docker::ContainerState) -> bool {
+        state.labels.get(PROJECT_LABEL) != Some(&self.project_label())
+    }
+
+    /// Refuses to touch container `name` when it exists but another project (or anyone
+    /// else) created it. Stopping or removing it, or its same-named volume, would act on
+    /// someone else's data.
+    fn ensure_not_foreign(&self, name: &str) -> Result<()> {
+        if let Some(state) = self.runtime.inspect_container(name)?
+            && self.is_foreign(&state)
+        {
+            anyhow::bail!("container {name} belongs to another project");
+        }
+        Ok(())
+    }
+
     fn spec(&self, dep: &Dependency) -> Result<(DockerSpec, ImageRef)> {
         let spec = modules::get(&dep.name)
             .docker_spec(dep)?
@@ -173,14 +195,19 @@ impl<'a> DockerRunner<'a> {
     }
 
     /// The image reference to pull and run: the digest resolved earlier in this run, else
-    /// the locked digest while the repository and tag are unchanged (and not `--update`),
-    /// else `<repository>:<tag>`.
+    /// the module's built-in digest pin for its default image, else the locked digest
+    /// while the repository and tag are unchanged (and not `--update`), else
+    /// `<repository>:<tag>`.
     pub fn reference(&self, dep: &Dependency) -> Result<String> {
         let canonical = modules::canonical_name(&dep.name);
         if let Some(r) = self.resolved_refs.borrow().get(canonical) {
             return Ok(r.clone());
         }
         let (_, image) = self.spec(dep)?;
+        // A built-in pin outranks the lock: the lock can't swap in another digest for it.
+        if image.digest.is_some() {
+            return Ok(image.reference());
+        }
         if !self.update
             && let Some(locked) = self.lock.as_ref().and_then(|l| l.get(canonical))
             && locked.source == DOCKER_SOURCE
@@ -214,10 +241,7 @@ impl<'a> DockerRunner<'a> {
             name: name.clone(),
             hostname: modules::canonical_name(&dep.name).to_string(),
             labels: vec![
-                (
-                    PROJECT_LABEL.into(),
-                    self.project_root.to_string_lossy().into_owned(),
-                ),
+                (PROJECT_LABEL.into(), self.project_label()),
                 (
                     SERVICE_LABEL.into(),
                     modules::canonical_name(&dep.name).into(),
@@ -226,6 +250,7 @@ impl<'a> DockerRunner<'a> {
             ports,
             volume: spec.data_path.map(|path| (name, path)),
             env: spec.env,
+            secret_env: spec.secret_env,
             image: self.reference(dep)?,
             args: spec.args,
         };
@@ -236,7 +261,8 @@ impl<'a> DockerRunner<'a> {
 }
 
 /// A stable hash of what a container is created from: image reference, ports, volume,
-/// environment (sorted) and arguments.
+/// environment (sorted, with credentials hashed like any other variable, since the
+/// container's config records them either way) and arguments.
 fn config_hash(run: &RunSpec) -> u64 {
     let mut lines = vec![format!("image {}", run.image)];
     lines.extend(run.ports.iter().map(|(h, c)| format!("port {h}:{c}")));
@@ -244,6 +270,7 @@ fn config_hash(run: &RunSpec) -> u64 {
     let mut env: Vec<String> = run
         .env
         .iter()
+        .chain(&run.secret_env)
         .map(|(k, v)| format!("env {k}={v}"))
         .collect();
     env.sort();
@@ -289,7 +316,9 @@ impl ServiceRunner for DockerRunner<'_> {
         Ok(self
             .runtime
             .inspect_container(&self.container_name(dep))?
-            .is_some_and(|s| s.running))
+            // Another project's container under our name isn't this service running;
+            // `start` refuses it, and `down` skips it instead of failing.
+            .is_some_and(|s| s.running && !self.is_foreign(&s)))
     }
 
     fn start(&self, dep: &Dependency) -> Result<()> {
@@ -308,6 +337,11 @@ impl ServiceRunner for DockerRunner<'_> {
             .find(|(k, _)| k == CONFIG_LABEL)
             .map(|(_, v)| v.as_str());
         match self.runtime.inspect_container(&run.name)? {
+            // Never start, reuse or replace a container another project (or anyone else)
+            // created under this name.
+            Some(state) if self.is_foreign(&state) => {
+                anyhow::bail!("container {} belongs to another project", run.name)
+            }
             Some(state) if state.labels.get(CONFIG_LABEL).map(String::as_str) == hash => {
                 if state.running {
                     Ok(())
@@ -325,11 +359,24 @@ impl ServiceRunner for DockerRunner<'_> {
     }
 
     fn stop(&self, dep: &Dependency) -> Result<()> {
-        self.runtime.stop(&self.container_name(dep))
+        let name = self.container_name(dep);
+        self.ensure_not_foreign(&name)?;
+        self.runtime.stop(&name)
     }
 
     fn remove(&self, dep: &Dependency, volumes: bool) -> Result<bool> {
         let name = self.container_name(dep);
+        // Leave another project's container (and its volume) alone, but let `down`
+        // carry on with the remaining services.
+        if let Some(state) = self.runtime.inspect_container(&name)?
+            && self.is_foreign(&state)
+        {
+            output::warn(&format!(
+                "{}: container {name} belongs to another project — not removing it",
+                dep.name
+            ));
+            return Ok(false);
+        }
         self.runtime.remove_container(&name)?;
         if volumes {
             self.runtime.remove_volume(&name)?;

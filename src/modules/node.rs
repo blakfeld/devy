@@ -7,7 +7,7 @@ use crate::output;
 use crate::package_manager::PackageManager;
 
 use super::helpers::{stamp_matches, write_stamp};
-use super::{Module, extra_strs, node_pkg, run_cmd};
+use super::{Module, extra_list, node_pkg, run_cmd};
 
 pub struct NodeModule;
 
@@ -27,6 +27,22 @@ pub(crate) fn detect_node_pm(project_root: &Path) -> (&'static str, Option<PathB
         return ("npm", Some(npm_lock));
     }
     ("npm", None)
+}
+
+/// Builds `npm install -g -- <packages...>`. Packages follow `--` so a configured value can
+/// never be parsed as an npm option, and each must be a registry spec as defined by
+/// [`crate::validate::list_entry`] — the same rule `devy check` applies when the config is
+/// loaded, so a value accepted there is never refused here (and vice versa).
+/// Shared with the typescript module.
+pub(super) fn npm_global_install_args(packages: &[String]) -> Result<Vec<&str>> {
+    if let Some(bad) = packages.iter().find(|p| !crate::validate::list_entry(p)) {
+        anyhow::bail!(
+            "invalid global npm package '{bad}': only registry package names are allowed"
+        );
+    }
+    let mut args = vec!["install", "-g", "--"];
+    args.extend(packages.iter().map(String::as_str));
+    Ok(args)
 }
 
 /// `22` or `22.11.0` → `nodejs_22`, for Node majors nixpkgs carries.
@@ -64,6 +80,24 @@ impl Module for NodeModule {
         pm.install_package(&super::pkg_dep(self, pm, dep, node_pkg(pm)))
     }
 
+    fn setup_steps(&self, dep: &Dependency, project_root: &Path) -> Vec<String> {
+        let mut steps = Vec::new();
+        if project_root.join("package.json").exists() {
+            let (pm_cmd, _) = detect_node_pm(project_root);
+            steps.push(format!("{pm_cmd} install (package.json lifecycle scripts)"));
+        }
+        if let Ok(globals) = extra_list(dep, "global_packages")
+            && !globals.is_empty()
+        {
+            steps.push(format!(
+                "npm install -g {} {}",
+                globals.join(" "),
+                super::GLOBAL_PACKAGES_STEP
+            ));
+        }
+        steps
+    }
+
     fn post_setup(
         &self,
         dep: &Dependency,
@@ -87,12 +121,12 @@ impl Module for NodeModule {
                 if !status.success() {
                     anyhow::bail!("`{pm_cmd} install` failed — check the output above for details");
                 }
-                write_stamp(&stamp_path, manifest);
+                write_stamp(&stamp_path, manifest)?;
                 output::success(&format!("{pm_cmd} install complete"));
             }
         }
 
-        let packages = extra_strs(dep, "global_packages");
+        let packages = extra_list(dep, "global_packages")?;
         if packages.is_empty() {
             return Ok(());
         }
@@ -101,11 +135,8 @@ impl Module for NodeModule {
         if std::fs::read_to_string(&stamp).ok().as_deref() == Some(current.as_str()) {
             return Ok(());
         }
-        let refs: Vec<&str> = packages.iter().map(String::as_str).collect();
-        let mut args = vec!["install", "-g"];
-        args.extend_from_slice(&refs);
-        run_cmd("npm", &args)?;
-        let _ = std::fs::write(&stamp, &current);
+        run_cmd("npm", &npm_global_install_args(&packages)?)?;
+        super::helpers::write_stamp_text(&stamp, &current)?;
         Ok(())
     }
 }
@@ -115,6 +146,86 @@ mod tests {
     use super::*;
     use crate::package_manager::MockPackageManager;
     use std::collections::HashMap;
+
+    #[test]
+    fn npm_global_install_args_use_separator() {
+        let pkgs = vec![
+            "typescript".to_string(),
+            "eslint@9".to_string(),
+            "@angular/cli@^17.0.0".to_string(),
+        ];
+        assert!(
+            npm_global_install_args(&[
+                "pkg@~1.2".to_string(),
+                "pkg@latest".to_string(),
+                "pkg@>=1.0".to_string()
+            ])
+            .is_ok()
+        );
+        assert_eq!(
+            npm_global_install_args(&pkgs).unwrap(),
+            [
+                "install",
+                "-g",
+                "--",
+                "typescript",
+                "eslint@9",
+                "@angular/cli@^17.0.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn npm_global_install_args_accept_what_config_validation_accepts() {
+        // npm aliases pass `devy check` (validate::list_entry), so `up` must accept them too.
+        for good in ["ts@npm:typescript@5", "x@npm:@scope/pkg", "@a/b@npm:c@^1.2"] {
+            assert!(crate::validate::list_entry(good), "{good}");
+            assert!(
+                npm_global_install_args(&[good.to_string()]).is_ok(),
+                "{good}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_global_install_args_reject_non_registry_specs() {
+        for bad in [
+            "-g",
+            "--prefix=/tmp",
+            "user/repo",
+            "file:../x",
+            "./dir",
+            "/abs",
+            "~/x",
+            "git+https://example.com/x.git",
+            "@scope",
+            "@/name",
+            "@scope/name/extra",
+            "a b",
+            ".hidden",
+            "evil.tgz",
+            "evil.TAR.GZ",
+            "pkg@.",
+            "pkg@..",
+            "pkg@./x",
+            "pkg@~/x",
+            "pkg@x.tgz",
+            "pkg@",
+            "@scope/name@.",
+            "pkg@1|2",
+            "pkg@npm:file:../x",
+            "pkg@npm:user/repo",
+        ] {
+            assert!(
+                npm_global_install_args(&[bad.to_string()]).is_err(),
+                "{bad} must be rejected"
+            );
+            assert!(
+                !crate::validate::list_entry(bad),
+                "{bad} must fail config validation"
+            );
+        }
+    }
 
     fn dep_with_global_packages(pkgs: &[&str]) -> Dependency {
         let mut extra = HashMap::new();
@@ -285,5 +396,17 @@ mod tests {
             result.is_ok(),
             "post_setup must skip install when stamp matches"
         );
+    }
+
+    #[test]
+    fn node_post_setup_rejects_hostile_global_package_before_npm() {
+        let dir = crate::test_support::tmp_dir();
+        let dep = dep_with_global_packages(&["./x"]);
+        // A matching stamp would skip npm; validation must still fail first.
+        std::fs::write(dir.join(".devy_node_global_stamp"), "./x").unwrap();
+        let err = NodeModule
+            .post_setup(&dep, &MockPackageManager::default(), &dir)
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid list entry"), "{err}");
     }
 }

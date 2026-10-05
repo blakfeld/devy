@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::commands::ports;
+use crate::commands::ports::{self, PortMode};
 use crate::config::{Dependency, DevyConfig};
 use crate::modules;
 use crate::package_manager::PackageManager;
@@ -26,6 +26,7 @@ pub(crate) fn resolve(
     deps: &[Dependency],
     pm: &dyn PackageManager,
     project_root: &Path,
+    mode: PortMode,
 ) -> ProjectEnv {
     let mut module_env: HashMap<String, String> = HashMap::new();
     // PM-level prepends (e.g. .devy/nix-profile/bin) go first so project-local
@@ -34,6 +35,7 @@ pub(crate) fn resolve(
     for dep in deps {
         let m = modules::get(&dep.name);
         module_env.extend(m.env_vars(dep, project_root));
+        module_env.extend(m.backend_env_vars(dep, pm, project_root, mode));
         path_prepends.extend(m.path_prepends(dep, project_root));
     }
 
@@ -86,6 +88,7 @@ pub(crate) fn merge_env(
 mod tests {
     use super::*;
     use crate::package_manager::MockPackageManager;
+    use serde_norway as yaml;
 
     #[test]
     fn config_env_overrides_module_env_for_same_key() {
@@ -110,14 +113,13 @@ mod tests {
 
     #[test]
     fn resolve_puts_package_manager_entries_first() {
-        let config: DevyConfig =
-            serde_yml::from_str("dependencies:\n  - python\n  - redis\n").unwrap();
+        let config: DevyConfig = yaml::from_str("dependencies:\n  - python\n  - redis\n").unwrap();
         let deps = config.normalized_dependencies().unwrap();
         let pm = MockPackageManager {
             path_prepends_result: vec!["/p/.devy/nix-profile/bin".into()],
             ..Default::default()
         };
-        let env = resolve(&config, &deps, &pm, Path::new("/p"));
+        let env = resolve(&config, &deps, &pm, Path::new("/p"), PortMode::ReadOnly);
         assert_eq!(env.path_prepends[0], "/p/.devy/nix-profile/bin");
         assert_eq!(env.path_prepends.len(), 2, "{:?}", env.path_prepends);
         assert!(env.vars.contains_key("VIRTUAL_ENV"));
@@ -130,7 +132,7 @@ mod tests {
 
     #[test]
     fn resolve_lets_config_environment_win() {
-        let config: DevyConfig = serde_yml::from_str(
+        let config: DevyConfig = yaml::from_str(
             "dependencies:\n  - postgres\nenvironment:\n  DATABASE_URL: postgres://custom\n",
         )
         .unwrap();
@@ -140,6 +142,7 @@ mod tests {
             &deps,
             &MockPackageManager::default(),
             Path::new("/p"),
+            PortMode::ReadOnly,
         );
         assert_eq!(
             env.vars.get("DATABASE_URL").map(String::as_str),
@@ -149,7 +152,7 @@ mod tests {
 
     #[test]
     fn resolve_omits_port_for_unassigned_service() {
-        let config: DevyConfig = serde_yml::from_str("dependencies:\n  - redis\n").unwrap();
+        let config: DevyConfig = yaml::from_str("dependencies:\n  - redis\n").unwrap();
         let mut deps = config.normalized_dependencies().unwrap();
         let pm = MockPackageManager {
             name: "nix",
@@ -162,7 +165,7 @@ mod tests {
             crate::commands::ports::PortMode::ReadOnly,
         )
         .unwrap();
-        let env = resolve(&config, &deps, &pm, Path::new("/p"));
+        let env = resolve(&config, &deps, &pm, Path::new("/p"), PortMode::ReadOnly);
         assert!(env.vars.contains_key("REDIS_HOST"));
         assert!(!env.vars.contains_key("REDIS_PORT"), "{:?}", env.vars);
     }

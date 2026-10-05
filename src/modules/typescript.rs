@@ -7,8 +7,8 @@ use crate::output;
 use crate::package_manager::PackageManager;
 
 use super::helpers::{stamp_matches, write_stamp};
-use super::node::detect_node_pm;
-use super::{Module, extra_strs, node_pkg, run_cmd};
+use super::node::{detect_node_pm, npm_global_install_args};
+use super::{Module, extra_list, node_pkg, run_cmd};
 
 pub struct TypeScriptModule;
 
@@ -41,14 +41,26 @@ impl Module for TypeScriptModule {
         pm.install_package(&super::pkg_dep(self, pm, dep, node_pkg(pm)))?;
 
         let mut globals = vec!["typescript".to_string()];
-        globals.extend(extra_strs(dep, "global_packages"));
+        globals.extend(extra_list(dep, "global_packages")?);
 
-        let refs: Vec<&str> = globals.iter().map(String::as_str).collect();
-        let mut args = vec!["install", "-g"];
-        args.extend_from_slice(&refs);
-        run_cmd("npm", &args)?;
+        run_cmd("npm", &npm_global_install_args(&globals)?)?;
 
         Ok(())
+    }
+
+    fn setup_steps(&self, dep: &Dependency, project_root: &Path) -> Vec<String> {
+        let mut globals = vec!["typescript".to_string()];
+        globals.extend(extra_list(dep, "global_packages").unwrap_or_default());
+        let mut steps = vec![format!(
+            "npm install -g {} {}",
+            globals.join(" "),
+            super::GLOBAL_PACKAGES_STEP
+        )];
+        if project_root.join("package.json").exists() {
+            let (pm_cmd, _) = super::node::detect_node_pm(project_root);
+            steps.push(format!("{pm_cmd} install (package.json lifecycle scripts)"));
+        }
+        steps
     }
 
     fn post_setup(
@@ -77,7 +89,7 @@ impl Module for TypeScriptModule {
         if !status.success() {
             anyhow::bail!("`{pm_cmd} install` failed — check the output above for details");
         }
-        write_stamp(&stamp_path, manifest);
+        write_stamp(&stamp_path, manifest)?;
         output::success(&format!("{pm_cmd} install complete"));
         Ok(())
     }
@@ -188,5 +200,21 @@ mod tests {
     fn typescript_accepts_global_packages_key() {
         let known = TypeScriptModule.known_extra_keys().unwrap();
         assert!(known.contains(&"global_packages"));
+    }
+
+    #[test]
+    fn typescript_install_rejects_hostile_global_package_before_npm() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "global_packages".into(),
+            crate::config::ExtraValue::Sequence(vec![crate::config::ExtraValue::String(
+                "--registry=https://evil".into(),
+            )]),
+        );
+        let dep = Dependency::with_extra("typescript", extra);
+        let err = TypeScriptModule
+            .install(&MockPackageManager::default(), &dep)
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid list entry"), "{err}");
     }
 }

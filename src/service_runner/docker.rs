@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::config::ContainerCli;
 
@@ -24,13 +25,14 @@ pub trait CommandRunner {
     fn status(&self, program: &str, args: &[String]) -> Result<bool>;
 }
 
-/// Runs real processes.
+/// Runs real processes. The program is resolved with `package_manager::system_tool`, so a
+/// `docker`/`podman` a repository puts on PATH is never run.
 pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
     #[cfg_attr(test, mutants::skip)] // spawns real processes
     fn output(&self, program: &str, args: &[String]) -> Result<CmdOutput> {
-        let out = std::process::Command::new(program)
+        let out = std::process::Command::new(crate::package_manager::require_system_tool(program)?)
             .args(args)
             .output()
             .with_context(|| format!("Failed to run `{program}`"))?;
@@ -43,10 +45,11 @@ impl CommandRunner for SystemRunner {
 
     #[cfg_attr(test, mutants::skip)] // spawns real processes
     fn status(&self, program: &str, args: &[String]) -> Result<bool> {
-        let status = std::process::Command::new(program)
-            .args(args)
-            .status()
-            .with_context(|| format!("Failed to run `{program}`"))?;
+        let status =
+            std::process::Command::new(crate::package_manager::require_system_tool(program)?)
+                .args(args)
+                .status()
+                .with_context(|| format!("Failed to run `{program}`"))?;
         Ok(status.success())
     }
 }
@@ -71,6 +74,9 @@ pub struct RunSpec {
     /// `(volume name, mount path)`.
     pub volume: Option<(String, String)>,
     pub env: Vec<(String, String)>,
+    /// Credentials, written to a mode-0600 file passed with `--env-file` (and deleted once
+    /// `run` returns) so they never appear in the CLI's argv.
+    pub secret_env: Vec<(String, String)>,
     pub image: String,
     pub args: Vec<String>,
 }
@@ -202,8 +208,9 @@ impl<'a> ContainerRuntime<'a> {
         Ok(Some(ContainerState { running, labels }))
     }
 
-    /// The argv (after the CLI name) that creates and starts `spec`'s container.
-    pub fn run_args(spec: &RunSpec) -> Vec<String> {
+    /// The argv (after the CLI name) that creates and starts `spec`'s container, reading
+    /// its `secret_env` from `env_file` when given.
+    pub fn run_args(spec: &RunSpec, env_file: Option<&Path>) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "run".into(),
             "-d".into(),
@@ -228,6 +235,10 @@ impl<'a> ContainerRuntime<'a> {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
         }
+        if let Some(path) = env_file {
+            args.push("--env-file".into());
+            args.push(path.to_string_lossy().into_owned());
+        }
         args.push(spec.image.clone());
         args.extend(spec.args.iter().cloned());
         args
@@ -235,7 +246,16 @@ impl<'a> ContainerRuntime<'a> {
 
     /// Creates and starts a container. Fails with the CLI's error output.
     pub fn run(&self, spec: &RunSpec) -> Result<()> {
-        let out = self.runner.output(self.cli_name(), &Self::run_args(spec))?;
+        // Kept alive until the CLI returns; dropping it deletes the file.
+        let env_file = if spec.secret_env.is_empty() {
+            None
+        } else {
+            Some(write_env_file(&spec.secret_env)?)
+        };
+        let args = Self::run_args(spec, env_file.as_ref().map(|f| f.path()));
+        let out = self.runner.output(self.cli_name(), &args);
+        drop(env_file);
+        let out = out?;
         if !out.success {
             anyhow::bail!("{}", out.stderr.trim());
         }
@@ -273,6 +293,45 @@ impl<'a> ContainerRuntime<'a> {
     pub fn remove_volume(&self, name: &str) -> Result<()> {
         self.simple(&["volume", "rm", name], true)
     }
+}
+
+/// Writes `pairs` as a Docker env file (`KEY=value` lines, read literally) to a new
+/// temporary file readable only by the current user. Rejects names that aren't plain
+/// identifiers and values containing line breaks or NUL, which the format can't carry;
+/// errors name the variable but never its value.
+fn write_env_file(pairs: &[(String, String)]) -> Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let mut body = String::new();
+    for (k, v) in pairs {
+        let valid_name = k
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid_name {
+            anyhow::bail!("invalid container environment variable name {k:?}");
+        }
+        if v.contains(['\n', '\r', '\0']) {
+            anyhow::bail!("{k} must not contain line breaks or NUL characters");
+        }
+        body.push_str(&format!("{k}={v}\n"));
+    }
+    // tempfile creates the file with mode 0600 on Unix (set again below to be explicit);
+    // on Windows it lives in the per-user temp directory.
+    let mut file = tempfile::Builder::new()
+        .prefix("devy-env-")
+        .tempfile()
+        .context("Failed to create a temporary env file")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o600))
+            .context("Failed to restrict the temporary env file")?;
+    }
+    file.write_all(body.as_bytes())
+        .and_then(|()| file.flush())
+        .context("Failed to write the temporary env file")?;
+    Ok(file)
 }
 
 /// Answers one recorded call (program first) with its output.
@@ -556,9 +615,113 @@ mod tests {
             labels: vec![("sh.devy.service".into(), "minio".into())],
             ports: vec![(51000, 9000), (51001, 9001)],
             volume: Some(("devy-app-1234abcd-minio".into(), "/data".into())),
-            env: vec![("MINIO_ROOT_USER".into(), "me".into())],
-            image: "minio/minio:latest".into(),
+            env: vec![("TZ".into(), "UTC".into())],
+            secret_env: vec![],
+            image: "pgsty/silo:RELEASE.2026-09-16T00-00-00Z".into(),
             args: vec!["server".into(), "/data".into()],
+        }
+    }
+
+    fn secret_spec() -> RunSpec {
+        RunSpec {
+            secret_env: vec![
+                ("MINIO_ROOT_USER".into(), "me".into()),
+                ("MINIO_ROOT_PASSWORD".into(), "hunter2-secret".into()),
+            ],
+            ..spec()
+        }
+    }
+
+    /// The `--env-file` path in a recorded `run` call.
+    fn env_file_arg(call: &[String]) -> Option<String> {
+        call.iter()
+            .position(|a| a == "--env-file")
+            .map(|i| call[i + 1].clone())
+    }
+
+    #[test]
+    fn run_passes_secrets_through_env_file_not_argv() {
+        for cli in BOTH {
+            // Captured while the CLI "runs": (path, contents, unix mode).
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let seen_in = std::rc::Rc::clone(&seen);
+            let fake = FakeRunner::new(move |call| {
+                let path = env_file_arg(call).expect("--env-file passed");
+                let contents = std::fs::read_to_string(&path).unwrap();
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777
+                };
+                #[cfg(not(unix))]
+                let mode = 0o600;
+                *seen_in.borrow_mut() = Some((path, contents, mode));
+                ok("")
+            });
+            runtime(cli, &fake).run(&secret_spec()).unwrap();
+            let line = &fake.lines()[0];
+            assert!(!line.contains("hunter2-secret"), "{line}");
+            assert!(!line.contains("MINIO_ROOT_PASSWORD"), "{line}");
+            assert!(!line.contains("-e MINIO_ROOT_USER"), "{line}");
+            let (path, contents, mode) = seen.borrow_mut().take().unwrap();
+            assert_eq!(
+                *line,
+                format!(
+                    "{} run -d --name devy-app-1234abcd-minio --hostname minio \
+                     --label sh.devy.service=minio -p 127.0.0.1:51000:9000 \
+                     -p 127.0.0.1:51001:9001 -v devy-app-1234abcd-minio:/data \
+                     -e TZ=UTC --env-file {path} \
+                     pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data",
+                    cli.binary()
+                )
+            );
+            assert_eq!(
+                contents,
+                "MINIO_ROOT_USER=me\nMINIO_ROOT_PASSWORD=hunter2-secret\n"
+            );
+            assert_eq!(mode, 0o600);
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "the env file is deleted once run returns"
+            );
+        }
+    }
+
+    #[test]
+    fn run_deletes_env_file_when_run_fails() {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let seen_in = std::rc::Rc::clone(&seen);
+        let fake = FakeRunner::new(move |call| {
+            *seen_in.borrow_mut() = env_file_arg(call);
+            fail("boom")
+        });
+        assert!(
+            runtime(ContainerCli::Docker, &fake)
+                .run(&secret_spec())
+                .is_err()
+        );
+        let path = seen.borrow_mut().take().unwrap();
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn run_rejects_secrets_the_env_file_format_cannot_carry() {
+        for (k, v) in [
+            ("MINIO_ROOT_PASSWORD", "a\nEVIL=1"),
+            ("MINIO_ROOT_PASSWORD", "a\rb"),
+            ("MINIO_ROOT_PASSWORD", "a\0b"),
+            ("BAD NAME", "x"),
+            ("1BAD", "x"),
+            ("", "x"),
+        ] {
+            let fake = FakeRunner::ok();
+            let spec = RunSpec {
+                secret_env: vec![(k.into(), v.into())],
+                ..spec()
+            };
+            let err = runtime(ContainerCli::Docker, &fake).run(&spec).unwrap_err();
+            assert!(!err.to_string().contains("EVIL"), "{err}");
+            assert!(fake.lines().is_empty(), "nothing runs for {k:?}");
         }
     }
 
@@ -573,7 +736,7 @@ mod tests {
                     "{} run -d --name devy-app-1234abcd-minio --hostname minio \
                      --label sh.devy.service=minio -p 127.0.0.1:51000:9000 \
                      -p 127.0.0.1:51001:9001 -v devy-app-1234abcd-minio:/data \
-                     -e MINIO_ROOT_USER=me minio/minio:latest server /data",
+                     -e TZ=UTC pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data",
                     cli.binary()
                 )]
             );

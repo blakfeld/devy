@@ -34,7 +34,25 @@ impl FailureRecord {
             timestamp: utc_timestamp(std::time::SystemTime::now()),
         }
     }
+
+    /// [`FailureRecord::new`] for the project at `project_root`. When its `devy.yml` is
+    /// a symlink or not a regular file, the error (whose parse-error text can quote the
+    /// link target, which `doctor` would send to claude) is replaced by
+    /// [`CONFIG_NOT_REGULAR`].
+    pub fn for_project(project_root: &Path, err: &anyhow::Error, progress: &UpProgress) -> Self {
+        let mut record = Self::new(err, progress);
+        let regular = std::fs::symlink_metadata(project_root.join("devy.yml"))
+            .is_ok_and(|meta| meta.file_type().is_file());
+        if !regular {
+            record.error_chain = CONFIG_NOT_REGULAR.to_string();
+        }
+        record
+    }
 }
+
+/// The recorded error when `devy.yml` is not a regular file.
+pub const CONFIG_NOT_REGULAR: &str =
+    "devy.yml is a symlink or not a regular file; the error was not recorded";
 
 /// `<os>-<arch>`, e.g. `macos-aarch64`.
 pub fn platform() -> String {
@@ -49,32 +67,10 @@ pub fn path(project_root: &Path) -> PathBuf {
 pub fn write(project_root: &Path, record: &FailureRecord) -> Result<()> {
     let target = path(project_root);
     let dir = target.parent().expect("PATH has a parent");
-    std::fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
+    crate::fs_safe::ensure_dir_in(project_root, dir)?;
     let body = serde_json::to_string_pretty(record)?;
-    let tmp = dir.join(format!(".last-up-failure.{}.tmp", std::process::id()));
-    write_private(&tmp, body.as_bytes()).with_context(|| format!("Failed to write {PATH}"))?;
-    std::fs::rename(&tmp, &target).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+    crate::fs_safe::write_atomic(&target, body.as_bytes(), 0o600)
+        .with_context(|| format!("Failed to write {PATH}"))
 }
 
 /// Deletes the record; a missing record is not an error.
@@ -87,12 +83,15 @@ pub fn remove(project_root: &Path) -> Result<()> {
     }
 }
 
-/// The record, or `None` when there is none.
+/// The record, or `None` when there is none. It goes into `doctor`'s AI context, so it
+/// is read only as a regular, non-symlink file inside the project
+/// ([`crate::ai::context_file`]); anything else counts as no record.
 pub fn load(project_root: &Path) -> Result<Option<FailureRecord>> {
-    let text = match std::fs::read_to_string(path(project_root)) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("Failed to read {PATH}")),
+    let Some(text) = crate::ai::context_file(project_root, PATH) else {
+        if std::fs::symlink_metadata(path(project_root)).is_ok() {
+            anyhow::bail!("{PATH} is not a regular file in the project; ignoring it");
+        }
+        return Ok(None);
     };
     serde_json::from_str(&text)
         .map(Some)
@@ -133,6 +132,46 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn regular_config_keeps_the_error_chain() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("devy.yml"), "name: x\n").unwrap();
+        let err = anyhow::anyhow!("exit 1").context("Failed to install postgres");
+        let record = FailureRecord::for_project(&dir, &err, &UpProgress::default());
+        assert_eq!(record.error_chain, "Failed to install postgres: exit 1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_error_is_not_recorded() {
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        std::fs::write(outside.join("secret"), "SENTINEL_SECRET: [\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), dir.join("devy.yml")).unwrap();
+        let err = anyhow::anyhow!("did not find expected node content near SENTINEL_SECRET")
+            .context("Failed to parse devy.yml");
+        let record = FailureRecord::for_project(&dir, &err, &UpProgress::default());
+        assert_eq!(record.error_chain, CONFIG_NOT_REGULAR);
+        // A directory (or anything else that is not a regular file) is treated the same.
+        let dir2 = crate::test_support::tmp_dir();
+        std::fs::create_dir(dir2.join("devy.yml")).unwrap();
+        let record = FailureRecord::for_project(&dir2, &err, &UpProgress::default());
+        assert_eq!(record.error_chain, CONFIG_NOT_REGULAR);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_a_symlinked_record_without_reading_it() {
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        std::fs::write(outside.join("secret"), "SENTINEL_SECRET\n").unwrap();
+        std::fs::create_dir(dir.join(".devy")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), path(&dir)).unwrap();
+        let err = format!("{:#}", load(&dir).unwrap_err());
+        assert!(err.contains("not a regular file"), "{err}");
+        assert!(!err.contains("SENTINEL"), "{err}");
+    }
 
     fn record(chain: &str) -> FailureRecord {
         FailureRecord::new(

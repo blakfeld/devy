@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::{Detector, Draft, package_json, read, version_of};
+use super::{Detector, Draft, package_json, read, snippet, version_of};
 use crate::modules;
 
 /// `.nvmrc`, then `.node-version`, then `package.json` `engines.node`.
@@ -18,7 +18,8 @@ impl Detector for Node {
                     None => {
                         draft.add_dep("node", None);
                         draft.todo(format!(
-                            "`{file}` names `{pinned}`; set a numeric version for node"
+                            "`{file}` names `{}`; set a numeric version for node",
+                            snippet(pinned)
                         ));
                     }
                 }
@@ -59,7 +60,8 @@ impl Detector for ToolVersions {
                 draft.add_dep(name, version.and_then(version_of));
             } else {
                 draft.todo(format!(
-                    "`.tool-versions` lists `{tool}`, which devy has no module for"
+                    "`.tool-versions` lists `{}`, which devy has no module for",
+                    snippet(tool)
                 ));
             }
         }
