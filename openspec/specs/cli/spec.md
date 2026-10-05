@@ -4,13 +4,15 @@
 Defines the `devy` command-line surface: the built-in subcommands, how user-defined commands are dispatched, the output conventions, and how errors map to exit codes.
 
 ## Requirements
+
 ### Requirement: Built-in subcommands
-The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`, `stop`, `restart`, `down`, `status`, `check`, `doctor`, `hook`, `pr`, `export`, `logs`, `ask` and `allow`, plus the hidden `_commands` and `_services` subcommands used by shell completion, and `--help` SHALL list the visible ones.
+The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`, `stop`, `restart`, `down`, `status`, `check`, `doctor`, `hook`, `pr`, `export`, `logs` and `ask`, plus the hidden `_commands` and `_services` subcommands used by shell completion, and `--help` SHALL list the visible ones.
 
 #### Scenario: Help lists core subcommands
 - **WHEN** the user runs `devy --help`
 - **THEN** the process exits 0
-- **AND** the output lists `up`, `down`, `check`, `doctor`, `init`, `hook`, `status`, `logs`, `ask` and `allow`
+- **AND** the output lists `up`, `down`, `check`, `doctor`, `init`, `hook`, `status`, `logs` and `ask`
+- **AND** the output does not list `allow`
 
 #### Scenario: Hidden subcommand is not advertised
 - **WHEN** the user runs `devy --help`

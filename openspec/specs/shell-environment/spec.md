@@ -4,6 +4,7 @@
 Defines how devy persists project environment variables and PATH entries into a shadowenv file, trusts it, and reads it back, so the environment activates automatically in the user's shell.
 
 ## Requirements
+
 ### Requirement: Shadowenv file location and header
 devy SHALL write the project environment to `<project_root>/.shadowenv.d/500_devy.lisp`, creating the directory if needed, and the file MUST begin with `(provide "devy" "1.0.0")`.
 
@@ -37,13 +38,11 @@ When `devy up` merges environment variables, values from the `environment:` sect
 - **THEN** the shadowenv file contains `DATABASE_URL` set to `postgres://custom`
 
 ### Requirement: Shadowenv installation and trust
-When there is environment content to write and `shadowenv` is not found outside the project (as defined in filesystem-safety), `devy up` SHALL install `shadowenv` through the active package manager. After writing the file, devy SHALL run `shadowenv trust` in the project root only when both of these hold, and MUST fail if trusting fails:
-- the project is trusted under project-trust
-- `.shadowenv.d/` is a real directory, not tracked by git, that contains no entry shadowenv could evaluate other than `500_devy.lisp`: every other entry is a regular file whose name does not end in `.lisp` (compared case-insensitively), such as the `.gitignore` and `.trust-<fingerprint>` files `shadowenv trust` writes itself and the `.error-<n>-<shell pid>` files shadowenv's hook writes while the directory is untrusted
+When there is environment content to write and `shadowenv` is not found outside the project (as defined in filesystem-safety), `devy up` SHALL install `shadowenv` through the active package manager. After writing the file, devy SHALL run `shadowenv trust` in the project root, and MUST fail if trusting fails. It SHALL do so only when `.shadowenv.d/` is a real directory, not tracked by git, that contains no entry shadowenv could evaluate other than `500_devy.lisp`: every other entry is a regular file whose name does not end in `.lisp` (compared case-insensitively), such as the `.gitignore` and `.trust-<fingerprint>` files `shadowenv trust` writes itself and the `.error-<n>-<shell pid>` files shadowenv's hook writes while the directory is untrusted. No prompt or trust record of devy's own is involved.
 
-devy SHALL locate the binary outside the project, or in the verified project nix profile. devy SHALL check the directory before writing `500_devy.lisp`. When `.shadowenv.d/` contains a directory, a symlink or another `*.lisp` file, devy SHALL fail with `.shadowenv.d contains files devy did not write (<names>); devy removed shadowenv's trust for this project; review and remove them, then run devy allow and devy up`. Before failing on such an entry, or whenever the managed-path check of filesystem-safety refuses a managed directory (for example a `.shadowenv.d/` tracked by git), whichever command ran it (`devy up`, `devy exec`, or a service started under nix by `devy start`/`restart`), devy SHALL remove shadowenv's trust files (`.shadowenv.d/.trust-*`, only when `.shadowenv.d/` is a real directory) so a signature from an earlier `devy up` stops loading the directory.
+devy SHALL locate the binary outside the project, or in the verified project nix profile. devy SHALL check the directory before writing `500_devy.lisp`. When `.shadowenv.d/` contains a directory, a symlink or another `*.lisp` file, devy SHALL fail with `.shadowenv.d contains files devy did not write (<names>); devy removed shadowenv's trust for this project; review and remove them, then run devy up`. Before failing on such an entry, or whenever the managed-path check of filesystem-safety refuses a managed directory (for example a `.shadowenv.d/` tracked by git), whichever command ran it (`devy up`, `devy exec`, or a service started under nix by `devy start`/`restart`), devy SHALL remove shadowenv's trust files (`.shadowenv.d/.trust-*`, only when `.shadowenv.d/` is a real directory) so a signature from an earlier `devy up` stops loading the directory.
 
-The first line of every `500_devy.lisp` devy writes SHALL be the Lisp comment `; devy-env <nonce>`, where `<nonce>` is 32 lowercase hex digits drawn at random for each write, and the file SHALL end with a newline. Before putting the file in place, devy SHALL write an exact copy of it to `<nonce>.lisp` in the per-user directory `$XDG_STATE_HOME/devy/shadowenv/` (default `~/.local/state/devy/shadowenv/`; `%LOCALAPPDATA%\devy\shadowenv\` on Windows), created with mode 0700 beside the trust store and refused, like it, inside the project; failing to write the copy SHALL fail the write. After replacing the file, devy SHALL remove the copy the replaced file's first line named, but only when that copy is byte for byte the replaced file, so a `500_devy.lisp` copied from another project (or naming its nonce) never deletes that project's copy. `devy allow --revoke` SHALL likewise remove the copy of the project's `500_devy.lisp` (only when it is that file's copy), so the shell hook stops accepting the file until the next `devy up`. The shell hook (shell-integration) and the trust check (project-trust) treat a `500_devy.lisp` as devy's only when it is a regular file identical to the copy its first line names: repository content cannot write that copy, nor learn a nonce generated on the user's machine, so a pulled or replaced `500_devy.lisp` never matches.
+The first line of every `500_devy.lisp` devy writes SHALL be the Lisp comment `; devy-env <nonce>`, where `<nonce>` is 32 lowercase hex digits drawn at random for each write, and the file SHALL end with a newline. Before putting the file in place, devy SHALL write an exact copy of it to `<nonce>.lisp` in the per-user directory `$XDG_STATE_HOME/devy/shadowenv/` (default `~/.local/state/devy/shadowenv/`; `%LOCALAPPDATA%\devy\shadowenv\` on Windows), created with mode 0700 (as is `<state>/devy/`, both owned by the current user) and refused when it is inside the project, judged by where it is or, before it exists, where it would be created (its nearest existing ancestor, resolved), unless it is the platform default location (for example below a project at `$HOME`, a dotfiles repository) and git does not track it; the platform default SHALL be decided by the resolved path (`$HOME/.local/state/devy`, or `%LOCALAPPDATA%\devy`), not by whether `XDG_STATE_HOME` is set; failing to write the copy SHALL fail the write. After replacing the file, devy SHALL remove the copy the replaced file's first line named, but only when that copy is byte for byte the replaced file, so a `500_devy.lisp` copied from another project (or naming its nonce) never deletes that project's copy. The shell hook (shell-integration) treats a `500_devy.lisp` as devy's only when it is a regular file identical to the copy its first line names: repository content cannot write that copy, nor learn a nonce generated on the user's machine, so a pulled or replaced `500_devy.lisp` never matches.
 
 The errors SHALL be:
 - `Failed to configure environment variables: shadowenv trust failed` when `shadowenv trust` exits non-zero
@@ -53,6 +52,14 @@ The errors SHALL be:
 #### Scenario: Shadowenv installed via nix
 - **WHEN** shadowenv is not found outside the project and the backend is nix
 - **THEN** devy installs `shadowenv` into the project nix profile, verifies the profile, and runs `<project_root>/.devy/nix-profile/bin/shadowenv trust`
+
+#### Scenario: Shadowenv trusted without a prompt
+- **WHEN** `.shadowenv.d/` holds only devy's `500_devy.lisp` and shadowenv's own files, and the user runs `devy up` in a project devy has never seen
+- **THEN** devy runs `shadowenv trust` without asking the user anything
+
+#### Scenario: State directory inside the project
+- **WHEN** `XDG_STATE_HOME` names a directory inside the project that does not exist yet, and `devy up` writes the environment
+- **THEN** devy fails naming its state directory as inside the project, and nothing is created there
 
 #### Scenario: Committed lisp file
 - **WHEN** the repo commits `.shadowenv.d/000_evil.lisp` and the user runs `devy up`
@@ -89,11 +96,15 @@ When clearing, devy SHALL NOT install shadowenv if it is missing. It still runs 
 - **THEN** devy does not create `.shadowenv.d/500_devy.lisp`
 
 ### Requirement: Activation hint
-After writing a non-empty environment, `devy up` SHALL print `✓ Environment configured (<N> variable[s])`, where N counts only variables and not PATH entries, and an activation hint `eval "$(shadowenv hook <shell>)"`, where `<shell>` is the basename of `$SHELL` when it is sh, zsh, bash, fish, or powershell, and otherwise zsh (powershell on Windows).
+After writing a non-empty environment, `devy up` SHALL print `✓ Environment configured (<N> variable[s])`, where N counts only variables and not PATH entries, and an activation hint that loads devy's shell integration: `eval "$(devy hook <shell>)"` when `<shell>` is zsh or bash, and `devy hook fish | source` for fish, where `<shell>` is the basename of `$SHELL` when it is zsh, bash, or fish, and otherwise zsh.
 
 #### Scenario: Bash user
 - **WHEN** `$SHELL` is `/bin/bash`
-- **THEN** devy prints `eval "$(shadowenv hook bash)"`
+- **THEN** devy prints `eval "$(devy hook bash)"`
+
+#### Scenario: Fish user
+- **WHEN** `$SHELL` is `/usr/local/bin/fish`
+- **THEN** devy prints `devy hook fish | source`
 
 ### Requirement: Reading the environment back
 devy SHALL be able to parse the written file back into the set of variables (unescaping values) and PATH entries (in original order), returning nothing when the file does not exist; `devy check` and `devy status` use this to compare expected and written state.

@@ -4,6 +4,7 @@
 Defines `devy up`, which brings a project's environment up from `devy.yml`. It installs dependencies, writes the lock and the shell environment, starts services, and runs the up hooks in a fixed order.
 
 ## Requirements
+
 ### Requirement: Serialized execution
 `devy up` SHALL take an exclusive advisory lock on `<project root>/.devy-lock` (creating the file if needed) after loading `devy.yml` and selecting the package manager, and before printing the header or running any hook. A concurrent `devy up` in the same project SHALL block until the first one finishes. If the guard file cannot be opened or locked, the command SHALL fail with `Failed to open process guard file` or `Failed to acquire process lock (is another devy process running?)`.
 
@@ -14,20 +15,21 @@ Defines `devy up`, which brings a project's environment up from `devy.yml`. It i
 ### Requirement: Up phase ordering
 `devy up` SHALL run these steps in order:
 1. Print the header `devy up · <name>`, where `<name>` is the `name` from `devy.yml` with control characters stripped, or `project` when it is unset.
-2. Check project trust, prompting or failing as defined in project-trust.
-3. Check that devy-managed paths (`.devy/`, `.shadowenv.d/`, the virtualenv) are not symlinks or tracked by git, as defined in filesystem-safety.
-4. Run the `before_up` hook.
-5. Ensure the package manager is available.
-6. Load `devy.lock`. This happens even with `--update`.
-7. Validate each dependency's configuration.
-8. Pin versions from the lock (unless `--update`), resolve service ports, and fail on port conflicts.
-9. Install dependencies (phase 1).
-10. Write `devy.lock`, and update the trust record to match it.
-11. Write the shell environment.
-12. Report orphaned lock entries.
-13. Start services (phase 2).
-14. Run the `after_up` hook.
-15. Print `✓ <name> is ready`.
+2. Check that devy-managed paths (`.devy/`, `.shadowenv.d/`, the virtualenv) are not symlinks or tracked by git, as defined in filesystem-safety.
+3. Run the `before_up` hook.
+4. Ensure the package manager is available.
+5. Load `devy.lock`. This happens even with `--update`.
+6. Validate each dependency's configuration.
+7. Pin versions from the lock (unless `--update`), resolve service ports, and fail on port conflicts.
+8. Install dependencies (phase 1).
+9. Write `devy.lock`.
+10. Write the shell environment.
+11. Report orphaned lock entries.
+12. Start services (phase 2).
+13. Run the `after_up` hook.
+14. Print `✓ <name> is ready`.
+
+`devy up` SHALL NOT ask the user to allow the project or check any trust record: it runs the project's hooks and installs as `devy.yml` declares them.
 
 A failure in any step SHALL abort the remaining steps. Each hook run SHALL be preceded by a `Hooks` header.
 
@@ -40,8 +42,12 @@ A failure in any step SHALL abort the remaining steps. Each hook run SHALL be pr
 - **THEN** the final line is `✓ <name> is ready`
 
 #### Scenario: Untrusted project stops before hooks
-- **WHEN** the project is not trusted and the user declines the prompt
-- **THEN** the `before_up` hook does not run and nothing is installed
+- **WHEN** a cloned repository commits `.shadowenv.d/` and the user runs `devy up`
+- **THEN** devy fails naming `.shadowenv.d` as tracked by git, the `before_up` hook does not run, and nothing is installed
+
+#### Scenario: No trust prompt
+- **WHEN** the user runs `devy up` for the first time in a freshly cloned project, with or without a terminal
+- **THEN** devy prints no allow prompt and runs the `before_up` hook
 
 ### Requirement: Lock write
 `devy up` SHALL build the lock from every dependency after phase 1, before the environment is written and before any service starts. It SHALL do this even when there are no dependencies, so the first `devy up` in a project with none creates a `devy.lock` with an empty `dependencies` map. When the new lock equals the existing one, devy SHALL leave the file untouched. Otherwise it SHALL write it and print `✓ Lock file written to devy.lock`.
@@ -112,7 +118,7 @@ For each dependency, in declaration order, `devy up` SHALL do the following. In 
 - **THEN** devy pulls the image and does not ask the package manager to install `redis`
 
 ### Requirement: Environment composition
-`devy up` SHALL build the project environment from three sources: the variables and PATH entries each module contributes, `<NAME>_HOST`/`<NAME>_PORT` variables for each service, and the `environment` map in `devy.yml`. A user-defined `environment` value SHALL override a module-provided variable with the same name. PATH entries contributed by the package manager SHALL come before module PATH entries. The result SHALL be written through the shell environment manager. When there is anything to write and shadowenv is not available, devy SHALL first install it through the package manager, printing `→ Installing shadowenv` and failing with `Failed to install shadowenv` if that fails. After writing, devy SHALL print `✓ Environment configured (<N> variables)`, where PATH entries are not counted, followed by the hint `Activate with: eval "$(shadowenv hook <shell>)"`. `<shell>` is the basename of `$SHELL` if it is sh, zsh, bash, fish or powershell, and otherwise `zsh` (`powershell` on Windows).
+`devy up` SHALL build the project environment from three sources: the variables and PATH entries each module contributes, `<NAME>_HOST`/`<NAME>_PORT` variables for each service, and the `environment` map in `devy.yml`. A user-defined `environment` value SHALL override a module-provided variable with the same name. PATH entries contributed by the package manager SHALL come before module PATH entries. The result SHALL be written through the shell environment manager. When there is anything to write and shadowenv is not available, devy SHALL first install it through the package manager, printing `→ Installing shadowenv` and failing with `Failed to install shadowenv` if that fails. After writing, devy SHALL print `✓ Environment configured (<N> variables)`, where PATH entries are not counted, followed by the hint `Activate with: <command>`, which loads devy's shell integration: `eval "$(devy hook <shell>)"` when `<shell>` is zsh or bash, and `devy hook fish | source` for fish. `<shell>` is the basename of `$SHELL` if it is zsh, bash or fish, and otherwise `zsh`.
 
 #### Scenario: User value wins
 - **WHEN** the postgresql module sets `DATABASE_URL` and `devy.yml` `environment` also sets `DATABASE_URL`

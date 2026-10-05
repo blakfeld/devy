@@ -4,6 +4,7 @@
 Ensures that files and directories committed to a repository, or planted in shared temporary locations by other local users, cannot redirect devy's writes, executables or sockets outside the places devy intends.
 
 ## Requirements
+
 ### Requirement: Writes do not follow symlinks
 Every file devy creates or replaces inside the project, under `.devy/`, under `.shadowenv.d/`, or in a temporary directory SHALL be written by creating a new temporary file in the destination directory with exclusive creation and without following symlinks, then renaming it over the destination. If the destination path itself, or any directory devy creates on the way to it, is a symlink, devy SHALL fail with `refusing to write <path>: it is a symbolic link` and leave the link target untouched. This covers at least:
 - `devy.lock` and `devy.yml`
@@ -30,7 +31,7 @@ Before writing into or executing from `.devy/`, `.shadowenv.d/`, the Python virt
 - **THEN** `devy up` fails naming `.venv` as tracked by git and writes no shadowenv file
 
 #### Scenario: Committed venv tool under devy exec
-- **WHEN** an allowed repo commits `.venv/bin/sudo`, declares `python`, and the user runs `devy exec sudo`
+- **WHEN** a repo commits `.venv/bin/sudo`, declares `python`, and the user runs `devy exec sudo`
 - **THEN** devy fails naming `.venv` as tracked by git and runs nothing
 
 #### Scenario: Fake nix profile

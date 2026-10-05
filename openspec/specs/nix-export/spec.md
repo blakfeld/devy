@@ -47,30 +47,28 @@ The system SHALL include one `pkgs.<attr>` entry per dependency. The attribute c
 - **THEN** the export contains no entry for it and no warning is printed
 
 ### Requirement: Environment variables exported as attributes
-`devy export` SHALL NOT require project trust, but its output MUST NOT let `environment` entries of an untrusted project run code when the exported shell starts (`mkShell` treats some names, such as `preHook` or `shellHook`, as code, and others, such as `BASH_ENV`, change how the shell runs). Entries SHALL be emitted in key order, and whether the project is trusted SHALL be decided by the trust store with the current `devy.yml` and `devy.lock`, as defined in project-trust:
-- When the project is trusted, the system SHALL emit each `environment:` entry as an attribute of the mkShell, except a key named `packages` or `shellHook` (attributes the export writes itself), which SHALL be left out as a comment with a warning.
-- When the project is not trusted, the system SHALL write every entry as a `#` comment line (`# <key> = "<value>";`), preceded by a comment saying the project is not allowed, and SHALL print one warning telling the user to review `devy.yml`, run `devy allow` and export again. In a commented-out value, newlines and carriage returns MUST be written as `\n` and `\r` escapes and other control characters dropped, so a value cannot end the comment.
+The system SHALL emit each `environment:` entry as an attribute of the mkShell, in key order, except a key named `packages` or `shellHook` (attributes the export writes itself), which SHALL be left out as a comment with a warning. `devy export` SHALL NOT check any trust record or comment entries out: like `devy up`, the exported shell applies the project's environment (`mkShell` treats some names, such as `preHook`, as code, and others, such as `BASH_ENV`, change how the shell runs), and reviewing `devy.yml` is the user's decision.
 
 Keys that are not valid bare Nix identifiers MUST be quoted. Values MUST be emitted as Nix double-quoted strings with `\`, `"` and `${` escaped. Quoted keys use the same escapes.
 
 #### Scenario: Value containing interpolation syntax
-- **WHEN** the project is trusted and `environment` has `GREETING: 'hi ${USER}'`
+- **WHEN** `environment` has `GREETING: 'hi ${USER}'`
 - **THEN** the export contains `GREETING = "hi \${USER}";`
 
 #### Scenario: Key needing quotes
-- **WHEN** the project is trusted and `environment` has the key `rec`, a Nix keyword
+- **WHEN** `environment` has the key `rec`, a Nix keyword
 - **THEN** the attribute name is emitted quoted as `"rec"`
 
 #### Scenario: Untrusted project
-- **WHEN** the project was never allowed and `environment` has `preHook: "touch /tmp/p"` and `FOO: bar`
-- **THEN** the export contains `# preHook = "touch /tmp/p";` and `# FOO = "bar";` and no `preHook` or `FOO` attribute, and devy warns to run `devy allow` and export again
+- **WHEN** a freshly cloned project's `environment` has `preHook: "touch /tmp/p"` and `FOO: bar`
+- **THEN** the export contains the attributes `preHook = "touch /tmp/p";` and `FOO = "bar";`, nothing is commented out, and no warning about allowing the project is printed
 
 #### Scenario: Value that would end the comment
-- **WHEN** the project is not trusted and an entry's value contains a newline followed by `shellHook = "touch /tmp/q";`
-- **THEN** the whole entry stays on one comment line, with the newline written as `\n`
+- **WHEN** an entry's value contains a newline followed by `shellHook = "touch /tmp/q";`
+- **THEN** the quotes are escaped, so the whole value stays inside its Nix string and adds no `shellHook` attribute
 
 #### Scenario: Trusted project
-- **WHEN** the project is allowed with its current files and `environment` has `BASH_ENV: /tmp/env.sh`
+- **WHEN** `environment` has `BASH_ENV: /tmp/env.sh`
 - **THEN** the export contains `BASH_ENV = "/tmp/env.sh";` and no warning is printed
 
 ### Requirement: Flake structure and shell hook

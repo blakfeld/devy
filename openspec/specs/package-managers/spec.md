@@ -123,7 +123,7 @@ The Homebrew backend SHALL install a versioned formula `<name>@<version>` when t
 - **THEN** devy installs the formula `node`, not `node@16`, without a warning
 
 ### Requirement: Homebrew taps
-When a dependency sets `tap`, the Homebrew backend SHALL validate it as `org/repo` (exactly one `/`, each part non-empty, starting with a letter or digit, limited to letters, digits, `-`, `_`, `.`, and not equal to `.` or `..`) and run `brew tap -- <tap>` before installing. Taps are listed in the project-trust summary. A dependency name can never select a tap, because dependency names cannot contain `/`.
+When a dependency sets `tap`, the Homebrew backend SHALL validate it as `org/repo` (exactly one `/`, each part non-empty, starting with a letter or digit, limited to letters, digits, `-`, `_`, `.`, and not equal to `.` or `..`) and run `brew tap -- <tap>` before installing. Taps are listed in the executable entry listing (project-config). A dependency name can never select a tap, because dependency names cannot contain `/`.
 
 #### Scenario: Invalid tap
 - **WHEN** a dependency sets `tap: "evil; rm -rf /"`
