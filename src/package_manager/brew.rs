@@ -327,8 +327,8 @@ impl PackageManager for Homebrew {
 /// non-empty, starting with an ASCII letter or digit, limited to ASCII letters, digits,
 /// `-`, `_` and `.`, and not `.` or `..`. This rejects URLs, extra path components,
 /// option-like values and shell metacharacters. It does not restrict *which* GitHub
-/// repository is tapped — any well-formed `org/repo` is accepted, which is why taps are
-/// listed in the executable-entry summary.
+/// repository is tapped: any well-formed `org/repo` is accepted. Taps appear in the
+/// executable entry listing (AI init/doctor review).
 pub(crate) fn validate_tap(tap: &str) -> Result<()> {
     let parts: Vec<&str> = tap.split('/').collect();
     if parts.len() != 2 {

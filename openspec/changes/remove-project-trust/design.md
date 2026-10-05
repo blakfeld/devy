@@ -16,3 +16,4 @@
 
 - A cloned repository's hooks now run on the first `devy up` without a prompt. Accepted by the user: equivalent to running the repository's scripts.
 - `devy down` runs its `before_down` hook without the managed-path check that `up` and `exec` run first; that matches pre-hardening behavior.
+- A `devy.yml` that no longer loads (a pull that breaks it, or one that removes it) leaves shadowenv's trust and the last `500_devy.lisp` devy wrote in place, so that environment stays applied in the shell until `devy up` succeeds again. The hook's guard still compares `.shadowenv.d` with devy's copy on every prompt, so lisp a pull adds there, or a `500_devy.lisp` it replaces, is still refused.

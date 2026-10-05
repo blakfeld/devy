@@ -547,9 +547,9 @@ pub trait Module: Sync {
         None
     }
 
-    /// How `install` really gets the dependency onto the machine, for the executable-entry summary,
-    /// given `backend`, the package manager as the summary names it (`nix`, `brew`,
-    /// `sudo apt-get`, `winget`). Unlike [`Module::source`] (a stable lock key), it shows
+    /// How `install` really gets the dependency onto the machine, for the executable
+    /// entry listing (AI init/doctor review), given `backend`, the package manager as
+    /// that listing names it (`nix`, `brew`, `sudo apt-get`, `winget`). Unlike [`Module::source`] (a stable lock key), it shows
     /// the route through the package manager, including `sudo`. The default: the module's
     /// own installer when it has one (rustup and the bun and deno installers always
     /// bypass the package manager), otherwise `backend`.
@@ -773,8 +773,9 @@ pub trait Module: Sync {
 
     /// The commands `post_setup` runs because of files in the project (package-manager
     /// installs that run lifecycle scripts, repository-provided scripts, build scripts),
-    /// each as `<command> (<what drives it>)`, for the executable-entry summary. Empty when this
-    /// module runs none for the project at `project_root`.
+    /// each as `<command> (<what drives it>)`, for the executable entry listing (AI
+    /// init/doctor review). Empty when this module runs none for the project at
+    /// `project_root`.
     fn setup_steps(&self, _dep: &Dependency, _project_root: &Path) -> Vec<String> {
         Vec::new()
     }

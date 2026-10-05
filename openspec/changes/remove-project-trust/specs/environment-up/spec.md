@@ -38,3 +38,18 @@ A failure in any step SHALL abort the remaining steps. Each hook run SHALL be pr
 #### Scenario: No trust prompt
 - **WHEN** the user runs `devy up` for the first time in a freshly cloned project, with or without a terminal
 - **THEN** devy prints no allow prompt and runs the `before_up` hook
+
+### Requirement: Environment composition
+`devy up` SHALL build the project environment from three sources: the variables and PATH entries each module contributes, `<NAME>_HOST`/`<NAME>_PORT` variables for each service, and the `environment` map in `devy.yml`. A user-defined `environment` value SHALL override a module-provided variable with the same name. PATH entries contributed by the package manager SHALL come before module PATH entries. The result SHALL be written through the shell environment manager. When there is anything to write and shadowenv is not available, devy SHALL first install it through the package manager, printing `→ Installing shadowenv` and failing with `Failed to install shadowenv` if that fails. After writing, devy SHALL print `✓ Environment configured (<N> variables)`, where PATH entries are not counted, followed by the hint `Activate with: <command>`, which loads devy's shell integration: `eval "$(devy hook <shell>)"` when `<shell>` is zsh or bash, and `devy hook fish | source` for fish. `<shell>` is the basename of `$SHELL` if it is zsh, bash or fish, and otherwise `zsh`.
+
+#### Scenario: User value wins
+- **WHEN** the postgresql module sets `DATABASE_URL` and `devy.yml` `environment` also sets `DATABASE_URL`
+- **THEN** the written environment uses the value from `devy.yml`
+
+#### Scenario: Environment cleared when nothing remains
+- **WHEN** a backend that contributes no PATH entries (brew, apt or WinGet) is in use, a previous run wrote environment variables, and the dependencies and `environment` that produced them have since been removed
+- **THEN** `devy up` clears the devy environment file and prints `✓ Environment configuration cleared`
+
+#### Scenario: Nix always writes the environment
+- **WHEN** nix is the package manager and the project has no dependencies and no `environment`
+- **THEN** `devy up` still writes the environment file with the `.devy/nix-profile/bin` PATH entry, prints `✓ Environment configured (0 variables)`, and never clears the file

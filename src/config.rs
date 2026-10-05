@@ -421,8 +421,8 @@ impl DevyConfig {
                 );
             }
         }
-        // Every loaded config normalizes, so what reads its dependencies (the trust
-        // summary among them) never sees an error after `load`.
+        // Every loaded config normalizes, so what reads its dependencies
+        // (`config_diff::summary` among them) never sees an error after `load`.
         self.normalized_dependencies()?;
         Ok(())
     }

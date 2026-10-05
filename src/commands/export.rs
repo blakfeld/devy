@@ -613,11 +613,66 @@ mod tests {
         );
     }
 
+    /// `nix` with the contents of every string literal removed, leaving the code a Nix
+    /// parser would evaluate: `"…"` strings (with `\` escapes) and `''…''` indented
+    /// strings (with the `'''`, `''$` and `''\` escapes). Antiquotations are not
+    /// followed; the generator escapes every `${` in a value.
+    fn nix_code_outside_strings(nix: &str) -> String {
+        let mut code = String::new();
+        let mut chars = nix.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => {
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '\\' => {
+                                chars.next();
+                            }
+                            '"' => break,
+                            _ => {}
+                        }
+                    }
+                    code.push_str("\"\"");
+                }
+                '\'' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c != '\'' || chars.peek() != Some(&'\'') {
+                            continue;
+                        }
+                        chars.next();
+                        match chars.peek() {
+                            Some('\'' | '$') => {
+                                chars.next();
+                            }
+                            Some('\\') => {
+                                chars.next();
+                                chars.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                    code.push_str("''''");
+                }
+                _ => code.push(c),
+            }
+        }
+        code
+    }
+
+    #[test]
+    fn nix_code_outside_strings_drops_string_contents() {
+        assert_eq!(
+            nix_code_outside_strings(r#"a = "x\" b = y"; c = ''p''' '''$ ''\n q''; d"#),
+            r#"a = ""; c = ''''; d"#
+        );
+    }
+
     const HOSTILE_ENV: &str = concat!(
         "environment:\n",
         "  preHook: \"touch /tmp/p\"\n",
         "  BASH_ENV: \"/tmp/evil.sh\"\n",
-        "  NOTE: \"line one\\n} // { shellHook = \\\"touch /tmp/q\\\"; }\\r\\u0007\"\n",
+        "  NOTE: \"line one\\n\\\"; shellHook = \\\"touch /tmp/q\\\"; x = \\\"\\r\\u0007\"\n",
         "  FOO: bar\n",
     );
 
@@ -636,7 +691,16 @@ mod tests {
             assert!(out.contains("FOO = \"bar\";"), "{out}");
             // The quote is escaped, so the value cannot close the string.
             assert!(out.contains(r#"shellHook = \"touch /tmp/q\";"#), "{out}");
-            assert_eq!(out.matches("\nshellHook =").count(), 0, "{out}");
+            // Only devy's own shellHook is live Nix code; the injected one stays inside
+            // NOTE's string. (Values keep literal newlines, so a line-based count cannot
+            // tell the two apart.)
+            assert_eq!(
+                nix_code_outside_strings(&out)
+                    .matches("shellHook =")
+                    .count(),
+                1,
+                "{out}"
+            );
         }
     }
 

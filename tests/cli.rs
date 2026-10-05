@@ -2292,7 +2292,7 @@ fn services_json_without_services_is_empty() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// no project trust gate: devy up runs the project's hooks, shadowenv trust
+// devy up runs project hooks without asking; shadowenv trust of .shadowenv.d
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// `devy up` runs a project's hooks without asking: a repository is vetted by the user,
@@ -2300,13 +2300,13 @@ fn services_json_without_services_is_empty() {
 #[cfg(unix)]
 #[test]
 fn up_runs_the_hook_without_asking() {
+    // The hook leaves its marker and then fails, so `up` stops before installing anything.
     let proj = TempProject::with_yaml(
-        "name: t\nhooks:\n  before_up: \"touch marker\"\ndependencies:\n  - redis\n",
+        "name: t\nhooks:\n  before_up: \"touch marker; exit 1\"\ndependencies:\n  - redis\n",
     );
-    // The hook runs before devy looks for a package manager, so it runs here whether or
-    // not one is installed.
     let out = proj.run(&["up"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(!stderr.contains("not allowed"), "{stderr}");
     assert!(!stderr.contains("devy allow"), "{stderr}");
     assert!(proj.file("marker").exists(), "{stderr}");
@@ -2562,8 +2562,8 @@ fn starship_stub(var: &str) -> String {
 #[cfg(unix)]
 type Plant<'a> = (&'a str, Box<dyn Fn()>);
 
-/// The shell hook's guard, run before shadowenv's hook on every prompt: after a trusted
-/// `devy up`, lisp a pull adds to `.shadowenv.d` (or a replaced `500_devy.lisp`) loses
+/// The shell hook's guard, run before shadowenv's hook on every prompt: after `devy up`
+/// has run `shadowenv trust`, lisp a pull adds to `.shadowenv.d` (or a replaced `500_devy.lisp`) loses
 /// shadowenv's trust before shadowenv evaluates it, while devy's own setup keeps it.
 #[cfg(unix)]
 #[test]

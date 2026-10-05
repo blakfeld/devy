@@ -539,6 +539,8 @@ devy export --format=shell     # Writes shell.nix
 devy export --format=flake     # Writes flake.nix
 ```
 
+Each `environment` entry in `devy.yml` becomes an attribute of `mkShell`, and some names, such as `preHook` or `BASH_ENV`, run code when the shell starts, so review `devy.yml` before exporting a project you didn't write.
+
 ### `devy pr`
 
 Opens a GitHub pull request for the current branch in your browser.

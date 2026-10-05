@@ -359,21 +359,8 @@ pub(crate) fn up_tracked(
                 if count == 1 { "" } else { "s" }
             ));
 
-            let shell = std::env::var("SHELL")
-                .ok()
-                .and_then(|s| s.rsplit('/').next().map(String::from))
-                .filter(|s| matches!(s.as_str(), "sh" | "zsh" | "bash" | "fish" | "powershell"))
-                .unwrap_or_else(|| {
-                    if cfg!(target_os = "windows") {
-                        "powershell".into()
-                    } else {
-                        "zsh".into()
-                    }
-                });
-            output::info_code(
-                "Activate with:",
-                &format!("eval \"$(shadowenv hook {shell})\""),
-            );
+            let shell = std::env::var("SHELL").ok();
+            output::info_code("Activate with:", &activation_hint(shell.as_deref()));
         } else {
             output::success("Environment configuration cleared");
         }
@@ -555,6 +542,21 @@ pub(crate) fn start_service_if_needed(runner: &dyn ServiceRunner, dep: &Dependen
     Ok(())
 }
 
+/// The command that loads devy's shell integration (`devy hook`), which sets up shadowenv
+/// behind devy's guard, for the shell named by `$SHELL` (`shell`). `devy hook` supports
+/// zsh, bash and fish; any other or unknown shell gets the zsh form.
+fn activation_hint(shell: Option<&str>) -> String {
+    let bin = env!("CARGO_PKG_NAME");
+    let name = shell
+        .and_then(|s| s.rsplit(['/', '\\']).next())
+        .unwrap_or("");
+    match name {
+        "fish" => format!("{bin} hook fish | source"),
+        "bash" => format!("eval \"$({bin} hook bash)\""),
+        _ => format!("eval \"$({bin} hook zsh)\""),
+    }
+}
+
 /// `value` if it passes `valid`, else `None` with a warning. Resolved versions and digests
 /// are scraped from tool output, and `LockFile::load` rejects an entry that fails these
 /// rules, so recording one would leave a lock that every later command refuses to read.
@@ -643,6 +645,29 @@ pub(crate) fn write_lock(deps: &[Dependency], runners: &Runners, path: &Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_hint_uses_devy_hook_for_the_shell() {
+        assert_eq!(
+            activation_hint(Some("/bin/bash")),
+            "eval \"$(devy hook bash)\""
+        );
+        assert_eq!(
+            activation_hint(Some("/usr/local/bin/zsh")),
+            "eval \"$(devy hook zsh)\""
+        );
+        assert_eq!(
+            activation_hint(Some("/opt/homebrew/bin/fish")),
+            "devy hook fish | source"
+        );
+        for other in [None, Some("/bin/sh"), Some("powershell"), Some("")] {
+            assert_eq!(
+                activation_hint(other),
+                "eval \"$(devy hook zsh)\"",
+                "{other:?}"
+            );
+        }
+    }
 
     #[test]
     fn lockable_drops_values_the_lock_loader_would_reject() {

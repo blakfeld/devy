@@ -42,3 +42,14 @@ The errors SHALL be:
 #### Scenario: Managed-path refusal outside up
 - **WHEN** an earlier `devy up` trusted `.shadowenv.d`, a pull makes `.devy` a symlink, and the user runs `devy exec make`
 - **THEN** devy refuses, and `.shadowenv.d/.trust-*` is removed
+
+### Requirement: Activation hint
+After writing a non-empty environment, `devy up` SHALL print `✓ Environment configured (<N> variable[s])`, where N counts only variables and not PATH entries, and an activation hint that loads devy's shell integration: `eval "$(devy hook <shell>)"` when `<shell>` is zsh or bash, and `devy hook fish | source` for fish, where `<shell>` is the basename of `$SHELL` when it is zsh, bash, or fish, and otherwise zsh.
+
+#### Scenario: Bash user
+- **WHEN** `$SHELL` is `/bin/bash`
+- **THEN** devy prints `eval "$(devy hook bash)"`
+
+#### Scenario: Fish user
+- **WHEN** `$SHELL` is `/usr/local/bin/fish`
+- **THEN** devy prints `devy hook fish | source`

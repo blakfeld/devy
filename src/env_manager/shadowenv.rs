@@ -157,8 +157,11 @@ fn remove_copy_of(content: &[u8], copy_dir: &Path) -> bool {
 
 /// Whether the project at `project_root` has a `.shadowenv.d/500_devy.lisp` that is not
 /// the one devy last wrote: not a regular file, or not byte for byte the copy in
-/// `copy_dir` that its first line names. An absent file is not foreign. The shell hook's
-/// guard draws the same line; this is its reference in the unit tests.
+/// `copy_dir` that its first line names. An absent file is not foreign.
+///
+/// Test-only: devy itself never calls this. It is the Rust reference for the check the
+/// shell hook's guard (`devy hook`, `_devy_shadowenv_check`) runs in shell, so the unit
+/// tests pin down the rule the guard must match.
 #[cfg(test)]
 fn env_file_foreign(project_root: &Path, copy_dir: &Path) -> bool {
     let path = project_root.join(ENV_FILE);
@@ -316,15 +319,10 @@ fn refuse_foreign_entries(shadowenv_dir: &Path) -> Result<()> {
     )
 }
 
-/// [`remove_trust`] for the project at `root`, warning on failure. Returns whether any
-/// signature was removed.
-pub fn untrust(root: &Path) -> bool {
-    match remove_trust(root) {
-        Ok(removed) => removed > 0,
-        Err(e) => {
-            crate::output::warn(&format!("could not remove shadowenv's trust: {e:#}"));
-            false
-        }
+/// [`remove_trust`] for the project at `root`, warning on failure.
+pub(crate) fn untrust(root: &Path) {
+    if let Err(e) = remove_trust(root) {
+        crate::output::warn(&format!("could not remove shadowenv's trust: {e:#}"));
     }
 }
 
