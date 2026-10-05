@@ -1,6 +1,5 @@
 # Hostile fixture: VALID config (every name passes validation) that is still hostile.
-# The test swaps it in for tree/devy.yml so that `up` reaches the trust gate and the
-# managed-path checks.
+# The test swaps it in for tree/devy.yml so that `up` reaches the managed-path checks.
 name: "hostile\e]52;c;aG9zdGlsZQ==\a"
 hooks:
   before_up: "touch '@OUT@/markers/before_up'; exit 1"

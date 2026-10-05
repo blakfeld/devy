@@ -143,7 +143,7 @@ impl Module for PythonModule {
     }
 
     fn setup_steps(&self, dep: &Dependency, project_root: &Path) -> Vec<String> {
-        // An `install_cmd` replaces the pip step; the trust summary lists it with the
+        // An `install_cmd` replaces the pip step; the executable-entry summary lists it with the
         // other install commands.
         if dep
             .extra

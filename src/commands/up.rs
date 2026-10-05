@@ -61,8 +61,6 @@ pub(crate) fn record_outcome(
             }
             Ok(())
         }
-        // Not a failure to diagnose, and nothing may be written for an untrusted project.
-        Err(err) if err.downcast_ref::<crate::trust::NotAllowed>().is_some() => Err(err),
         Err(err) => {
             let record = failure_record::FailureRecord::for_project(project_root, &err, progress);
             match failure_record::write(project_root, &record) {
@@ -89,15 +87,8 @@ fn run_located(
     progress: &mut UpProgress,
 ) -> Result<()> {
     progress.enter("load config");
-    // A devy.yml that no longer loads cannot be trusted: shadowenv's trust goes too.
-    let config = DevyConfig::load(config_path).inspect_err(|_| {
-        crate::trust::untrust_shadowenv(project_root);
-    })?;
+    let config = DevyConfig::load(config_path)?;
     output::header(&format!("devy up · {}", project_name(&config)));
-
-    // Before anything runs, installs or writes (including the process guard below).
-    progress.enter("check trust");
-    crate::trust::require(&config, project_root, crate::trust::Gate::Up)?;
 
     progress.enter("detect package manager");
     let pm = package_manager::detect(&config, project_root)?;
@@ -122,12 +113,7 @@ fn run_located(
         pm.as_ref(),
         ContainerRuntime::system(config.container_cli),
         &Shadowenv,
-        UpOptions {
-            update,
-            bootstrap,
-            // The gate above passed: the project was trusted, or allowed just now.
-            trusted: true,
-        },
+        UpOptions { update, bootstrap },
         project_root,
         &project_root.join(crate::lock::PATH),
         progress,
@@ -138,9 +124,6 @@ fn run_located(
 pub(crate) struct UpOptions {
     pub update: bool,
     pub bootstrap: bool,
-    /// The project passed the trust gate at command start: devy keeps the trust record
-    /// current for its own lock write and runs `shadowenv trust`.
-    pub trusted: bool,
 }
 
 /// The project name shown in headers: `name` from devy.yml, or `project`.
@@ -222,7 +205,7 @@ pub(crate) fn up_tracked(
 ) -> Result<()> {
     progress.backend = Some(pm.name().to_string());
     let project_name = project_name(config);
-    // The header and the trust check come first, in `run_located`.
+    // The header comes first, in `run_located`.
 
     // Before anything runs or writes: the directories devy writes into and runs from must
     // not be symlinks, foreign-owned or committed to the repository.
@@ -331,10 +314,7 @@ pub(crate) fn up_tracked(
     // Doing this before service start means a service failure doesn't leave the
     // lock stale for the already-installed packages.
     progress.enter("write lock");
-    // devy's own lock write must not make the next run ask for trust again.
-    if let Some(written) = write_lock(&effective_deps, &runners, lock_path)? {
-        crate::trust::refresh_lock(project_root, &written, opts.trusted);
-    }
+    write_lock(&effective_deps, &runners, lock_path)?;
 
     progress.enter("configure environment");
 
@@ -369,12 +349,7 @@ pub(crate) fn up_tracked(
 
         output::step(&format!("Writing {} config", env_mgr.name()));
         env_mgr
-            .setup(
-                project_root,
-                &merged_env,
-                &module_path_prepends,
-                opts.trusted,
-            )
+            .setup(project_root, &merged_env, &module_path_prepends)
             .context("Failed to configure environment variables")?;
 
         if has_content {
@@ -602,12 +577,8 @@ fn lockable(
 
 /// Records each dependency's resolved version, source and port. A docker-managed service
 /// records `source: docker`, its image tag as the version and the pulled image's digest.
-/// Returns the bytes written, or `None` when the lock was already up to date.
-pub(crate) fn write_lock(
-    deps: &[Dependency],
-    runners: &Runners,
-    path: &Path,
-) -> Result<Option<Vec<u8>>> {
+/// Leaves the file alone when the lock is already up to date.
+pub(crate) fn write_lock(deps: &[Dependency], runners: &Runners, path: &Path) -> Result<()> {
     let pm = runners.package.pm();
     let mut locked = BTreeMap::new();
     for dep in deps {
@@ -661,12 +632,12 @@ pub(crate) fn write_lock(
     if let Ok(Some(existing)) = LockFile::load(path)
         && existing == new_lock
     {
-        return Ok(None);
+        return Ok(());
     }
 
-    let written = new_lock.write(path).context("Failed to write devy.lock")?;
+    new_lock.write(path).context("Failed to write devy.lock")?;
     output::success(&format!("Lock file written to {}", crate::lock::PATH));
-    Ok(Some(written))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1194,7 +1165,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1219,7 +1189,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1248,7 +1217,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1278,7 +1246,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1312,7 +1279,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1346,7 +1312,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1378,7 +1343,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1434,7 +1398,6 @@ mod tests {
                 UpOptions {
                     update: true,
                     bootstrap: false,
-                    trusted: false,
                 },
                 &dir,
                 &lock,
@@ -1473,7 +1436,6 @@ mod tests {
                 UpOptions {
                     update: false,
                     bootstrap: false,
-                    trusted: false,
                 },
                 &dir,
                 &lock,
@@ -1540,7 +1502,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1570,7 +1531,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1598,7 +1558,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1621,7 +1580,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1679,7 +1637,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1801,7 +1758,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1831,7 +1787,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1864,7 +1819,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1906,7 +1860,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock_path,
@@ -1956,7 +1909,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -1997,7 +1949,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -2037,7 +1988,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -2147,7 +2097,6 @@ mod tests {
                 UpOptions {
                     update: false,
                     bootstrap: false,
-                    trusted: false,
                 },
                 &dir,
                 &lock,
@@ -2234,7 +2183,6 @@ mod tests {
                 UpOptions {
                     update: false,
                     bootstrap: false,
-                    trusted: false,
                 },
                 &dir,
                 &lock,
@@ -2290,7 +2238,6 @@ mod tests {
             UpOptions {
                 update: false,
                 bootstrap: false,
-                trusted: false,
             },
             &dir,
             &lock,
@@ -2371,7 +2318,6 @@ mod tests {
                 UpOptions {
                     update,
                     bootstrap: false,
-                    trusted: false,
                 },
                 &dir,
                 &lock_path,

@@ -119,12 +119,6 @@ enum Commands {
         #[arg(long, conflicts_with_all = ["yes", "no_ai"])]
         show_context: bool,
     },
-    /// Review what this project runs and allow devy to run it (required before up, down, start, restart and exec)
-    Allow {
-        /// Remove this project's trust record instead
-        #[arg(long)]
-        revoke: bool,
-    },
     /// Print a shell integration snippet to eval in your rc file
     Hook {
         /// Shell to generate the snippet for (zsh, bash, fish)
@@ -270,7 +264,6 @@ impl Cli {
                 no_ai,
                 show_context,
             } => commands::doctor::run(*yes, *no_ai, *show_context),
-            Commands::Allow { revoke } => commands::allow::run(*revoke),
             Commands::Pr => commands::pr::run(),
             Commands::Export { format } => commands::export::run(*format),
             Commands::Hook { shell } => commands::hook::run(shell),

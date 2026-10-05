@@ -43,9 +43,6 @@ pub enum AiMode {
 pub struct Options {
     pub yes: bool,
     pub ai: AiMode,
-    /// The project as trusted when doctor started (`None` when it was not), so an
-    /// accepted fix without executable changes keeps it trusted.
-    pub trusted_at_start: Option<crate::trust::TrustedAtStart>,
 }
 
 /// Recent log output for a service.
@@ -131,11 +128,7 @@ pub fn run(yes: bool, no_ai: bool, show_context: bool) -> Result<()> {
     run_with(
         &config_path,
         &project_root,
-        Options {
-            yes,
-            ai,
-            trusted_at_start: crate::trust::TrustedAtStart::check(&config_path, &project_root),
-        },
+        Options { yes, ai },
         Deps {
             detect: &|config, root| package_manager::detect(config, root),
             env_mgr: &Shadowenv,
@@ -347,7 +340,6 @@ pub(crate) fn run_with(
         },
         deps.input,
         deps.is_tty,
-        opts.trusted_at_start.as_ref(),
     )
 }
 
@@ -819,7 +811,6 @@ pub(crate) fn offer_fix(
     offer: Offer,
     input: &mut dyn BufRead,
     is_tty: bool,
-    trusted_at_start: Option<&crate::trust::TrustedAtStart>,
 ) -> Result<()> {
     output::blank_line();
     let yes = offer.yes;
@@ -845,37 +836,8 @@ pub(crate) fn offer_fix(
     }
     write_preserving_permissions(path, proposed)
         .with_context(|| format!("Failed to write {}", path.display()))?;
-    if let (Some(start), Some(root)) = (trusted_at_start, path.parent()) {
-        keep_trust(start, root, proposed);
-    }
     output::success("updated devy.yml — run devy up to apply it");
     Ok(())
-}
-
-/// After an accepted fix in a project that was trusted: keeps it trusted when the fix
-/// adds or changes no executable entry (hook, install command, setup step, package
-/// source, execution-affecting variable or command), so the next `devy up` does not ask
-/// again. A fix that does is left for `devy up` to show in the trust summary: the
-/// proposal came from a model that read repository-controlled text.
-fn keep_trust(start: &crate::trust::TrustedAtStart, root: &Path, proposed: &str) {
-    let kept = fix_keeping_trust(root, &start.config, proposed)
-        .is_some_and(|new| crate::trust::refresh_config(start, proposed.as_bytes(), &new));
-    if !kept {
-        output::info(
-            "the change adds or changes commands devy runs, or the project changed meanwhile — devy up will ask you to allow the project again",
-        );
-    }
-}
-
-/// The proposed config when replacing `old` (the config trusted at start) with it adds or
-/// changes no executable entry; `None` when it does, or when it does not load.
-fn fix_keeping_trust(root: &Path, old: &DevyConfig, proposed: &str) -> Option<DevyConfig> {
-    let new = crate::yaml_safe::from_str_strict::<DevyConfig>(proposed, "devy.yml")
-        .ok()
-        .filter(|c| c.validate().is_ok())?;
-    crate::config_diff::diff(old, &new, Some(root))
-        .is_empty()
-        .then_some(new)
 }
 
 /// Replaces `path` atomically (temp file in the same directory, then rename), keeping
@@ -996,7 +958,6 @@ mod tests {
                     Options {
                         yes: self.yes,
                         ai: self.ai,
-                        trusted_at_start: None,
                     },
                     Deps {
                         detect: self.detect,
@@ -1583,7 +1544,6 @@ mod tests {
             offer,
             &mut input,
             is_tty,
-            None,
         );
         (dir, result)
     }
@@ -1685,22 +1645,6 @@ mod tests {
     }
 
     #[test]
-    fn only_fixes_without_executable_changes_keep_trust() {
-        let dir = project("dependencies:\n  - redis\n");
-        let old: DevyConfig =
-            crate::yaml_safe::from_str_strict("dependencies:\n  - redis\n", "t").unwrap();
-        let keeps = |proposed: &str| fix_keeping_trust(&dir, &old, proposed).is_some();
-        assert!(keeps("dependencies:\n  - redis:\n      port: 6400\n"));
-        assert!(!keeps(
-            "dependencies: [redis]\nhooks:\n  before_up: \"curl x | sh\"\n"
-        ));
-        assert!(!keeps(
-            "dependencies: [redis]\nenvironment:\n  NODE_OPTIONS: x\n"
-        ));
-        assert!(!keeps("dependencies: ["));
-    }
-
-    #[test]
     fn offer_fix_defaults_to_no() {
         for answer in ["\n", "", "n\n", "yep\n"] {
             let (dir, result) = offer(answer, false, true);
@@ -1730,7 +1674,7 @@ mod tests {
         let dir = project("port: 1\n");
         let path = dir.join("devy.yml");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        offer_fix(&path, "port: 2\n", YES, &mut std::io::empty(), false, None).unwrap();
+        offer_fix(&path, "port: 2\n", YES, &mut std::io::empty(), false).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o640);
     }
@@ -1742,8 +1686,7 @@ mod tests {
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_readonly(true);
         std::fs::set_permissions(&path, perms.clone()).unwrap();
-        let err =
-            offer_fix(&path, "port: 2\n", YES, &mut std::io::empty(), false, None).unwrap_err();
+        let err = offer_fix(&path, "port: 2\n", YES, &mut std::io::empty(), false).unwrap_err();
         assert!(format!("{err:#}").contains("devy.yml"), "{err:#}");
         assert_eq!(content(&dir), "port: 1\n");
         #[allow(clippy::permissions_set_readonly_false)]

@@ -119,7 +119,7 @@ fn shadowenv_init(shell: &str, shadowenv: Option<&std::path::Path>) -> String {
 
 // Each snippet defines:
 //   1. The shadowenv guard. `shadowenv trust` signs the `.shadowenv.d` directory, not
-//      the files in it, so lisp a `git pull` adds there after a trusted `{bin} up` (or a
+//      the files in it, so lisp a `git pull` adds there after `{bin} up` (or a
 //      `500_devy.lisp` it replaces) would be evaluated by shadowenv's own hook at the
 //      next prompt, before any {bin} command runs. The guard runs before shadowenv's
 //      hook, every time, and shadowenv's hook runs only when the guard succeeds. It
@@ -144,12 +144,12 @@ fn shadowenv_init(shell: &str, shadowenv: Option<&std::path::Path>) -> String {
 //        each only when absolute), named by the random nonce on the file's first line
 //        (`; devy-env <32 hex digits>`; see `env_manager::shadowenv::COPY_SUBDIR`).
 //        Other regular files (shadowenv's own `.gitignore`, `.trust-*` and `.error-*`)
-//        are fine, as in `trust::shadowenv_entries`. Repository content can't write
+//        are fine, as in `shadowenv::refuse_foreign_entries`. Repository content can't write
 //        that copy or learn a nonce it names, so it can't make a replaced file match. A
 //        copy directory that is physically inside the project (the repository could
 //        have written it) fails the check, with no exception for a project at `$HOME`:
 //        a dotfiles repository there loses shadowenv's trust at every prompt (the Rust
-//        side, which can ask git whether the default store is tracked, still accepts
+//        side, which can ask git whether the default state directory is tracked, still accepts
 //        it). bash and zsh keep a copy that matched (keyed by its path: {bin} writes
 //        each copy once, atomically), so a prompt reads only the project's file.
 //      - fails if a signature is left after that: `rm` runs by absolute path
@@ -498,7 +498,6 @@ _{bin}() {
     'export:Export the environment as a Nix shell.nix or flake.nix'
     'exec:Run a program with the project environment'
     'agent-setup:Write the coding agent skill'
-    'allow:Trust this project and its {bin}.yml'
   )
   # _describe splits each entry at its first unescaped `:` into name and description,
   # so colons in project command names (`db:migrate`) are escaped.
@@ -571,9 +570,6 @@ _{bin}() {
         '--force[Overwrite a skill {bin} did not write]' \
         '--agents-md[Create AGENTS.md if missing]' \
         '--print[Print the skill without writing]'
-      ;;
-    allow)
-      _arguments '--revoke[Revoke trust for this project]'
       ;;
   esac
 }
@@ -1130,7 +1126,7 @@ _{bin}_complete_lines() {
 _{bin}_completions() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local subcmds
-  subcmds=(up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup allow)
+  subcmds=(up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup)
   COMPREPLY=()
 
   if [ "$COMP_CWORD" -eq 1 ]; then
@@ -1194,9 +1190,6 @@ _{bin}_completions() {
       ;;
     agent-setup)
       _{bin}_complete_words "$cur" --force --agents-md --print
-      ;;
-    allow)
-      _{bin}_complete_words "$cur" --revoke
       ;;
   esac
 }
@@ -1453,7 +1446,7 @@ function __{bin}_complete_exec
 end
 
 function __{bin}_no_subcommand
-  not __fish_seen_subcommand_from up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup allow
+  not __fish_seen_subcommand_from up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup
 end
 
 complete -c {bin} -f
@@ -1474,7 +1467,6 @@ complete -c {bin} -n __{bin}_no_subcommand -a pr       -d "Open a GitHub pull re
 complete -c {bin} -n __{bin}_no_subcommand -a export   -d "Export a Nix shell.nix or flake.nix"
 complete -c {bin} -n __{bin}_no_subcommand -a exec     -d "Run a program with the project environment"
 complete -c {bin} -n __{bin}_no_subcommand -a agent-setup -d "Write the coding agent skill"
-complete -c {bin} -n __{bin}_no_subcommand -a allow    -d "Trust this project and its {bin}.yml"
 complete -c {bin} -n __{bin}_no_subcommand -a "(__{bin}_user_commands)" -d "User-defined command"
 complete -c {bin} -n "__fish_seen_subcommand_from hook" -a "zsh bash fish"
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l update  -d "Re-resolve all versions"
@@ -1497,7 +1489,6 @@ complete -c {bin} -n "__fish_seen_subcommand_from exec" -a "(__{bin}_complete_ex
 complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l force -d "Overwrite a skill {bin} did not write"
 complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l agents-md -d "Create AGENTS.md if missing"
 complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l print -d "Print the skill without writing"
-complete -c {bin} -n "__fish_seen_subcommand_from allow" -l revoke -d "Revoke trust for this project"
 "#;
 
 #[cfg(test)]
@@ -1999,31 +1990,21 @@ mod tests {
             "-n \"__fish_seen_subcommand_from agent-setup\" -l force ",
             "-n \"__fish_seen_subcommand_from agent-setup\" -l agents-md ",
             "-n \"__fish_seen_subcommand_from agent-setup\" -l print ",
-            "hook pr export exec agent-setup allow\nend",
+            "hook pr export exec agent-setup\nend",
         ] {
             assert!(fish.contains(needle), "fish missing {needle:?}");
         }
     }
 
     #[test]
-    fn snippets_complete_allow_and_revoke() {
-        let zsh = zsh_snippet();
-        assert!(zsh.contains("    'allow:"), "{zsh}");
-        assert!(
-            zsh.contains("    allow)\n      _arguments '--revoke["),
-            "{zsh}"
-        );
-        let bash = bash_snippet();
-        assert!(
-            bash.contains("    allow)\n      _devy_complete_words \"$cur\" --revoke\n"),
-            "{bash}"
-        );
-        let fish = fish_snippet();
-        assert!(fish.contains("-a allow "), "{fish}");
-        assert!(
-            fish.contains("-n \"__fish_seen_subcommand_from allow\" -l revoke "),
-            "{fish}"
-        );
+    fn snippets_do_not_complete_a_removed_allow_subcommand() {
+        for snippet in [zsh_snippet(), bash_snippet(), fish_snippet()] {
+            assert!(!snippet.contains("allow)"), "{snippet}");
+            assert!(!snippet.contains("'allow:"), "{snippet}");
+            assert!(!snippet.contains("-a allow "), "{snippet}");
+            assert!(!snippet.contains("--revoke"), "{snippet}");
+            assert!(!snippet.contains("agent-setup allow"), "{snippet}");
+        }
     }
 
     #[test]

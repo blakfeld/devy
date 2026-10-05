@@ -485,7 +485,7 @@ fn refusal(rel: &Path, what: &str) -> anyhow::Error {
 /// to shadowenv, and a signature an earlier `devy up` wrote would keep loading it.
 pub fn check_managed_paths(root: &Path, venvs: &[PathBuf]) -> Result<()> {
     check_managed_paths_only(root, venvs).inspect_err(|_| {
-        crate::trust::untrust_shadowenv(root);
+        crate::env_manager::shadowenv::untrust(root);
     })
 }
 

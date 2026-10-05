@@ -328,7 +328,7 @@ impl PackageManager for Homebrew {
 /// `-`, `_` and `.`, and not `.` or `..`. This rejects URLs, extra path components,
 /// option-like values and shell metacharacters. It does not restrict *which* GitHub
 /// repository is tapped — any well-formed `org/repo` is accepted, which is why taps are
-/// listed in the project-trust summary.
+/// listed in the executable-entry summary.
 pub(crate) fn validate_tap(tap: &str) -> Result<()> {
     let parts: Vec<&str> = tap.split('/').collect();
     if parts.len() != 2 {

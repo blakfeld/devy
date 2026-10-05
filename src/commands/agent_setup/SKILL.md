@@ -25,8 +25,6 @@ Run project tools, tests and scripts with `{bin} exec -- <program> [args…]`, f
 - The exit code is the program's own.
 - Use the `<SERVICE>_PORT` variables instead of hard-coding ports. Ports are assigned per project and are often not the default.
 
-If `{bin}` fails with `project is not allowed`, stop and ask the user to review `{bin}.yml` and run `{bin} allow`. Never run `{bin} allow` yourself: allowing a project lets it run code on the user's machine, and that decision is the user's.
-
 When `{bin}.yml` defines a project command for the task (listed under `commands` in `{bin} status --json`), run it as `{bin} <command>` instead.
 
 ## When something is wrong

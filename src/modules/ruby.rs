@@ -53,7 +53,7 @@ fn rbenv_outside_project(rbenv: &Path, args: &[&str]) -> Command {
 
 /// `rbenv` on PATH outside the project, or in the verified project nix profile (where the
 /// nix backend installs it), so a repository can't plant one that `devy status` or
-/// `devy check` would run (both reach `is_installed` without the trust gate).
+/// `devy check` would run.
 fn rbenv_program() -> Option<PathBuf> {
     crate::fs_safe::which_with_project_profile("rbenv")
 }

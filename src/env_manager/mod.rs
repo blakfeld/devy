@@ -9,14 +9,12 @@ use std::path::Path;
 pub trait EnvManager {
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
-    /// Writes the environment for `dir`. With `trust` (the project passed devy's trust
-    /// gate), also tells the environment tool to load it.
+    /// Writes the environment for `dir` and tells the environment tool to load it.
     fn setup(
         &self,
         dir: &Path,
         vars: &HashMap<String, String>,
         path_prepends: &[String],
-        trust: bool,
     ) -> Result<()>;
     /// Reads back the variables previously written by `setup`. Returns `None` if the
     /// env file has not been created yet.
@@ -65,7 +63,6 @@ impl EnvManager for MockEnvManager {
         _dir: &Path,
         vars: &HashMap<String, String>,
         path_prepends: &[String],
-        _trust: bool,
     ) -> Result<()> {
         self.setup_called.set(true);
         *self.last_vars.borrow_mut() = vars.clone();

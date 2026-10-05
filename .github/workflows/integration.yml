@@ -53,7 +53,6 @@ jobs:
             - jq
           EOF
 
-          "$OLDPWD/target/release/devy" allow
           "$OLDPWD/target/release/devy" up
           "$OLDPWD/target/release/devy" check
 
@@ -98,7 +97,6 @@ jobs:
           }
           trap cleanup EXIT
 
-          "$DEVY" allow
           "$DEVY" up
           "$DEVY" check
 
@@ -154,7 +152,6 @@ jobs:
             - jq
           EOF
 
-          "$OLDPWD/target/release/devy" allow
           "$OLDPWD/target/release/devy" up
           "$OLDPWD/target/release/devy" check
 
@@ -187,7 +184,6 @@ jobs:
           }
           trap cleanup EXIT
 
-          "$DEVY" allow
           "$DEVY" up
           "$DEVY" check
 
@@ -238,7 +234,6 @@ jobs:
             - jq
           EOF
 
-          "$OLDPWD/target/release/devy" allow
           "$OLDPWD/target/release/devy" up
           "$OLDPWD/target/release/devy" check
 
@@ -281,7 +276,6 @@ jobs:
             - jq
           EOF
 
-          "$OLDPWD/target/release/devy" allow
           "$OLDPWD/target/release/devy" up
           "$OLDPWD/target/release/devy" check
 
@@ -351,7 +345,6 @@ jobs:
           }
           trap cleanup EXIT
 
-          "$DEVY" allow
           "$DEVY" up
           cat devy.lock
           grep -q "source: docker" devy.lock

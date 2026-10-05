@@ -72,9 +72,9 @@ impl TempProject {
         proj
     }
 
-    /// The devy binary with this project as working directory and a trust store private
-    /// to the project (`XDG_STATE_HOME`, `LOCALAPPDATA`), so tests never read or write
-    /// the real one.
+    /// The devy binary with this project as working directory and a state directory
+    /// private to the project (`XDG_STATE_HOME`, `LOCALAPPDATA`), so tests never read or
+    /// write the real one.
     fn cmd(&self) -> Command {
         let mut cmd = Command::new(binary());
         cmd.current_dir(&self.dir)
@@ -83,21 +83,11 @@ impl TempProject {
         cmd
     }
 
-    /// Where `cmd` points the trust store: beside the project, removed with it.
+    /// Where `cmd` points devy's state directory: beside the project, removed with it.
     fn state_dir(&self) -> PathBuf {
         let mut name = self.dir.file_name().unwrap().to_os_string();
         name.push("_state");
         self.dir.with_file_name(name)
-    }
-
-    /// Runs `devy allow`, asserting that it succeeds.
-    fn allow(&self) {
-        let out = self.run(&["allow"]);
-        assert!(
-            out.status.success(),
-            "devy allow failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -252,11 +242,6 @@ fn init_does_not_write_an_injected_hook_without_a_terminal() {
         content.contains("# TODO: review suggested hooks.after_up"),
         "{content}"
     );
-    // Not trusted: no trust record was written.
-    let records = std::fs::read_dir(proj.state_dir().join("devy").join("trust"))
-        .map(|d| d.count())
-        .unwrap_or(0);
-    assert_eq!(records, 0);
 }
 
 #[cfg(unix)]
@@ -835,7 +820,7 @@ complete_at() {
 complete_at devy ""
 complete_at devy d
 complete_at devy logs ""
-complete_at devy allow --
+complete_at devy down --
 complete_at devy exec ls files/
 "#;
     // File names that word splitting or globbing would break apart or multiply.
@@ -875,7 +860,7 @@ complete_at devy exec ls files/
             let sections: Vec<Vec<&str>> =
                 stdout.split("---\n").map(|s| s.lines().collect()).collect();
             assert_eq!(sections.len(), 6, "{ctx}\n{stdout}");
-            let (all, d, logs, allow) = (&sections[0], &sections[1], &sections[2], &sections[3]);
+            let (all, d, logs, down) = (&sections[0], &sections[1], &sections[2], &sections[3]);
 
             // Called outside real completion, `compopt` fails (or is missing, on bash
             // 3.2), so bash would insert names unquoted: those with shell syntax are
@@ -885,7 +870,7 @@ complete_at devy exec ls files/
             // Built-ins and safe project names are offered; names with shell
             // syntax or control characters are skipped, since bash would insert
             // them into the command line unquoted.
-            for name in ["up", "doctor", "allow", "dev"] {
+            for name in ["up", "doctor", "dev"] {
                 assert!(all.contains(&name), "{ctx}: missing {name:?} in {all:?}");
             }
             for list in [all, logs] {
@@ -904,7 +889,8 @@ complete_at devy exec ls files/
             assert!(logs.contains(&"redis"), "{ctx}: {logs:?}");
             assert!(logs.contains(&"--follow"), "{ctx}: {logs:?}");
 
-            assert_eq!(allow, &["--revoke"], "{ctx}\n{stdout}");
+            assert_eq!(down, &["--volumes"], "{ctx}\n{stdout}");
+            assert!(!all.contains(&"allow"), "{ctx}: {all:?}");
         }
     }
 }
@@ -1160,7 +1146,6 @@ fn up_writes_lock_past_planted_temp_symlinks() {
     for n in 0..50 {
         std::os::unix::fs::symlink(&victim, proj.file(&format!(".devy.lock.{n}.tmp"))).unwrap();
     }
-    proj.allow();
     let out = run_with_fake_shadowenv(&proj, &["up"]);
     assert!(
         out.status.success(),
@@ -1188,7 +1173,6 @@ fn up_refuses_symlinked_lock() {
     let proj = TempProject::with_yaml("name: test\ndependencies: []\n");
     let victim = victim(&proj);
     std::os::unix::fs::symlink(&victim, proj.file("devy.lock")).unwrap();
-    proj.allow();
     let out = run_with_fake_shadowenv(&proj, &["up"]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1210,7 +1194,6 @@ fn up_refuses_symlinked_process_guard() {
     let target = proj.fake_bin().join("created-by-devy");
     std::fs::create_dir_all(proj.fake_bin()).unwrap();
     std::os::unix::fs::symlink(&target, proj.file(".devy-lock")).unwrap();
-    proj.allow();
     let out = run_with_fake_shadowenv(&proj, &["up"]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1251,7 +1234,6 @@ fn up_refuses_venv_tracked_by_git() {
         proj.dir.join(".venv/bin").display(),
         git.parent().unwrap().display()
     );
-    proj.allow();
     let out = proj.cmd().arg("up").env("PATH", path).output().unwrap();
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1270,7 +1252,6 @@ fn up_refuses_venv_tracked_by_git() {
 fn up_refuses_fake_nix_profile() {
     let proj = TempProject::with_yaml("name: test\ndependencies: []\n");
     std::fs::create_dir_all(proj.file(".devy/nix-profile/bin")).unwrap();
-    proj.allow();
     let out = proj.run(&["up"]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1289,7 +1270,6 @@ const FAILING_HOOK_YAML: &str = "name: shop\nhooks:\n  before_up: \"exit 1\"\nde
 #[test]
 fn up_failure_writes_record_and_prints_doctor_hint_after_error() {
     let proj = TempProject::with_yaml(FAILING_HOOK_YAML);
-    proj.allow();
     let out = proj.run_without_claude(&["up"]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1338,7 +1318,6 @@ fn up_records_invalid_yaml_as_load_config_failure() {
 /// to diagnose without depending on what is installed on this machine.
 fn project_with_failed_up() -> TempProject {
     let proj = TempProject::with_yaml(FAILING_HOOK_YAML);
-    proj.allow();
     let out = proj.run(&["up"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(proj.file(".devy/last-up-failure.json").exists());
@@ -1741,7 +1720,6 @@ fn help_output_lists_key_subcommands() {
         "ask",
         "exec",
         "agent-setup",
-        "allow",
     ] {
         assert!(
             stdout.contains(cmd),
@@ -1764,7 +1742,6 @@ fn exec_env_shows_project_environment() {
     );
     proj.write("devy.lock", LOCK_WITH_REDIS_PORT);
     let lock_before = std::fs::read(proj.file("devy.lock")).unwrap();
-    proj.allow();
     let out = proj.run(&["exec", "env"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -1793,7 +1770,6 @@ fn exec_env_shows_project_environment() {
 #[test]
 fn exec_passes_exit_code_through() {
     let proj = TempProject::with_yaml("package_manager: nix\n");
-    proj.allow();
     let out = proj.run(&["exec", "sh", "-c", "exit 3"]);
     assert_eq!(out.status.code(), Some(3));
     assert!(
@@ -1806,7 +1782,6 @@ fn exec_passes_exit_code_through() {
 #[test]
 fn exec_missing_program_exits_one() {
     let proj = TempProject::with_yaml("dependencies: []\n");
-    proj.allow();
     let out = proj.run(&["exec", "no-such-program"]);
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1818,7 +1793,6 @@ fn exec_missing_program_exits_one() {
 #[test]
 fn exec_does_not_interpret_arguments_with_a_shell() {
     let proj = TempProject::with_yaml("package_manager: nix\n");
-    proj.allow();
     let out = proj.run(&["exec", "--", "printf", "%s\\n", "$HOME; rm -rf x"]);
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "$HOME; rm -rf x\n");
@@ -1828,7 +1802,6 @@ fn exec_does_not_interpret_arguments_with_a_shell() {
 #[test]
 fn exec_output_is_the_programs_only() {
     let proj = TempProject::with_yaml("package_manager: nix\n");
-    proj.allow();
     let out = proj.run(&["exec", "echo", "hi"]);
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
@@ -1866,7 +1839,6 @@ fn exec_finds_a_program_on_the_project_path_only() {
         std::fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    proj.allow();
     let out = proj.run(&["exec", "devy-test-hello"]);
     assert!(
         out.status.success(),
@@ -1891,7 +1863,6 @@ fn exec_ignores_a_fake_nix_profile() {
         std::fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    proj.allow();
     let out = proj.run(&["exec", "devy-test-hello"]);
     assert!(!out.status.success());
     assert!(!String::from_utf8_lossy(&out.stdout).contains("planted"));
@@ -1905,7 +1876,6 @@ fn exec_finds_a_program_on_the_project_path_only() {
     let bin = proj.file(".venv\\Scripts");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(bin.join("devy-test-hello.cmd"), "@echo project hello\r\n").unwrap();
-    proj.allow();
     let out = proj.run(&["exec", "devy-test-hello"]);
     assert!(
         out.status.success(),
@@ -1919,7 +1889,6 @@ fn exec_finds_a_program_on_the_project_path_only() {
 #[test]
 fn exec_passes_exit_code_through() {
     let proj = TempProject::with_yaml("dependencies: []\n");
-    proj.allow();
     let out = proj.run(&["exec", "cmd", "/c", "exit 3"]);
     assert_eq!(out.status.code(), Some(3));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("error:"));
@@ -1932,7 +1901,6 @@ fn exec_passes_arguments_to_a_cmd_script() {
     let bin = proj.file(".venv\\Scripts");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(bin.join("devy-test-args.cmd"), "@echo [%~1] [%~2]\r\n").unwrap();
-    proj.allow();
     let out = proj.run(&["exec", "devy-test-args", "a b", "c"]);
     assert!(
         out.status.success(),
@@ -1948,7 +1916,6 @@ fn exec_builtin_shadows_project_command() {
     let proj = TempProject::with_yaml(
         "package_manager: nix\ncommands:\n  exec: echo project-command\nenvironment:\n  LOG_LEVEL: debug\n",
     );
-    proj.allow();
     let out = proj.run(&["exec", "env"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.lines().any(|l| l == "LOG_LEVEL=debug"), "{stdout}");
@@ -2325,337 +2292,34 @@ fn services_json_without_services_is_empty() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// project trust (devy allow and the gate on up, down, start, restart)
+// no project trust gate: devy up runs the project's hooks, shadowenv trust
 // ─────────────────────────────────────────────────────────────────────────────
 
-const NOT_ALLOWED: &str = "project is not allowed — review devy.yml and run devy allow";
-
-/// A project whose `before_up` and `before_down` hooks create `marker` in the project.
-fn marker_project() -> TempProject {
-    TempProject::with_yaml(
-        "name: t\nhooks:\n  before_up: \"touch marker\"\n  before_down: \"touch marker\"\ndependencies:\n  - redis\n",
-    )
-}
-
-/// Scenario "Untrusted repo without a terminal".
-#[test]
-fn gated_commands_refuse_an_unallowed_project_without_a_terminal() {
-    let proj = marker_project();
-    for args in [
-        &["up"][..],
-        &["down"],
-        &["start", "redis"],
-        &["restart", "redis"],
-    ] {
-        let out = proj.run(args);
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains(NOT_ALLOWED), "{args:?}: {stderr}");
-        assert!(!stderr.contains("devy doctor"), "{args:?}: {stderr}");
-    }
-    assert!(!proj.file("marker").exists());
-    assert!(!proj.file("devy.lock").exists());
-    assert!(!proj.file(".devy").exists(), "no failure record is written");
-    assert!(!proj.file(".devy-lock").exists());
-}
-
-/// Scenario "Read-only commands unaffected".
-#[test]
-fn read_only_commands_need_no_trust() {
-    let proj = TempProject::with_yaml("name: t\ndependencies: []\n");
-    for args in [&["check"][..], &["_commands"], &["_services"]] {
-        let out = proj.run(args);
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(!String::from_utf8_lossy(&out.stderr).contains(NOT_ALLOWED));
-    }
-}
-
+/// `devy up` runs a project's hooks without asking: a repository is vetted by the user,
+/// like any script in it.
 #[cfg(unix)]
 #[test]
-fn allow_records_trust_and_up_runs_the_hook() {
-    let proj = marker_project();
-    let out = proj.run(&["allow"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Hooks"), "{stdout}");
-    assert!(stdout.contains("before_up: touch marker"), "{stdout}");
-    let root = std::fs::canonicalize(&proj.dir).unwrap();
-    assert!(
-        stdout.contains(&format!("✓ allowed {}", root.display())),
-        "{stdout}"
+fn up_runs_the_hook_without_asking() {
+    let proj = TempProject::with_yaml(
+        "name: t\nhooks:\n  before_up: \"touch marker\"\ndependencies:\n  - redis\n",
     );
     // The hook runs before devy looks for a package manager, so it runs here whether or
     // not one is installed.
     let out = proj.run(&["up"]);
-    assert!(
-        !String::from_utf8_lossy(&out.stderr).contains(NOT_ALLOWED),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(proj.file("marker").exists());
-}
-
-/// Scenario "Edited config invalidates trust".
-#[test]
-fn editing_devy_yml_after_allow_requires_allowing_again() {
-    let proj = marker_project();
-    proj.allow();
-    proj.write(
-        "devy.yml",
-        "name: t\nhooks:\n  before_up: \"touch other\"\ndependencies: []\n",
-    );
-    let out = proj.run(&["up"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains(NOT_ALLOWED));
-    assert!(!proj.file("other").exists());
-}
-
-/// Scenario "Revoke also untrusts shadowenv".
-#[cfg(unix)]
-#[test]
-fn allow_revoke_removes_shadowenv_trust() {
-    let proj = TempProject::with_yaml("name: t\ndependencies: []\nenvironment:\n  FOO: bar\n");
-    let ran = recording_shadowenv(&proj);
-    proj.allow();
-    let out = proj
-        .cmd()
-        .arg("up")
-        .env("PATH", proj.fake_bin())
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(ran.exists());
-    assert!(proj.file(".shadowenv.d/.trust-a46f63ff").exists());
-    let copies = proj.state_dir().join("devy/shadowenv");
-    assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 1);
-    let out = proj.run(&["allow", "--revoke"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!proj.file(".shadowenv.d/.trust-a46f63ff").exists());
-    assert!(proj.file(".shadowenv.d/500_devy.lisp").exists());
-    // The shell hook no longer accepts the file: shadowenv waits for the next `devy up`.
-    assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
-}
-
-/// Scenario "Revoke".
-#[test]
-fn allow_revoke_removes_trust_and_succeeds_without_a_record() {
-    let proj = marker_project();
-    let out = proj.run(&["allow", "--revoke"]);
-    assert!(out.status.success(), "revoke without a record must succeed");
-    proj.allow();
-    let out = proj.run(&["allow", "--revoke"]);
-    assert!(out.status.success());
-    let root = std::fs::canonicalize(&proj.dir).unwrap();
-    assert!(
-        String::from_utf8_lossy(&out.stdout)
-            .contains(&format!("✓ revoked trust for {}", root.display())),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let out = proj.run(&["up"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains(NOT_ALLOWED));
-    assert!(!proj.file("marker").exists());
-}
-
-/// `--revoke` only locates devy.yml: a pulled change that no longer parses can still be
-/// revoked.
-#[test]
-fn allow_revoke_works_with_an_invalid_devy_yml() {
-    let proj = marker_project();
-    proj.allow();
-    std::fs::create_dir_all(proj.file(".shadowenv.d")).unwrap();
-    let sig = proj.file(".shadowenv.d/.trust-a46f63ff");
-    proj.write("devy.yml", "dependencies: [\n");
-    // A gated command on a devy.yml that no longer loads drops shadowenv's trust.
-    std::fs::write(&sig, "sig").unwrap();
-    let out = proj.run(&["exec", "true"]);
-    assert_ne!(out.status.code(), Some(0));
-    assert!(
-        !sig.exists(),
-        "exec on a broken devy.yml must untrust shadowenv"
-    );
-    std::fs::write(&sig, "sig").unwrap();
-    let out = proj.run(&["allow", "--revoke"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("revoked trust for"));
-    assert!(!sig.exists(), "revoke must untrust shadowenv");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("not allowed"), "{stderr}");
+    assert!(!stderr.contains("devy allow"), "{stderr}");
+    assert!(proj.file("marker").exists(), "{stderr}");
 }
 
 #[test]
-fn allow_fails_without_or_with_an_invalid_devy_yml() {
-    let proj = TempProject::new();
-    let out = proj.run(&["allow"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("devy.yml not found"));
-    proj.write("devy.yml", "name: [unclosed\n");
-    assert_eq!(proj.run(&["allow"]).status.code(), Some(1));
-    assert!(!proj.state_dir().join("devy").join("trust").exists());
-}
-
-#[test]
-fn help_lists_allow_as_a_subcommand() {
+fn allow_is_not_a_subcommand() {
     let out = Command::new(binary()).arg("--help").output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.lines().any(|l| l.trim_start().starts_with("allow ")),
+        !stdout.lines().any(|l| l.trim_start().starts_with("allow ")),
         "{stdout}"
     );
-}
-
-/// Runs `devy <args>` under `script(1)`, so stdin and stderr are a terminal, and types
-/// `input` once the trust prompt is on screen (some `script` versions end the session
-/// when their stdin closes early). Returns `None` when `script` is unavailable.
-#[cfg(unix)]
-fn run_in_terminal(proj: &TempProject, args: &[&str], input: &str) -> Option<Output> {
-    run_in_terminal_with(proj, args, input, &[])
-}
-
-/// `run_in_terminal` with only `envs` (and `XDG_STATE_HOME`) in the environment; with no
-/// `envs`, the environment is inherited.
-#[cfg(unix)]
-fn run_in_terminal_with(
-    proj: &TempProject,
-    args: &[&str],
-    input: &str,
-    envs: &[(&str, std::ffi::OsString)],
-) -> Option<Output> {
-    use std::io::{Read, Write};
-    use std::process::Stdio;
-    use std::sync::{Arc, Mutex};
-    let script = ["/usr/bin/script", "/bin/script"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())?;
-    let devy = binary().display().to_string();
-    let mut cmd = Command::new(script);
-    if cfg!(target_os = "linux") {
-        // util-linux script takes one shell command string; every word is quoted.
-        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-        let mut words = vec![quote(&devy)];
-        words.extend(args.iter().map(|a| quote(a)));
-        cmd.args(["-q", "-e", "-c", &words.join(" "), "/dev/null"]);
-    } else {
-        cmd.args(["-q", "/dev/null", &devy]).args(args);
-    }
-    if !envs.is_empty() {
-        cmd.env_clear();
-    }
-    let mut child = cmd
-        .current_dir(&proj.dir)
-        .env("XDG_STATE_HOME", proj.state_dir())
-        .envs(envs.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let shown = Arc::new(Mutex::new(Vec::new()));
-    let reader = {
-        let shown = Arc::clone(&shown);
-        let mut stdout = child.stdout.take().unwrap();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = stdout.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                shown.lock().unwrap().extend_from_slice(&buf[..n]);
-            }
-        })
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while std::time::Instant::now() < deadline
-        && !String::from_utf8_lossy(&shown.lock().unwrap()).contains("[y/N]")
-    {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let mut stdin = child.stdin.take().unwrap();
-    let _ = stdin.write_all(input.as_bytes());
-    let _ = stdin.flush();
-    // Give script a moment to forward the answer before its stdin closes.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    drop(stdin);
-    let mut output = child.wait_with_output().ok()?;
-    reader.join().ok()?;
-    output.stdout = shown.lock().unwrap().clone();
-    Some(output)
-}
-
-/// Scenario "Untrusted repo in a terminal, declined".
-#[cfg(unix)]
-#[test]
-fn declining_the_terminal_prompt_runs_nothing() {
-    let proj = marker_project();
-    let Some(out) = run_in_terminal(&proj, &["up"], "\n") else {
-        return; // no script(1): the prompt itself is covered by trust.rs unit tests
-    };
-    let shown = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        shown.contains("This project has not been allowed"),
-        "{shown}"
-    );
-    assert!(shown.contains("before_up: touch marker"), "{shown}");
-    assert!(shown.contains("Allow and continue? [y/N]"), "{shown}");
-    assert_ne!(out.status.code(), Some(0), "{shown}");
-    assert!(!proj.file("marker").exists());
-    assert!(!proj.file(".devy").exists());
-    // Still not allowed.
-    let out = proj.run(&["up"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains(NOT_ALLOWED));
-}
-
-/// Scenario "Lock rewrite keeps trust": devy's own lock write refreshes the record.
-#[cfg(unix)]
-#[test]
-fn up_update_then_up_does_not_ask_again() {
-    let proj = TempProject::with_yaml("name: t\ndependencies: []\n");
-    proj.allow();
-    let out = run_with_fake_shadowenv(&proj, &["up", "--update"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(proj.file("devy.lock").exists(), "the lock was written");
-    // The lock went from absent to written: without the refresh, this run would be
-    // refused as not allowed.
-    let out = run_with_fake_shadowenv(&proj, &["up"]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "{stderr}");
-    assert!(!stderr.contains(NOT_ALLOWED), "{stderr}");
-}
-
-/// A lock changed outside devy (for example pulled from git) requires allowing again.
-#[cfg(unix)]
-#[test]
-fn lock_changed_outside_devy_requires_allowing_again() {
-    let proj = TempProject::with_yaml("name: t\ndependencies: []\n");
-    proj.allow();
-    assert!(run_with_fake_shadowenv(&proj, &["up"]).status.success());
-    proj.write("devy.lock", "dependencies: {}\n# pulled from git\n");
-    let out = run_with_fake_shadowenv(&proj, &["up"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains(NOT_ALLOWED));
 }
 
 /// A fake `shadowenv` (outside the project) that records each run in `shadowenv.ran`.
@@ -2685,7 +2349,6 @@ fn committed_shadowenv_lisp_blocks_shadowenv_trust() {
     // A signature from an earlier `devy up` must not survive the refusal.
     proj.write(".shadowenv.d/.trust-a46f63ff", "sig");
     let ran = recording_shadowenv(&proj);
-    proj.allow();
     let out = proj
         .cmd()
         .arg("up")
@@ -2695,7 +2358,7 @@ fn committed_shadowenv_lisp_blocks_shadowenv_trust() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains(".shadowenv.d contains files devy did not write (000_evil.lisp); devy removed shadowenv's trust for this project; review and remove them, then run devy allow and devy up"),
+        stderr.contains(".shadowenv.d contains files devy did not write (000_evil.lisp); devy removed shadowenv's trust for this project; review and remove them, then run devy up"),
         "{stderr}"
     );
     assert!(!ran.exists(), "shadowenv trust must not run");
@@ -2705,10 +2368,9 @@ fn committed_shadowenv_lisp_blocks_shadowenv_trust() {
 
 #[cfg(unix)]
 #[test]
-fn trusted_project_with_only_devy_lisp_runs_shadowenv_trust() {
+fn up_with_only_devy_lisp_runs_shadowenv_trust() {
     let proj = TempProject::with_yaml("name: t\ndependencies: []\nenvironment:\n  FOO: bar\n");
     let ran = recording_shadowenv(&proj);
-    proj.allow();
     let out = proj
         .cmd()
         .arg("up")
@@ -2738,13 +2400,12 @@ fn trusted_project_with_only_devy_lisp_runs_shadowenv_trust() {
 
 /// shadowenv's hook writes `.shadowenv.d/.error-<n>-<shell pid>` when it meets the
 /// directory untrusted (for example right after the guard removed its trust): a new
-/// one per shell, which must not make the project "not allowed" again.
+/// one per shell, which must not block the next `devy up`.
 #[cfg(unix)]
 #[test]
-fn shadowenv_error_files_keep_the_project_allowed() {
+fn shadowenv_error_files_do_not_block_up() {
     let proj = TempProject::with_yaml("name: t\ndependencies: []\nenvironment:\n  FOO: bar\n");
     recording_shadowenv(&proj);
-    proj.allow();
     let up = || {
         proj.cmd()
             .arg("up")
@@ -2914,7 +2575,6 @@ fn shell_hook_guard_removes_shadowenv_trust_for_files_devy_did_not_write() {
     }
     let proj = TempProject::with_yaml("name: t\ndependencies: []\nenvironment:\n  FOO: bar\n");
     recording_shadowenv(&proj);
-    proj.allow();
     let out = proj
         .cmd()
         .arg("up")
@@ -3737,7 +3397,6 @@ fn shell_hook_guards_shadowenvs_own_init() {
         .collect();
     let proj = TempProject::with_yaml("name: t\ndependencies: []\nenvironment:\n  FOO: bar\n");
     recording_shadowenv(&proj);
-    proj.allow();
     let out = proj
         .cmd()
         .arg("up")
@@ -4342,7 +4001,6 @@ fn shell_hook_guards_shadowenvs_own_fish_init() {
         .collect();
     let proj = TempProject::with_yaml("name: t\ndependencies: []\nenvironment:\n  FOO: bar\n");
     recording_shadowenv(&proj);
-    proj.allow();
     let out = proj
         .cmd()
         .arg("up")
@@ -4450,42 +4108,14 @@ fn shell_hook_guards_shadowenvs_own_fish_init() {
 }
 
 #[test]
-fn exec_requires_trust() {
-    let proj = TempProject::with_yaml(
-        "name: t
-environment:
-  NODE_OPTIONS: \"--require ./x.js\"
-",
-    );
-    let out = proj.run(&["exec", "env"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains(NOT_ALLOWED));
-    assert!(out.stdout.is_empty());
-}
-
-#[test]
-fn export_comments_out_environment_until_allowed() {
+fn export_writes_environment_entries() {
     let proj = TempProject::with_yaml(
         "name: t\ndependencies: []\nenvironment:\n  BASH_ENV: \"/tmp/evil.sh\"\n  FOO: bar\n",
     );
     let out = proj.run(&["export"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("run devy allow"));
-    let flake = std::fs::read_to_string(proj.file("flake.nix")).unwrap();
-    assert!(flake.contains("# BASH_ENV = \"/tmp/evil.sh\";"), "{flake}");
-    assert!(flake.contains("# FOO = \"bar\";"), "{flake}");
-
-    proj.allow();
-    let out = proj.run(&["export"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("devy allow"), "{stderr}");
     let flake = std::fs::read_to_string(proj.file("flake.nix")).unwrap();
     for attr in ["BASH_ENV = \"/tmp/evil.sh\";", "FOO = \"bar\";"] {
         assert!(flake.lines().any(|l| l.trim() == attr), "{attr}: {flake}");
@@ -4506,7 +4136,7 @@ const HOSTILE_SECRETS: [&str; 2] = ["AKIAHOSTILEFIXTURE0000", "readme-was-read-7
 enum HostileConfig {
     /// `tree/devy.yml`: rejected at load (`./evil.deb`, a `$(…)` command name).
     Invalid,
-    /// `valid.devy.yml`: loads, so `up` reaches the trust gate and managed-path checks.
+    /// `valid.devy.yml`: loads, so `up` reaches the managed-path checks.
     Valid,
     /// No devy.yml at all, for `devy init`.
     Absent,
@@ -4558,7 +4188,7 @@ impl HostileRepo {
         }
         std::fs::write(out.join("sentinel/devy-dir/keep"), "keep").unwrap();
         // Defence in depth: sourced by any bash that inherits the project's BASH_ENV. The
-        // tests run nothing that would; the trust summary listing BASH_ENV is the check.
+        // tests run nothing that would.
         std::fs::write(
             out.join("bash_env.sh"),
             format!("touch '{}'\n", out.join("markers/bash_env").display()),
@@ -4742,7 +4372,7 @@ impl HostileRepo {
     }
 
     /// The credential never appears in devy's output or in any file under the project,
-    /// the trust store or the fake-tool directory, and no output carries an OSC escape
+    /// devy's state directory or the fake-tool directory, and no output carries an OSC escape
     /// (the fixture's `name` holds an OSC 52 clipboard write).
     fn assert_nothing_leaked(&self) {
         assert!(!self.outputs.is_empty());
@@ -4835,18 +4465,15 @@ impl HostileRepo {
     }
 }
 
-/// The invalid hostile config (task 18.1): `check` and `up` reject it at load, `allow`
-/// refuses it, `_commands` lists nothing and bash completion offers no project data.
+/// The invalid hostile config (task 18.1): `check` and `up` reject it at load,
+/// `_commands` lists nothing and bash completion offers no project data.
 #[cfg(unix)]
 #[test]
 fn hostile_repo_invalid_config_is_rejected_everywhere() {
     let mut repo = HostileRepo::new(HostileConfig::Invalid);
     let invalid_dep = "dependencies[0]: invalid dependency name \"./evil.deb\"";
     repo.run_expecting(&["check"], 1, invalid_dep);
-    let out = repo.run_expecting(&["up"], 1, invalid_dep);
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("allowed"));
-    repo.run_expecting(&["allow"], 1, invalid_dep);
-    assert!(!repo.proj.state_dir().join("devy/trust").exists());
+    repo.run_expecting(&["up"], 1, invalid_dep);
     for args in [&["_commands"][..], &["_services"]] {
         let out = repo.run(args);
         assert!(out.status.success(), "{args:?} must never fail");
@@ -4941,7 +4568,7 @@ complete_at devy logs ""
                 .collect();
             assert_eq!(sections.len(), 5, "{ctx}: {stdout}");
             // The completion function ran: built-ins are offered.
-            for name in ["up", "check", "allow"] {
+            for name in ["up", "check", "exec"] {
                 assert!(
                     sections[0].contains(&name),
                     "{ctx}: no {name:?} in {stdout}"
@@ -5058,31 +4685,22 @@ fn hostile_repo_init_writes_no_injected_config() {
         !commands.contains("touch") && !commands.contains("hooks"),
         "{commands}"
     );
-    // The trust summary of the written file lists no hooks and no environment.
-    let out = repo.run(&["allow"]);
+    // The written file has no hooks and no environment.
     assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let summary = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !summary.contains("Hooks")
-            && !summary.contains("before_up")
-            && !summary.contains("BASH_ENV"),
-        "{summary}"
+        !yml.lines()
+            .any(|l| l.starts_with("hooks:") || l.contains("BASH_ENV")),
+        "{yml}"
     );
     repo.assert_nothing_leaked();
 }
 
-/// The valid but hostile config (task 18.1): every gated command refuses without trust,
-/// declining the prompt runs nothing, and after `devy allow` the committed symlinks,
-/// `.shadowenv.d` lisp and `.venv` still stop `up` before the hook runs. Once those are
-/// gone, `up` refuses a symlinked `devy.lock` and `500_devy.lisp`, and writes past the
-/// planted lock temp names (including ones at its own pid) without touching their target.
+/// The valid but hostile config (task 18.1): the committed symlinks, `.shadowenv.d`
+/// lisp and `.venv` stop `up` (and `exec`) before the hook runs. Once those are gone,
+/// `up` refuses a symlinked `devy.lock` and `500_devy.lisp`, and writes past the planted
+/// lock temp names (including ones at its own pid) without touching their target.
 #[cfg(unix)]
 #[test]
-fn hostile_repo_valid_config_is_gated_and_refused() {
+fn hostile_repo_valid_config_is_refused_by_the_managed_path_checks() {
     let mut repo = HostileRepo::new(HostileConfig::Valid);
     let git = repo.install_git();
     if let Some(git) = &git {
@@ -5107,58 +4725,19 @@ fn hostile_repo_valid_config_is_gated_and_refused() {
     assert!(!stderr.contains("invalid"), "{stderr}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("devy check · hostile"));
 
-    for args in [
-        &["up"][..],
-        &["down"],
-        &["start", "mysql"],
-        &["restart", "mysql"],
+    // Each committed trap stops `up` before the before_up hook (which would also fail on
+    // purpose, so dependencies are never installed). `exec` builds the same environment,
+    // so it refuses the same directories before running anything.
+    let out = repo.run_expecting(
         &["exec", "git"],
-    ] {
-        let out = repo.run_expecting(args, 1, NOT_ALLOWED);
-        if args[0] == "exec" {
-            assert!(
-                out.stdout.is_empty(),
-                "{}",
-                String::from_utf8_lossy(&out.stdout)
-            );
-        }
-    }
-    assert!(!repo.proj.file("devy.lock").exists());
-    assert!(repo.proj.file(".devy-lock").is_symlink());
-
-    // The isolated environment, plus the SHELL that util-linux script runs `-c` through.
-    let mut envs = repo.isolated_env();
-    envs.push(("SHELL", "/bin/sh".into()));
-    match run_in_terminal_with(&repo.proj, &["up"], "\n", &envs) {
-        // No script(1): the prompt itself is covered by trust.rs unit tests.
-        None => eprintln!("skipping the declined prompt: script(1) unavailable"),
-        Some(out) => {
-            let shown = String::from_utf8_lossy(&out.stdout).to_string();
-            assert!(
-                shown.contains("This project has not been allowed"),
-                "{shown}"
-            );
-            assert!(shown.contains("before_up: touch"), "{shown}");
-            assert!(shown.contains("BASH_ENV="), "{shown}");
-            assert_ne!(out.status.code(), Some(0), "{shown}");
-            repo.record("declined up", &out);
-            repo.run_expecting(&["up"], 1, NOT_ALLOWED);
-        }
-    }
-
-    let out = repo.run(&["allow"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        1,
+        ".devy is a symbolic link; devy will not use it",
     );
-    let summary = String::from_utf8_lossy(&out.stdout);
-    assert!(summary.contains("before_up: touch"), "{summary}");
-    assert!(summary.contains("BASH_ENV="), "{summary}");
-
-    // Allowed, but each committed trap still stops `up` before the before_up hook (which
-    // would also fail on purpose, so dependencies are never installed). `exec` builds the
-    // same environment, so it refuses the same directories before running anything.
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     repo.run_expecting(
         &["exec", "sudo"],
         1,
@@ -5201,17 +4780,12 @@ fn hostile_repo_valid_config_is_gated_and_refused() {
     );
     let victim = repo.out.join("victim");
     std::os::unix::fs::symlink(&victim, repo.proj.file("devy.lock")).unwrap();
-    repo.run_expecting(&["up"], 1, NOT_ALLOWED);
-    repo.run_expecting(&["allow"], 0, "");
     repo.run_expecting(
         &["up"],
         1,
         "devy.lock is not a regular file (symlinks are refused)",
     );
     std::fs::remove_file(repo.proj.file("devy.lock")).unwrap();
-    // Removing the lock changes what was allowed.
-    repo.run_expecting(&["up"], 1, NOT_ALLOWED);
-    repo.run_expecting(&["allow"], 0, "");
 
     // This run writes the lock, then the committed lisp file stops `shadowenv trust`.
     // A shell plants links at this devy process's own old-style temp names
@@ -5254,16 +4828,10 @@ fn hostile_repo_valid_config_is_gated_and_refused() {
 
     // devy's own lisp file is never written through a planted symlink either.
     std::fs::remove_file(repo.proj.file(".shadowenv.d/000_evil.lisp")).unwrap();
-    // The `.shadowenv.d` entries are part of what was allowed.
-    repo.run_expecting(&["up"], 1, NOT_ALLOWED);
     std::os::unix::fs::symlink(&victim, repo.proj.file(".shadowenv.d/500_devy.lisp")).unwrap();
-    // A `500_devy.lisp` that is not a regular file is part of what was allowed too.
-    repo.run_expecting(&["up"], 1, NOT_ALLOWED);
-    repo.run_expecting(&["allow"], 0, "");
     repo.run_expecting(&["up"], 1, "500_devy.lisp: it is a symbolic link");
     assert!(!shadowenv_ran.exists(), "shadowenv trust must not run");
     std::fs::remove_file(repo.proj.file(".shadowenv.d/500_devy.lisp")).unwrap();
-    repo.run_expecting(&["allow"], 0, "");
 
     let out = repo.run(&["up"]);
     assert!(
@@ -5399,7 +4967,6 @@ fn shell_hook_guards_an_interactive_bash() {
         .collect();
     let proj = TempProject::with_yaml("name: t\ndependencies: []\nenvironment:\n  FOO: bar\n");
     recording_shadowenv(&proj);
-    proj.allow();
     let out = proj
         .cmd()
         .arg("up")
@@ -5674,7 +5241,6 @@ fn shell_hook_guards_a_starship_bash_with_shadowenv_init_in_a_function() {
         .collect();
     let proj = TempProject::with_yaml("name: t\ndependencies: []\nenvironment:\n  FOO: bar\n");
     recording_shadowenv(&proj);
-    proj.allow();
     let out = proj
         .cmd()
         .arg("up")

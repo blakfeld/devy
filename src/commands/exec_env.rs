@@ -14,10 +14,7 @@ use crate::project_env::{self, ProjectEnv};
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — spawns the program; covered by tests/cli.rs
 pub fn run(argv: &[String]) -> Result<()> {
-    let (config, project_root) = crate::trust::load_gated()?;
-    // The project environment (PATH, NODE_OPTIONS, LD_PRELOAD, …) can run the
-    // repository's code in whatever program is started, so it needs trust like `up`.
-    crate::trust::require(&config, &project_root, crate::trust::Gate::Other)?;
+    let (config, project_root) = DevyConfig::load_with_root()?;
     let pm = package_manager::detect(&config, &project_root)?;
     let env = project_environment(&config, pm.as_ref(), &project_root)?;
     let cwd = std::env::current_dir().context("Failed to get current directory")?;

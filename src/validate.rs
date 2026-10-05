@@ -237,7 +237,7 @@ pub fn env_key(s: &str) -> bool {
 ///   `$__fish_config_dir`), and bash's exported functions (`BASH_FUNC_*`).
 ///
 /// Variables that only change the programs the shell starts, or shells started later,
-/// stay allowed and are listed in the trust summary like every entry: `PATH` (and zsh's
+/// stay allowed and are listed in the executable-entry summary like every entry: `PATH` (and zsh's
 /// `path`, fish's `fish_user_paths`), `CDPATH`, `BASH_ENV`, `ENV`, `INPUTRC`, the
 /// dynamic loader's variables (`LD_*`, `DYLD_*`; the guard empties the ones that load
 /// code, `LD_PRELOAD`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES` and the like, for its
@@ -867,7 +867,7 @@ mod tests {
         }
         // Names that only contain a reserved one, a reserved name in another case, and
         // the variables that only change the programs the shell starts or shells started
-        // later (listed in the trust summary like every entry).
+        // later (listed in the executable-entry summary like every entry).
         for k in [
             "DB_PWD",
             "MYSQL_PWD",

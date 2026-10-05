@@ -10,11 +10,10 @@ use crate::service_runner::docker::ContainerRuntime;
 
 #[cfg_attr(test, mutants::skip)] // thin I/O wrapper — requires a real devy.yml and package manager
 pub fn run(volumes: bool) -> Result<()> {
-    let (config, project_root) = crate::trust::load_gated()?;
+    let (config, project_root) = DevyConfig::load_with_root()?;
 
     let project_name = config.name.as_deref().unwrap_or("project");
     output::header(&format!("devy down · {}", project_name));
-    crate::trust::require(&config, &project_root, crate::trust::Gate::Other)?;
 
     if let Some(ref hook) = config.hooks.before_down {
         output::header("Hooks");

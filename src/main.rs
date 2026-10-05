@@ -18,9 +18,9 @@ mod output;
 mod package_manager;
 mod project_env;
 mod service_runner;
+mod state_dir;
 #[cfg(test)]
 mod test_support;
-mod trust;
 mod validate;
 mod yaml_safe;
 

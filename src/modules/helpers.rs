@@ -501,7 +501,7 @@ pub(crate) fn validate_extra(
         )?;
     }
     // A non-string `install_cmd` would be ignored by the python module, which would then
-    // run pip instead of what the trust summary shows; refuse it.
+    // run pip instead of what the executable-entry summary shows; refuse it.
     if canonical == "python"
         && let Some(cmd) = extra.get("install_cmd")
         && cmd.as_str().is_none()

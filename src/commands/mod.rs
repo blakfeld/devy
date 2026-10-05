@@ -1,5 +1,4 @@
 pub mod agent_setup;
-pub mod allow;
 pub mod ask;
 pub mod check;
 pub mod doctor;
