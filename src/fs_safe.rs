@@ -888,13 +888,29 @@ pub fn path_outside_project_in(path_var: &OsStr, root: Option<&Path>) -> OsStrin
 }
 
 fn is_inside(entry: &Path, root: &Path, canonical_root: Option<&Path>) -> bool {
-    let canonical_entry = entry.canonicalize().ok();
+    let canonical_entry = canonicalize_existing_prefix(entry);
     let candidates = [Some(entry), canonical_entry.as_deref()];
     let roots = [Some(root), canonical_root];
     candidates
         .iter()
         .flatten()
         .any(|e| roots.iter().flatten().any(|r| e.starts_with(r)))
+}
+
+/// `path` canonicalized through its deepest existing ancestor, with the components
+/// that don't exist yet appended unchanged. So a path that doesn't exist still compares
+/// in the same form as a canonical root: through `/var` → `/private/var` on macOS, or
+/// an 8.3 short name and the `\\?\` prefix on Windows. `None` if no ancestor resolves.
+fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let mut rest = Vec::new();
+    let mut base = path;
+    loop {
+        if let Ok(canonical) = base.canonicalize() {
+            return Some(rest.iter().rev().fold(canonical, |p, c| p.join(c)));
+        }
+        rest.push(base.file_name()?.to_os_string());
+        base = base.parent()?;
+    }
 }
 
 fn executable_in(dir: &Path, name: &str) -> Option<PathBuf> {
@@ -905,6 +921,19 @@ fn executable_in(dir: &Path, name: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::test_support::tmp_dir;
+
+    #[test]
+    fn missing_path_under_a_canonical_root_is_inside() {
+        // The root is recorded canonical (`/private/var/…` on macOS, `\\?\C:\…` with long
+        // names on Windows) while a path under it may be written another way and not
+        // exist yet; it must still count as inside.
+        let root = tmp_dir();
+        let canonical = root.canonicalize().unwrap();
+        let missing = root.join("homebrew").join("bin").join("brew");
+        assert!(is_inside(&missing, &canonical, Some(&canonical)));
+        let outside = std::env::temp_dir().join("devy-elsewhere").join("brew");
+        assert!(!is_inside(&outside, &canonical, Some(&canonical)));
+    }
 
     #[test]
     fn path_outside_project_drops_relative_and_project_entries() {
