@@ -870,7 +870,7 @@ complete_at devy exec ls files/
             // Built-ins and safe project names are offered; names with shell
             // syntax or control characters are skipped, since bash would insert
             // them into the command line unquoted.
-            for name in ["up", "doctor", "dev"] {
+            for name in ["up", "doctor", "prune", "dev"] {
                 assert!(all.contains(&name), "{ctx}: missing {name:?} in {all:?}");
             }
             for list in [all, logs] {
@@ -1165,6 +1165,174 @@ fn up_writes_lock_past_planted_temp_symlinks() {
         .filter(|e| !e.file_type().unwrap().is_symlink())
         .count();
     assert_eq!(regular_tmp, 0, "no temporary file may remain");
+}
+
+/// Runs devy with a stub `nix` (every command succeeds; `profile list` reports an empty
+/// profile) and a no-op `shadowenv` as the only executables on PATH.
+#[cfg(unix)]
+fn run_with_stub_nix(proj: &TempProject, args: &[&str]) -> Output {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = proj.fake_bin();
+    std::fs::create_dir_all(&bin).unwrap();
+    for (name, script) in [
+        (
+            "nix",
+            "#!/bin/sh\nif [ \"$1 $2\" = \"profile list\" ]; then echo '{\"elements\":{},\"version\":3}'; fi\nexit 0\n",
+        ),
+        ("shadowenv", "#!/bin/sh\nexit 0\n"),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    proj.cmd()
+        .args(args)
+        .env("PATH", &bin)
+        .output()
+        .expect("failed to execute devy binary")
+}
+
+/// Scenarios "Ignore file created" and "Existing ignore file kept".
+#[cfg(unix)]
+#[test]
+fn up_creates_the_devy_gitignore_once() {
+    let proj = TempProject::with_yaml("name: test\npackage_manager: nix\ndependencies:\n  - jq\n");
+    let out = run_with_stub_nix(&proj, &["up"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.file(".devy/.gitignore")).unwrap(),
+        "*\n"
+    );
+
+    proj.write(".devy/.gitignore", "custom\n");
+    let out = run_with_stub_nix(&proj, &["up"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.file(".devy/.gitignore")).unwrap(),
+        "custom\n"
+    );
+}
+
+/// Turns `<proj>/feat` into a linked worktree of the project's (main checkout's)
+/// repository, laid out as `git worktree add` leaves it, with `devy_yml` as its devy.yml.
+/// Mirrors `test_support::fake_linked_worktree` (not reachable from integration tests);
+/// keep the two layouts in sync.
+#[cfg(unix)]
+fn add_linked_worktree(proj: &TempProject, devy_yml: &str) -> PathBuf {
+    let admin = proj.file(".git/worktrees/feat");
+    let feat = proj.file("feat");
+    std::fs::create_dir_all(&admin).unwrap();
+    std::fs::create_dir_all(&feat).unwrap();
+    std::fs::write(proj.file(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(admin.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", feat.join(".git").display()),
+    )
+    .unwrap();
+    std::fs::write(feat.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    std::fs::write(feat.join("devy.yml"), devy_yml).unwrap();
+    feat
+}
+
+/// Scenarios "Status in a worktree", "Status in the main checkout" and "Corrupt worktree
+/// file". Unix only: the nix backend isn't available on Windows.
+#[cfg(unix)]
+#[test]
+fn status_names_the_main_checkout_of_a_worktree() {
+    let yaml = "name: shop\npackage_manager: nix\ndependencies:\n  - redis\n";
+    let proj = TempProject::with_yaml(yaml);
+    let feat = add_linked_worktree(&proj, yaml);
+    let main = proj.dir.canonicalize().unwrap();
+
+    let out = proj
+        .cmd()
+        .arg("status")
+        .current_dir(&feat)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let header = lines
+        .iter()
+        .position(|l| l.contains("devy status · shop"))
+        .expect("header");
+    assert_eq!(
+        lines[header + 1],
+        format!("worktree of {}", main.display()),
+        "{stdout}"
+    );
+
+    // Main checkout: no worktree line.
+    let out = proj.run(&["status"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        !stdout.contains("worktree of") && !stdout.contains("worktree ("),
+        "{stdout}"
+    );
+
+    // A corrupt `.devy/worktree.yml` is ignored with a warning, and never rewritten.
+    std::fs::create_dir_all(feat.join(".devy")).unwrap();
+    std::fs::write(feat.join(".devy/worktree.yml"), "ports: [oops\n").unwrap();
+    let out = proj
+        .cmd()
+        .arg("status")
+        .current_dir(&feat)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ignoring unreadable .devy/worktree.yml: "),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(feat.join(".devy/worktree.yml")).unwrap(),
+        "ports: [oops\n"
+    );
+}
+
+/// Scenario "Start in a worktree before up": the lock's port is never used.
+#[cfg(unix)]
+#[test]
+fn start_in_a_worktree_before_up_fails_without_using_the_locks_port() {
+    let yaml = "name: shop\npackage_manager: nix\ndependencies:\n  - redis\n";
+    let proj = TempProject::with_yaml(yaml);
+    let feat = add_linked_worktree(&proj, yaml);
+    std::fs::write(
+        feat.join("devy.lock"),
+        "version: 1\ndependencies:\n  redis:\n    resolved_version: null\n    source: nix\n    assigned_port: 51000\n",
+    )
+    .unwrap();
+    let out = proj
+        .cmd()
+        .args(["start", "redis"])
+        .current_dir(&feat)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("'redis' has no port in this worktree yet — run `devy up` first"),
+        "{stderr}"
+    );
+    assert!(!feat.join(".devy/worktree.yml").exists());
 }
 
 #[cfg(unix)]
@@ -1720,6 +1888,7 @@ fn help_output_lists_key_subcommands() {
         "ask",
         "exec",
         "agent-setup",
+        "prune",
     ] {
         assert!(
             stdout.contains(cmd),
@@ -2320,6 +2489,260 @@ fn allow_is_not_a_subcommand() {
         !stdout.lines().any(|l| l.trim_start().starts_with("allow ")),
         "{stdout}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// prune
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `$HOME` for `devy prune` runs: beside the project, removed with it.
+fn prune_home(proj: &TempProject) -> PathBuf {
+    proj.state_dir().join("home")
+}
+
+/// Where devy looks for nix service units under `prune_home`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn prune_unit_dir(proj: &TempProject) -> PathBuf {
+    let home = prune_home(proj);
+    if cfg!(target_os = "macos") {
+        home.join("Library").join("LaunchAgents")
+    } else {
+        home.join(".config").join("systemd").join("user")
+    }
+}
+
+/// Writes a devy unit file for service `service` recording `root` as its project root,
+/// named for this test project so it can't match any real unit. Returns its path.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_prune_unit(proj: &TempProject, service: &str, root: &std::path::Path) -> PathBuf {
+    let dir = prune_unit_dir(proj);
+    std::fs::create_dir_all(&dir).unwrap();
+    let slug = format!(
+        "{}-{service}",
+        proj.dir.file_name().unwrap().to_string_lossy()
+    );
+    let root = root.display();
+    let (file, contents) = if cfg!(target_os = "macos") {
+        let label = format!("sh.devy.{slug}.redis");
+        (
+            format!("{label}.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n  \
+                 <key>Label</key>\n  <string>{label}</string>\n  \
+                 <key>ProgramArguments</key>\n  <array>\n    <string>/bin/sleep</string>\n  </array>\n  \
+                 <key>EnvironmentVariables</key>\n  <dict>\n    \
+                 <key>DEVY_PROJECT_ROOT</key>\n    <string>{root}</string>\n  </dict>\n\
+                 </dict>\n</plist>\n"
+            ),
+        )
+    } else {
+        (
+            format!("devy-{slug}-redis.service"),
+            format!(
+                "[Service]\nExecStart=/bin/sleep 1\nEnvironment=\"DEVY_PROJECT_ROOT={root}\"\n"
+            ),
+        )
+    };
+    let path = dir.join(file);
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
+/// Runs `devy prune` with `$HOME` in `prune_home` and only fakes on PATH: a `docker`
+/// with a local context that lists no containers and a `systemctl` that succeeds, both
+/// recording their arguments in `<fake_bin>/<name>.args`. The developer's own units and
+/// containers are never seen. (macOS's launchctl is run from /bin, but only for this
+/// project's labels.)
+fn run_prune(proj: &TempProject, args: &[&str]) -> Output {
+    run_prune_with(proj, args, "")
+}
+
+/// `run_prune`, with shell code `docker_extra` run by the fake `docker` (and
+/// `systemctl`) after recording its arguments, e.g. to answer `ps` and `container
+/// inspect`.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn run_prune_with(proj: &TempProject, args: &[&str], docker_extra: &str) -> Output {
+    let bin = proj.fake_bin();
+    #[cfg(unix)]
+    for tool in ["docker", "systemctl"] {
+        use std::os::unix::fs::PermissionsExt;
+        let path = bin.join(tool);
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/{tool}.args'\n\
+             [ \"$1\" = context ] && echo unix:///var/run/docker.sock\n{docker_extra}\nexit 0\n",
+            bin.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::create_dir_all(prune_home(proj)).unwrap();
+    proj.cmd()
+        .arg("prune")
+        .args(args)
+        .env("HOME", prune_home(proj))
+        .env("PATH", &bin)
+        .env_remove("DOCKER_HOST")
+        .env_remove("CONTAINER_HOST")
+        .env_remove("DOCKER_CONTEXT")
+        .env_remove("CONTAINER_CONNECTION")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn prune_without_devy_yml_has_nothing_to_prune() {
+    let proj = TempProject::new();
+    let out = run_prune(&proj, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("○ nothing to prune"), "{stdout}");
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read_to_string(proj.fake_bin().join("docker.args")).unwrap(),
+        "context inspect --format {{.Endpoints.docker.Host}}\n\
+         ps -a --filter label=sh.devy.project --format {{.Names}}\n"
+    );
+    #[cfg(windows)]
+    assert!(
+        stdout.contains("skipping containers: neither docker nor podman was found"),
+        "{stdout}"
+    );
+}
+
+/// Containers of a removed checkout that this machine didn't label as its own are never
+/// removed, even with `--yes --volumes`: one created by an older devy (no `sh.devy.host`)
+/// is reported, and another machine's on a shared daemon is ignored.
+#[cfg(unix)]
+#[test]
+fn prune_skips_containers_without_this_hosts_label() {
+    let proj = TempProject::new();
+    let gone = proj.dir.join("removed-checkout");
+    let inspect = |host: Option<&str>| {
+        let mut labels = serde_json::json!({"sh.devy.project": gone.to_string_lossy()});
+        if let Some(h) = host {
+            labels["sh.devy.host"] = h.into();
+        }
+        serde_json::json!({"State": {"Running": true}, "Config": {"Labels": labels}}).to_string()
+    };
+    let docker = format!(
+        "[ \"$1\" = ps ] && printf 'devy-old-redis\\ndevy-other-redis\\n'\n\
+         if [ \"$1\" = container ]; then\n  for last; do :; done\n  case \"$last\" in\n    \
+         devy-old-redis) echo '{}' ;;\n    devy-other-redis) echo '{}' ;;\n  esac\nfi",
+        inspect(None),
+        inspect(Some("ffffffffffffffff")),
+    );
+    let out = run_prune_with(&proj, &["--yes", "--volumes"], &docker);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("skipping 1 container of a removed checkout without a sh.devy.host label"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("docker rm -f <name>"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("devy-old-redis ({})", gone.display())),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("devy-other-redis"), "{stdout}");
+    // The test can't compute the binary's host id: a machine devy can't identify (no
+    // machine-id, e.g. WSL over ssh) says so instead of counting the other machine's.
+    let unidentified = "devy can't identify this machine, so it removes no containers";
+    let ignoring = "ignoring 1 container labeled by another machine or user";
+    assert!(
+        stdout.contains(unidentified) != stdout.contains(ignoring),
+        "{stdout}"
+    );
+    assert!(stdout.contains("docker volume rm <name>"), "{stdout}");
+    assert!(stdout.contains("○ nothing to prune"), "{stdout}");
+    let calls = std::fs::read_to_string(proj.fake_bin().join("docker.args")).unwrap();
+    assert!(
+        !calls
+            .lines()
+            .any(|l| l.starts_with("rm ") || l.starts_with("volume ")),
+        "{calls}"
+    );
+}
+
+#[test]
+fn prune_builtin_shadows_project_command() {
+    let proj = TempProject::with_yaml("commands:\n  prune: echo project-prune\n");
+    let out = run_prune(&proj, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(!stdout.contains("project-prune"), "{stdout}");
+    assert!(stdout.contains("nothing to prune"), "{stdout}");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn prune_refuses_without_yes_when_not_interactive() {
+    let proj = TempProject::new();
+    let gone = proj.dir.join("removed-checkout");
+    let unit = write_prune_unit(&proj, "gone", &gone);
+    let out = run_prune(&proj, &[]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("refusing to prune without --yes when not interactive"),
+        "{stderr}"
+    );
+    assert!(stdout.contains(&gone.display().to_string()), "{stdout}");
+    assert!(unit.exists(), "nothing may be removed without --yes");
+    assert!(!proj.fake_bin().join("systemctl.args").exists());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn prune_yes_removes_a_removed_checkouts_unit_and_keeps_a_live_one() {
+    let proj = TempProject::new();
+    let gone = proj.dir.join("removed-checkout");
+    let live = proj.dir.join("live-checkout");
+    std::fs::create_dir(&live).unwrap();
+    std::fs::write(live.join("devy.yml"), "name: app\n").unwrap();
+    let stale_unit = write_prune_unit(&proj, "gone", &gone);
+    let live_unit = write_prune_unit(&proj, "live", &live);
+    let out = run_prune(&proj, &["--yes"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!stale_unit.exists(), "{stdout}");
+    assert!(live_unit.exists(), "{stdout}");
+    let stale_id = stale_unit.file_name().unwrap().to_string_lossy();
+    let stale_id = stale_id.trim_end_matches(".plist");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.contains("removed ") && l.contains(stale_id)),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("live-checkout"), "{stdout}");
+    #[cfg(target_os = "linux")]
+    {
+        let calls = std::fs::read_to_string(proj.fake_bin().join("systemctl.args")).unwrap();
+        assert!(
+            calls.contains(&format!("--user stop {stale_id}\n")),
+            "{calls}"
+        );
+        assert!(calls.contains("--user daemon-reload\n"), "{calls}");
+        assert!(!calls.contains("live"), "{calls}");
+    }
 }
 
 /// A fake `shadowenv` (outside the project) that records each run in `shadowenv.ran`.

@@ -15,8 +15,10 @@ pub use winget::WinGet;
 
 #[cfg(any(test, target_os = "macos", target_os = "linux"))]
 mod nix;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 pub use nix::NixPackageManager;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) use nix::{OrphanedUnit, UnitPruner};
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -78,8 +80,8 @@ fn not_found_message(name: &str, dirs: &[&str]) -> String {
 /// Where a service's log output can be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogSource {
-    /// Files tailed in-process, in display order (e.g. stdout then stderr).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only macOS backends log to files
+    /// Files tailed in-process, in display order (e.g. stdout then stderr). Empty when
+    /// there is nothing to read yet (e.g. a docker service with no container).
     Files(Vec<PathBuf>),
     /// A command that prints the log, already built for the requested line count and
     /// follow mode.
@@ -144,6 +146,22 @@ pub trait PackageManager {
     /// process themselves (nix); others use the package's own service definition.
     fn start_service(&self, name: &str, launch: Option<&LaunchSpec>) -> Result<()>;
     fn stop_service(&self, name: &str) -> Result<()>;
+    /// Moves service `name` off outdated unit names before it is stopped (nix: stops and
+    /// removes this project's legacy-named and renamed-slug units). `start_service` does
+    /// this itself, just before it starts the unit. Others do nothing.
+    fn migrate_service(&self, _name: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Whether service `name` has any unit under an outdated name (legacy or a renamed
+    /// project slug) that `migrate_service` would migrate. Read-only.
+    fn needs_service_migration(&self, _name: &str) -> bool {
+        false
+    }
+    /// Whether this project still runs service `name` under its legacy, project-less unit
+    /// name (`sh.devy.<name>`). Renamed-slug units don't count. Read-only.
+    fn uses_legacy_service_name(&self, _name: &str) -> bool {
+        false
+    }
     /// Returns the exact version string currently installed, e.g. "20.11.0" or "7.2.3".
     fn resolved_version(&self, dep: &Dependency) -> Result<Option<String>>;
 
@@ -200,6 +218,12 @@ pub trait PackageManager {
     }
 }
 
+/// devy.yml's `name`, or `project` when it has none: with the project root, it makes the
+/// project slug in nix unit names and docker container names.
+pub(crate) fn project_name(config: &DevyConfig) -> &str {
+    config.name.as_deref().unwrap_or("project")
+}
+
 /// Detect or select the active package manager.
 ///
 /// The choice comes from `package_manager:` in `devy.yml`. Unknown values are rejected
@@ -218,7 +242,10 @@ pub fn detect(
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             anyhow::bail!("package_manager: nix is not supported on Windows");
             #[cfg(any(target_os = "macos", target_os = "linux"))]
-            return Ok(Box::new(NixPackageManager::for_project(project_root)));
+            return Ok(Box::new(NixPackageManager::for_project(
+                project_root,
+                project_name(config),
+            )));
         }
         PackageManagerChoice::Brew => {
             #[cfg(not(target_os = "macos"))]
@@ -251,7 +278,10 @@ pub fn detect(
     // system package manager should set `package_manager: brew` or
     // `package_manager: apt` in devy.yml.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    return Ok(Box::new(NixPackageManager::for_project(project_root)));
+    return Ok(Box::new(NixPackageManager::for_project(
+        project_root,
+        project_name(config),
+    )));
 
     #[cfg(target_os = "windows")]
     return Ok(Box::new(WinGet::new()));
@@ -280,6 +310,11 @@ pub struct MockPackageManager {
     pub started_launches: std::cell::RefCell<Vec<Option<LaunchSpec>>>,
     /// Tracks which service names were passed to `stop_service`.
     pub stopped_services: std::cell::RefCell<Vec<String>>,
+    /// Tracks which service names were passed to `migrate_service`.
+    pub migrated_services: std::cell::RefCell<Vec<String>>,
+    /// Service names `uses_legacy_service_name` and `needs_service_migration` report as
+    /// legacy.
+    pub legacy_services: Vec<&'static str>,
     /// Tracks every package name passed to `install_package` (in dep.name form).
     pub installed_packages: std::cell::RefCell<Vec<String>>,
     /// The subset of `installed_packages` installed with `allow_unfree` set.
@@ -320,6 +355,8 @@ impl Default for MockPackageManager {
             started_services: std::cell::RefCell::new(Vec::new()),
             started_launches: std::cell::RefCell::new(Vec::new()),
             stopped_services: std::cell::RefCell::new(Vec::new()),
+            migrated_services: std::cell::RefCell::new(Vec::new()),
+            legacy_services: Vec::new(),
             installed_packages: std::cell::RefCell::new(Vec::new()),
             unfree_packages: std::cell::RefCell::new(Vec::new()),
             insecure_packages: std::cell::RefCell::new(Vec::new()),
@@ -392,6 +429,16 @@ impl PackageManager for MockPackageManager {
         } else {
             Ok(())
         }
+    }
+    fn migrate_service(&self, name: &str) -> Result<()> {
+        self.migrated_services.borrow_mut().push(name.to_string());
+        Ok(())
+    }
+    fn needs_service_migration(&self, name: &str) -> bool {
+        self.legacy_services.contains(&name)
+    }
+    fn uses_legacy_service_name(&self, name: &str) -> bool {
+        self.legacy_services.contains(&name)
     }
     fn resolved_version(&self, dep: &Dependency) -> Result<Option<String>> {
         self.version_queries.borrow_mut().push(dep.name.clone());

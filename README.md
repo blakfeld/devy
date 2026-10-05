@@ -173,7 +173,7 @@ devy checks these values whenever it loads `devy.yml`, so `devy check` and every
 | Command names | Letters, digits and `_ . : -`, starting with a letter or digit. | `dev`, `db:migrate`, `test.unit` |
 | rust `toolchain` | Letters, digits and `. _ -`, starting with a letter or digit. | `stable`, `1.78.0`, `nightly-2024-01-01` |
 | `cwd` (commands and hooks), python `venv_path` | A relative path that stays inside the project, with no `\` or `:`, no segment ending in `.` or a space, and no Windows device name (`CON`, `NUL`, `COM1`, ...). A `cwd` is resolved against the project root, wherever devy is run from. `venv_path` cannot be the project root itself (`.` or empty) or contain `..`. | `./api`, `scripts`, `.venv` |
-| `environment` keys | Letters, digits and `_`, not starting with a digit. shadowenv exports every entry into your running shell, so a name is refused when setting it there would make the shell run code or act on files by itself, change how it parses commands, or get around devy's shell hook. The list comes from the variables bash, zsh and fish document. Refused: the working directory (`PWD`, `OLDPWD`) and devy's state directory (`HOME`, `XDG_STATE_HOME`); parsing (`IFS`, `SHELLOPTS`, `BASHOPTS`, `BASH_COMPAT`, `POSIXLY_CORRECT`, `GLOBIGNORE`, `KEYBOARD_HACK`, `histchars`, `HISTCHARS`); prompt hooks and other functions the shell calls by name (`PROMPT_COMMAND`, `STARSHIP_PROMPT_COMMAND`, `_PRESERVED_PROMPT_COMMAND`, `precmd_functions`, `preexec_functions`, `chpwd_functions`, `periodic_functions`, `zshaddhistory_functions`, `zshexit_functions`, `zsh_directory_name_functions`, `fish_key_bindings`); strings the shell expands, running the commands in them (the prompts `PS0` to `PS4`, `PROMPT`, `PROMPT2` to `PROMPT4`, `prompt`, `RPROMPT`, `RPROMPT2`, `RPS1`, `RPS2`, `SPROMPT`, `PROMPT_EOL_MARK`; the mail messages `MAILPATH`, `mailpath`; bash's translations `TEXTDOMAIN`, `TEXTDOMAINDIR`); the rest of the mail check (`MAIL`, `MAILCHECK`: the shell checks the files they set before a prompt); which commands run and where code is loaded from (`EXECIGNORE`, `FUNCNEST`, `BASH_ALIASES`, `BASH_CMDS`, `auto_resume`, `NULLCMD`, `READNULLCMD`, `fish_function_path`, `fish_complete_path`, `FPATH`, `fpath`, `module_path`, `MODULE_PATH`, `BASH_LOADABLES_PATH`); files the shell reads or runs by itself (`ZDOTDIR`: a zsh login shell sources `$ZDOTDIR/.zlogout` when it exits) and `TMOUT`, which makes the shell exit by itself; numbers the shell evaluates as arithmetic, where an array subscript such as `PATH[$(cmd)]` runs a command (zsh's `SHLVL`, `LINES`, `COLUMNS`, `ZLE_RPROMPT_INDENT`, `LINENO`, `OPTIND`, `TRY_BLOCK_ERROR`, `TRY_BLOCK_INTERRUPT`, `RANDOM`, `SECONDS`, `ERRNO`, `KEYTIMEOUT`, `LISTMAX`, `PERIOD`, `DIRSTACKSIZE`, `LOGCHECK`, `BAUD`, `REPORTTIME`, `REPORTMEMORY`, `MENUSCROLL`, `UID`, `EUID`, `GID`, `EGID`, and bash's `HISTCMD` and `SRANDOM`; an integer variable your own rc file or a zsh module declares with `typeset -i` or `declare -i` is evaluated the same way, and devy can't know those names, so keep them out of `environment` yourself); files the shell writes or truncates (`HISTFILE`, `HISTFILESIZE`, `HISTSIZE`, `SAVEHIST`, `fish_history`, `BASH_XTRACEFD`, `TMPPREFIX`, `TMPSUFFIX`); zsh's tables of its own functions, aliases, options and history (`functions`, `aliases`, `galiases`, `saliases`, `builtins`, `commands`, `options`, `parameters`, `modules`, their `dis_*` variants, `widgets`, `keymaps`, `jobtexts`, `jobstates`, `jobdirs`, `nameddirs`, `userdirs`, `history`, `historywords`, `funcstack`, `functrace`, `funcsourcetrace`, `funcfiletrace` and the rest of the `zsh/parameter` module's); and names starting with `BASH_FUNC_`, `_devy_`, `__devy_`, `__shadowenv_`, `__hookbook_` or `__fish_`. Names that only change the programs your shell starts, or shells started later, are allowed: `PATH`, `fish_user_paths`, `CDPATH`, `BASH_ENV`, `ENV`, `INPUTRC`, `TMPDIR`, the locale, `LD_*` and `DYLD_*` (devy's shell hook empties the loader variables that load code, `LD_PRELOAD`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES` and the like, only for the utilities its guard runs). Names are reserved only in the case a shell uses them, so `ps1` or `pwd` are allowed. The error gives the reason, for example ``environment: invalid key "PWD" (the shell keeps it for the working directory); remove it from `environment` in devy.yml``. | `DATABASE_URL`, `_DEBUG` |
+| `environment` keys | Letters, digits and `_`, not starting with a digit. shadowenv exports every entry into your running shell, so a name is refused when setting it there would make the shell run code or act on files by itself, change how it parses commands, or get around devy's shell hook. The list comes from the variables bash, zsh and fish document. Refused: the working directory (`PWD`, `OLDPWD`) and devy's state directory (`HOME`, `XDG_STATE_HOME`); parsing (`IFS`, `SHELLOPTS`, `BASHOPTS`, `BASH_COMPAT`, `POSIXLY_CORRECT`, `GLOBIGNORE`, `KEYBOARD_HACK`, `histchars`, `HISTCHARS`); prompt hooks and other functions the shell calls by name (`PROMPT_COMMAND`, `STARSHIP_PROMPT_COMMAND`, `_PRESERVED_PROMPT_COMMAND`, `precmd_functions`, `preexec_functions`, `chpwd_functions`, `periodic_functions`, `zshaddhistory_functions`, `zshexit_functions`, `zsh_directory_name_functions`, `fish_key_bindings`); strings the shell expands, running the commands in them (the prompts `PS0` to `PS4`, `PROMPT`, `PROMPT2` to `PROMPT4`, `prompt`, `RPROMPT`, `RPROMPT2`, `RPS1`, `RPS2`, `SPROMPT`, `PROMPT_EOL_MARK`; the mail messages `MAILPATH`, `mailpath`; bash's translations `TEXTDOMAIN`, `TEXTDOMAINDIR`); the rest of the mail check (`MAIL`, `MAILCHECK`: the shell checks the files they set before a prompt); which commands run and where code is loaded from (`EXECIGNORE`, `FUNCNEST`, `BASH_ALIASES`, `BASH_CMDS`, `auto_resume`, `NULLCMD`, `READNULLCMD`, `fish_function_path`, `fish_complete_path`, `FPATH`, `fpath`, `module_path`, `MODULE_PATH`, `BASH_LOADABLES_PATH`); files the shell reads or runs by itself (`ZDOTDIR`: a zsh login shell sources `$ZDOTDIR/.zlogout` when it exits) and `TMOUT`, which makes the shell exit by itself; numbers the shell evaluates as arithmetic, where an array subscript such as `PATH[$(cmd)]` runs a command (zsh's `SHLVL`, `LINES`, `COLUMNS`, `ZLE_RPROMPT_INDENT`, `LINENO`, `OPTIND`, `TRY_BLOCK_ERROR`, `TRY_BLOCK_INTERRUPT`, `RANDOM`, `SECONDS`, `ERRNO`, `KEYTIMEOUT`, `LISTMAX`, `PERIOD`, `DIRSTACKSIZE`, `LOGCHECK`, `BAUD`, `REPORTTIME`, `REPORTMEMORY`, `MENUSCROLL`, `UID`, `EUID`, `GID`, `EGID`, and bash's `HISTCMD` and `SRANDOM`; an integer variable your own rc file or a zsh module declares with `typeset -i` or `declare -i` is evaluated the same way, and devy can't know those names, so keep them out of `environment` yourself); files the shell writes or truncates (`HISTFILE`, `HISTFILESIZE`, `HISTSIZE`, `SAVEHIST`, `fish_history`, `BASH_XTRACEFD`, `TMPPREFIX`, `TMPSUFFIX`); zsh's tables of its own functions, aliases, options and history (`functions`, `aliases`, `galiases`, `saliases`, `builtins`, `commands`, `options`, `parameters`, `modules`, their `dis_*` variants, `widgets`, `keymaps`, `jobtexts`, `jobstates`, `jobdirs`, `nameddirs`, `userdirs`, `history`, `historywords`, `funcstack`, `functrace`, `funcsourcetrace`, `funcfiletrace` and the rest of the `zsh/parameter` module's); the variables devy reads this machine's identity from for [`devy prune`](#devy-prune) (`SystemRoot`, `windir`, `COMPUTERNAME`, `USERNAME`, `USERDOMAIN` on Windows, and `WSL_DISTRO_NAME`); and names starting with `BASH_FUNC_`, `_devy_`, `__devy_`, `__shadowenv_`, `__hookbook_` or `__fish_`. Names that only change the programs your shell starts, or shells started later, are allowed: `PATH`, `fish_user_paths`, `CDPATH`, `BASH_ENV`, `ENV`, `INPUTRC`, `TMPDIR`, the locale, `LD_*` and `DYLD_*` (devy's shell hook empties the loader variables that load code, `LD_PRELOAD`, `LD_AUDIT`, `DYLD_INSERT_LIBRARIES` and the like, only for the utilities its guard runs). Names are reserved only in the case a shell uses them, so `ps1` or `pwd` are allowed. The Windows machine-identity names are the exception: on Windows they're reserved in any case, because Windows ignores case in variable names. On macOS and Linux devy doesn't read them, so they're allowed there. The error gives the reason, for example ``environment: invalid key "PWD" (the shell keeps it for the working directory); remove it from `environment` in devy.yml``. | `DATABASE_URL`, `_DEBUG` |
 
 Third-party Homebrew formulae use the `tap:` field rather than an `org/tap/formula` name.
 
@@ -230,6 +230,22 @@ Every other module, and any version outside these lists, installs the unversione
 
 **Insecure packages.** nixpkgs marks `elasticsearch` (7.x, end-of-life) as insecure. devy allows insecure packages for that install only, with `NIXPKGS_ALLOW_INSECURE=1` and `--impure`, and warns `elasticsearch: nixpkgs#elasticsearch is marked insecure by nixpkgs — allowing insecure packages for this install`. The service only listens on `127.0.0.1`, but don't expose it beyond your machine. `devy export` adds a matching `allowInsecurePredicate`.
 
+### Service names under Nix
+
+Nix-run services are named per project, so two projects, or two checkouts of one project, can run the same service at the same time. `<project>` is the project slug also used for docker container names: the project `name` plus a short hash of the project directory.
+
+| | Name |
+|---|---|
+| launchd agent (macOS) | `sh.devy.<project>.<name>`, in `~/Library/LaunchAgents/sh.devy.<project>.<name>.plist` |
+| systemd user unit (Linux) | `devy-<project>-<name>.service`, in `~/.config/systemd/user/` |
+| log file (macOS) | `devy-<project>-<name>.log`, in devy's private per-user directory |
+
+Each plist or unit records its project directory as `DEVY_PROJECT_ROOT` in the service's environment.
+
+**Upgrading.** Older devy versions named units `sh.devy.<name>` and `devy-<name>.service`. The first time devy starts or stops a service, it stops and removes this project's legacy unit, recognized by its `.devy/data` or `.devy/nix-profile` paths, and starts the per-project one. A legacy unit that belongs to another project is never touched. The same happens to a unit whose project slug changed because `name` was edited. `devy status`, `devy services` and `devy check` report a legacy unit's running state without migrating it.
+
+**Downgrading.** Older devy versions don't know per-project names. Run `devy down` with the new version before downgrading, or stop and remove the `sh.devy.<project>.*` agents (`devy-<project>-*.service` units on Linux) by hand.
+
 ## Running services with Docker or Podman
 
 Set `service_manager: docker` to run every service dependency as a per-project container instead of through the package manager. Languages and tools (`node`, `jq`, …) still come from the package manager. To containerize only some services, set `service_manager: docker` on those dependencies instead; to keep one service on the package manager while the rest run in containers, set `service_manager: package` on it.
@@ -277,7 +293,34 @@ dependencies:
 
 **Switching an existing project.** Moving a service from the package manager to docker starts it with a fresh, empty volume. Its old data stays with the package-managed service; dump and restore it if you need it.
 
+## Working in git worktrees
+
+You can run `devy up` in the main checkout and in any number of linked worktrees (`git worktree add ../app-feat`) at the same time. Each checkout has its own `.devy/` directory, so its Nix profile and service data under `.devy/data/` are already separate. Nix services are named per checkout (see [Service names under Nix](#service-names-under-nix)), and docker-managed containers and volumes are too. devy recognizes a linked worktree by reading its `.git` file; it never runs `git` to do so.
+
+**Ports.** In a linked worktree, devy doesn't use the ports in `devy.lock`. They belong to the main checkout, whose services may be running on them. Instead, the first `devy up` in the worktree gives each service a free port of its own, and records it in `.devy/worktree.yml`:
+
+```yaml
+version: 1
+ports:
+  redis: 52113
+  postgresql: 52114
+```
+
+Later runs reuse these ports, including `devy up --update`. `devy start`, `devy restart`, `devy check`, `devy status`, `devy services` and `devy exec` read the same file, and never write it. Before the first `devy up` in a worktree, `devy start redis` fails with ``'redis' has no port in this worktree yet — run `devy up` first``, rather than starting on the main checkout's port. If the file is unreadable or corrupt, devy warns `ignoring unreadable .devy/worktree.yml: <reason>` and treats it as empty, so the next `devy up` assigns new ports. A recorded port below 1024 is ignored the same way, without a warning. Ports set with `port:` in `devy.yml` aren't recorded in the file, since they always win. Outside a linked worktree, devy never reads or writes `.devy/worktree.yml`.
+
+**`devy.lock` stays put.** `devy up` in a worktree still records versions in `devy.lock`, but keeps every `assigned_port` exactly as the existing lock has it. A service that's new in the worktree gets no `assigned_port` there, so committing the lock from a worktree never changes anyone's ports. When only ports differ, `devy.lock` isn't rewritten at all.
+
+**Fixed ports are shared.** A port set with `port:` in `devy.yml` wins everywhere, so the worktree and the main checkout both try to use it. In a worktree, `devy up` and `devy check` warn `'<name>' has a fixed port <N> in devy.yml, so it can't run in this worktree and the main checkout at the same time`, but carry on. Remove the explicit port if you need both running.
+
+**Homebrew, apt and WinGet services are shared.** These backends run one system-wide instance of each service, on its default port, with system data directories. Every checkout uses the same instance, as unrelated projects already do.
+
+**Git ignores `.devy/`.** devy adds `.devy/.gitignore` containing `*` when it is missing, so nothing in it shows up in `git status` and you don't have to edit your own ignore rules. devy never changes an existing `.devy/.gitignore`.
+
+**Status.** `devy status` in a worktree prints `worktree of <main checkout>` under its header (`worktree (no main checkout)` for a worktree of a bare repository).
+
 ## Commands
+
+See [Working in git worktrees](#working-in-git-worktrees) for running several checkouts of a project at once.
 
 ### `devy up`
 
@@ -301,6 +344,32 @@ devy down             # Stop services; docker-managed services keep their contai
 devy down --volumes   # Also remove docker-managed containers and data volumes
 ```
 
+### `devy prune`
+
+Removes service resources left behind by checkouts that no longer exist, such as a deleted git worktree or a moved project directory. It doesn't need a `devy.yml`, so you can run it anywhere.
+
+```sh
+devy prune             # List what would be removed, then ask before removing it
+devy prune --yes       # Remove without asking (required when stdin is not a terminal)
+devy prune --volumes   # Also remove the data volumes of removed containers
+```
+
+It looks at:
+
+- **Nix services:** launchd agents (`~/Library/LaunchAgents/sh.devy.*.plist`) or systemd user units (`~/.config/systemd/user/devy-*.service`). Each unit records its project root as `DEVY_PROJECT_ROOT`. The unit is stopped, unloaded or disabled, and its file is deleted.
+- **Docker-managed services:** containers with a `sh.devy.project` label, found with `docker`. If `docker` is missing or can't list a local daemon's containers, `podman` is used instead. When `docker` works, podman's containers aren't checked. Each container is removed, but its data volume (which has the same name) is kept unless you pass `--volumes`, like `devy down --volumes`. With `--volumes`, a volume is removed only when the container mounts it. A container is checked again just before it's removed and removed by its ID, so one created under the same name in the meantime is left alone. Volumes whose container is already gone aren't found, because a volume records no project root. Remove those with `docker volume rm`.
+
+A resource is pruned only when its recorded project root no longer exists but that root's parent directory does. On Linux, a parent that is an empty `/etc/fstab` mount point counts as an unmounted volume, so its resources are kept. devy can't tell when other mounts aren't mounted, such as systemd `.mount` units, ZFS datasets or a manual `mount`. Mount those before you prune. Some resources are always kept:
+
+- A checkout on a branch without a `devy.yml` keeps its resources.
+- So does a project on an unmounted volume that devy can detect (see above).
+- If you delete the parent directory too, its resources are never pruned. Remove them by hand.
+- Units written by older devy versions record no root and are never pruned. Running `devy up` or `devy stop` in their project migrates them.
+
+Containers are skipped with a note when neither `docker` nor `podman` can list them. They're also skipped when the CLI talks to a daemon that may be on another machine: a non-socket `DOCKER_HOST` or docker context, or for podman a non-socket `CONTAINER_HOST`, any `CONTAINER_CONNECTION`, or (on Linux) a remote podman service.
+
+A local socket can still be shared: two WSL distributions using one Docker Desktop, or a devcontainer using its host's docker socket. So devy labels each container it creates with `sh.devy.host`, an opaque SHA-256 hash (with a fixed devy-specific prefix) of this machine's id and your user. The machine id is `/etc/machine-id` on Linux, the hardware UUID on macOS, or `MachineGuid` on Windows, else the host name. Inside a container, the host name is always included. Under WSL (outside a container), the distribution name is always included, since a distribution cloned with `wsl --import` keeps its machine id. That name is only set in sessions started by `wsl.exe`; elsewhere (ssh, cron) devy has no id. The user is your uid, or on Windows your user name. Other commands also leave a container alone when its label is another machine's (or has any label, when this machine has no id), so two machines sharing a daemon with the same project path don't act on each other's containers. `devy up`, `start` and `restart` stop with an error, `stop` and `down` skip it as they would another project's container, and `down --volumes` warns and doesn't remove it. If the container is really yours from before your id changed (a rebuilt devcontainer, or another session), check it with `docker inspect <name>` first, then remove it with `docker rm -f <name>` and run devy again. The new container reuses the same-named data volume, so do this only when that data is yours. A container without the label is still treated as the project's, on every machine sharing the daemon. The label prevents accidental collisions; it isn't a security boundary, since anyone with access to the daemon can set it. `devy prune` only removes containers carrying this machine's label, and says how many devy containers it ignored because another machine or user labeled them. If devy can't identify this machine (no machine id and no host name, or under WSL no distribution name), it doesn't label containers and `devy prune` removes none. Inside a container, devy recognizes docker and podman (`/.dockerenv`, `/run/.containerenv`); other runtimes that share the host's `/etc/machine-id` and uid get the host's id. The label changes if the machine id, user, or (in a container) host name changes, for example when a devcontainer is rebuilt. The previous label's containers are then counted as another machine's; remove them by hand. Containers created by older devy versions, or while devy couldn't identify the machine, have no label, so they're never pruned. If any belong to a removed checkout, `devy prune` lists them in a note. If they're this machine's, remove each with `docker rm -f <name>`, and its volume, if it has one, with `docker volume rm <name>`. Running `devy up` in a live project doesn't add the label to its existing containers. They get it when they are next recreated, for example after a change to the service's configuration. When nothing is found, `devy prune` prints `○ nothing to prune`.
+
 ### `devy services`, `devy start`, `devy stop`, `devy restart`
 
 Manage individual services without touching the rest of the environment. Use these when you want to control a single service — restart a database after a config change, stop something you don't need right now, or bring a service back up without re-running `devy up` for everything.
@@ -314,6 +383,8 @@ devy restart mysql   # Stop then start a service, waiting for it to be healthy
 ```
 
 Service names match what's defined under `dependencies:` in `devy.yml`.
+
+Under nix, `devy up`, `start`, `stop`, `restart` and `down` first migrate this project's services from the unit names older devy versions used, printing `○ migrated <name> to a per-project service name` (see "Service names under Nix").
 
 When a service starts but its health check times out, or doesn't stop in time, devy points you at `devy logs <name>`.
 
@@ -336,14 +407,18 @@ Where devy reads from:
 
 | Backend | Log source |
 |---|---|
-| nix on macOS | the launchd agent's log file, `$TMPDIR/devy-<name>.log` (shared by every project with a service of that name) |
-| nix on Linux | the user journal: `journalctl --user -u devy-<name>.service` |
+| nix on macOS | the launchd agent's log file, `devy-<project>-<name>.log` in devy's private per-user directory under `$TMPDIR` (or `$XDG_RUNTIME_DIR`) |
+| nix on Linux | the user journal: `journalctl --user -u devy-<project>-<name>.service` |
 | brew | the files `brew services info --json <name>` reports; both stdout and stderr files when it reports two |
 | apt | the system journal: `journalctl -u <name>` |
 | docker / podman | `docker logs` (or `podman logs`) for the container `devy-<project>-<service>` |
 | winget | not supported — devy says to check Windows Event Viewer or the service's own log directory |
 
+Under nix, a service that hasn't been started since upgrading from a devy version without per-project service names is read from its legacy log file (`<name>.log`) or unit (`devy-<name>.service`) instead, as long as that legacy unit belongs to this project.
+
 `<name>` is the backend's service name, e.g. `postgresql` for a `postgres` dependency.
+
+On macOS and Linux devy only reads a log file from a directory owned by you or root that isn't writable by everyone (unless it has the sticky bit, like `/tmp`), and the log file itself must be a regular file (not a symlink or FIFO) owned by you or root. Anything else is refused rather than read, since another user could have planted or swapped it, and `devy logs` exits with an error (with `--follow`, once nothing is left to follow; Ctrl-C still exits 0). With several services, the others are still shown. Because of this, the logs of a brew service whose Homebrew or Linuxbrew prefix is owned by another account (a shared `/opt/homebrew` or `/home/linuxbrew/.linuxbrew`, say) are refused.
 
 When a service hasn't logged anything yet, devy prints `· No logs yet for <name>` (with the expected file under nix on macOS) and exits 0. Under nix, services that also write their own log files under `.devy/data/<name>/` (nginx's `error.log` and `access.log`, Elasticsearch's and OpenSearch's `logs/`, Kafka's `app-logs/`, RabbitMQ's `log/`) get one `· also see <path>` line per file that exists.
 
@@ -375,6 +450,8 @@ devy status
 devy status --json   # Machine-readable; see "JSON output"
 ```
 
+In a linked git worktree, the line under the header names the main checkout: `worktree of <path>` (see [Working in git worktrees](#working-in-git-worktrees)).
+
 ### `devy check`
 
 Validates that everything matches `devy.yml` and exits non-zero if any issues are found. Suitable for CI.
@@ -383,6 +460,8 @@ Validates that everything matches `devy.yml` and exits non-zero if any issues ar
 devy check
 devy check --json    # Machine-readable; see "JSON output"
 ```
+
+Under nix, a service that still runs under a legacy unit name gets the note `○ <name> uses a legacy service name; it will be migrated on next start`. It doesn't count as an issue, isn't part of `--json` output, and `devy check` never migrates the unit itself.
 
 ### JSON output
 
@@ -609,11 +688,7 @@ Commit `devy.lock` to version control. Run `devy up --update` when you want to u
 
 devy checks every lock entry when it loads `devy.lock`: versions and digests must follow the [naming rules](#naming-rules), and a locked port below 1024 is only used when `devy.yml` sets it with `port:`. An invalid entry stops every command with `Failed to parse devy.lock: <dep>: invalid <field> <value>`, including `devy up --update`. Older devy versions could record a non-version token from winget output (such as `>`); remove that entry, or `devy.lock`, and run `devy up` to regenerate it.
 
-Don't commit `.devy/`. It holds machine-local state: the Nix profile, service data and the last `devy up` failure record. Add it to `.gitignore`:
-
-```gitignore
-.devy/
-```
+Don't commit `.devy/`. It holds machine-local state: the Nix profile, service data, worktree ports and the last `devy up` failure record. devy adds `.devy/.gitignore` containing `*` when it is missing, so you don't need an ignore rule of your own (see [Working in git worktrees](#working-in-git-worktrees)).
 
 Docker-managed services record `source: docker`, their image tag and `image_digest`, the digest of the pulled image, so every machine runs the same image (see [Running services with Docker or Podman](#running-services-with-docker-or-podman)).
 
@@ -661,13 +736,13 @@ Which ports devy can choose depends on whether the backend can make the service 
 Port assignment follows this priority order:
 
 1. **Explicit port in `devy.yml`** — e.g. `port: 3307` — always wins.
-2. **Port saved in `devy.lock`** — when the backend applies the port, it's reused on every later `devy up`, including after `--update`, so the port stays stable across machines and teammates.
+2. **Port saved in `devy.lock`** — when the backend applies the port, it's reused on every later `devy up`, including after `--update`, so the port stays stable across machines and teammates. In a linked git worktree, the port saved in `.devy/worktree.yml` is used instead (see [Working in git worktrees](#working-in-git-worktrees)).
 3. **Random available port** — when the backend applies the port, assigned on the first `devy up` if no port is configured and there's no lock entry.
 4. **The service's default port** — everywhere else. For example, `redis` under Homebrew always uses 6379, so `REDIS_PORT` and `REDIS_URL` point where Redis actually listens.
 
 If you set an explicit, non-default port that the backend can't apply (e.g. `redis` with `port: 6380` under Homebrew), devy still exports that port but warns that you have to configure the service to listen on it yourself.
 
-`devy start`, `devy restart`, `devy check` and `devy status` resolve ports the same way using `devy.lock`, but never assign new ports or write the lock. devy errors if two services resolve to the same port. Ports that `devy up` hasn't assigned yet are excluded, so `mysql` and `mariadb` under Nix don't conflict, but `elasticsearch` and `opensearch` under Homebrew (both 9200) do.
+`devy start`, `devy restart`, `devy check` and `devy status` resolve ports the same way using `devy.lock` (or `.devy/worktree.yml` in a linked worktree), but never assign new ports or write either file. devy errors if two services resolve to the same port. Ports that `devy up` hasn't assigned yet are excluded, so `mysql` and `mariadb` under Nix don't conflict, but `elasticsearch` and `opensearch` under Homebrew (both 9200) do.
 
 Values set under `environment:` in `devy.yml` take precedence over the auto-injected `_HOST` / `_PORT` variables, so you can override them if needed.
 
@@ -714,11 +789,11 @@ Each module knows the correct package name for each package manager — you alwa
 
 ### Platform notes
 
-**macOS (Nix default):** Services are managed via launchd. devy writes a `LaunchAgent` plist to `~/Library/LaunchAgents/sh.devy.<name>.plist` and uses `launchctl` to start and stop them.
+**macOS (Nix default):** Services are managed via launchd. devy writes a `LaunchAgent` plist to `~/Library/LaunchAgents/sh.devy.<project>.<name>.plist` and uses `launchctl` to start and stop them.
 
-**Linux (Nix default):** Services are managed via systemd user units. devy writes a unit file to `~/.config/systemd/user/devy-<name>.service` and uses `systemctl --user` to start and stop them — no `sudo` required.
+**Linux (Nix default):** Services are managed via systemd user units. devy writes a unit file to `~/.config/systemd/user/devy-<project>-<name>.service` and uses `systemctl --user` to start and stop them — no `sudo` required.
 
-**Services under Nix:** devy launches each service from `.devy/nix-profile/bin` with its resolved port, a `127.0.0.1` bind, and its data, sockets and generated config under `.devy/data/<service>/`. The plist or unit is rewritten on every start, so port changes take effect. Databases are initialized on first start (`initdb`, `mysqld --initialize-insecure`, `mariadb-install-db`), and Kafka's storage is formatted once. Kafka always runs in KRaft mode, because nixpkgs ships Kafka 4, which has no ZooKeeper. Vault without `dev_mode` gets a file-storage config and starts sealed, so initialize and unseal it yourself. `mongodb` installs nixpkgs' unfree `mongodb-ce` (see "Versions under Nix" for unfree handling). `mysql` and `mariadb` can be used together: MariaDB's client tools (`mysql`, `mysqldump`, …) take precedence in `.devy/nix-profile/bin`, while the `mysql` service still runs MySQL's own server. Unit names aren't per-project, so two projects can't run the same service under Nix at the same time.
+**Services under Nix:** devy launches each service from `.devy/nix-profile/bin` with its resolved port, a `127.0.0.1` bind, and its data, sockets and generated config under `.devy/data/<service>/`. The plist or unit is rewritten on every start, so port changes take effect. Databases are initialized on first start (`initdb`, `mysqld --initialize-insecure`, `mariadb-install-db`), and Kafka's storage is formatted once. Kafka always runs in KRaft mode, because nixpkgs ships Kafka 4, which has no ZooKeeper. Vault without `dev_mode` gets a file-storage config and starts sealed, so initialize and unseal it yourself. `mongodb` installs nixpkgs' unfree `mongodb-ce` (see "Versions under Nix" for unfree handling). `mysql` and `mariadb` can be used together: MariaDB's client tools (`mysql`, `mysqldump`, …) take precedence in `.devy/nix-profile/bin`, while the `mysql` service still runs MySQL's own server. Unit names are per-project (see "Service names under Nix"), so two projects can run the same service under Nix at the same time, as long as their ports differ.
 
 **Search servers under Nix:** `elasticsearch` and `opensearch` write into their config directory, which in the Nix store is read-only. On first start devy copies the package's `config/` to `.devy/data/<service>/config/`, makes it writable, and points the server at it (`ES_PATH_CONF` / `OPENSEARCH_PATH_CONF`). In that copy, the relative GC-log, error-file and heap-dump paths in `jvm.options` are rewritten to point under `.devy/data/<service>/`, because the package's start script runs from the read-only store. Later starts reuse it, so edits such as JVM heap in `jvm.options` persist. To reseed it, for example after a major-version upgrade, stop the service, delete `.devy/data/<service>/config/` and start it again. Elasticsearch runs with `ES_HOME` set to its package directory and machine learning disabled (`xpack.ml.enabled=false`), and OpenSearch with its security plugin disabled, so it serves plain HTTP.
 

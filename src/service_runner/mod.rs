@@ -4,6 +4,8 @@
 //! brew, apt or nix in the same project.
 
 pub(crate) mod docker;
+pub(crate) mod host_id;
+pub(crate) mod prune;
 
 use anyhow::Result;
 use std::cell::RefCell;
@@ -21,6 +23,12 @@ use docker::{ContainerRuntime, RunSpec};
 pub const PROJECT_LABEL: &str = "sh.devy.project";
 /// Container label holding the dependency's canonical name.
 pub const SERVICE_LABEL: &str = "sh.devy.service";
+/// Container label holding the id of the machine and user that created the container
+/// (`host_id::current`; left off when there is none). `devy prune` only removes
+/// containers with this machine's id;
+/// other commands find containers by name and `sh.devy.project`, so containers created
+/// before the label existed keep working.
+pub const HOST_LABEL: &str = "sh.devy.host";
 /// Container label holding a hash of everything the container was created with; a
 /// container whose hash differs from the current configuration is recreated.
 pub const CONFIG_LABEL: &str = "sh.devy.config";
@@ -38,12 +46,34 @@ pub trait ServiceRunner {
     fn is_running(&self, dep: &Dependency) -> Result<bool>;
     fn start(&self, dep: &Dependency) -> Result<()>;
     fn stop(&self, dep: &Dependency) -> Result<()>;
+    /// Moves the service off outdated unit names; called before it is stopped, never by
+    /// read-only commands. Starting migrates by itself, once the new unit is ready to
+    /// start. Containers have nothing to migrate.
+    fn migrate(&self, _dep: &Dependency) -> Result<()> {
+        Ok(())
+    }
+    /// Whether the service still has units under outdated names, which `start` would
+    /// replace. Read-only. A service running only under such a name must still be
+    /// started. Containers have nothing to migrate.
+    fn needs_migration(&self, _dep: &Dependency) -> bool {
+        false
+    }
     /// Removes the service's container and, with `volumes`, its data volume. Returns
     /// whether there was anything this runner could remove (only containers can be).
     fn remove(&self, dep: &Dependency, volumes: bool) -> Result<bool>;
     /// Where the service's logs can be read: the last `lines` lines and, with `follow`,
     /// new output as it is written.
     fn log_source(&self, dep: &Dependency, lines: u32, follow: bool) -> Result<LogSource>;
+    /// [`Self::log_source`] without follow, for callers that must not hang: any command
+    /// run to build the source (e.g. the container owner check) is killed after `timeout`.
+    fn log_source_within(
+        &self,
+        dep: &Dependency,
+        lines: u32,
+        _timeout: std::time::Duration,
+    ) -> Result<LogSource> {
+        self.log_source(dep, lines, false)
+    }
 
     /// Polls `is_running` until the service has stopped or the module's shutdown
     /// attempts are exhausted.
@@ -108,6 +138,14 @@ impl ServiceRunner for PackageRunner<'_> {
     fn stop(&self, dep: &Dependency) -> Result<()> {
         modules::get(&dep.name).stop(self.pm, dep)
     }
+    fn migrate(&self, dep: &Dependency) -> Result<()> {
+        self.pm
+            .migrate_service(&modules::get(&dep.name).service_name(dep))
+    }
+    fn needs_migration(&self, dep: &Dependency) -> bool {
+        self.pm
+            .needs_service_migration(&modules::get(&dep.name).service_name(dep))
+    }
     fn remove(&self, _dep: &Dependency, _volumes: bool) -> Result<bool> {
         Ok(false)
     }
@@ -131,6 +169,8 @@ pub struct DockerRunner<'a> {
     /// Canonical name → image reference resolved during this run (the pulled digest), so
     /// containers are created from exactly what devy.lock records.
     resolved_refs: RefCell<HashMap<String, String>>,
+    /// This machine's `sh.devy.host` id (`host_id::current`), set in tests.
+    host: Option<&'static str>,
 }
 
 impl<'a> DockerRunner<'a> {
@@ -143,7 +183,7 @@ impl<'a> DockerRunner<'a> {
         lock: Option<&LockFile>,
         update: bool,
     ) -> Self {
-        let name = config.name.as_deref().unwrap_or("project");
+        let name = crate::package_manager::project_name(config);
         Self {
             runtime,
             cli: config.container_cli,
@@ -152,7 +192,14 @@ impl<'a> DockerRunner<'a> {
             lock: lock.cloned(),
             update,
             resolved_refs: RefCell::new(HashMap::new()),
+            host: host_id::current(),
         }
+    }
+
+    /// Acts as the machine with host id `host` (`None`: one devy can't identify).
+    #[cfg(test)]
+    pub(crate) fn set_host(&mut self, host: Option<&'static str>) {
+        self.host = host;
     }
 
     pub fn runtime(&self) -> &ContainerRuntime<'a> {
@@ -164,26 +211,72 @@ impl<'a> DockerRunner<'a> {
         format!("devy-{}-{}", self.slug, modules::canonical_name(&dep.name))
     }
 
-    /// The `sh.devy.project` label value marking this project's containers.
-    fn project_label(&self) -> String {
-        self.project_root.to_string_lossy().into_owned()
+    /// The `sh.devy.project` label value marking this project's containers. A root that
+    /// isn't valid UTF-8 can't be recorded faithfully, and a lossy label would let
+    /// `devy prune` mistake a live project's container for a removed checkout's, so no
+    /// container is created for it.
+    fn project_label(&self) -> Result<&str> {
+        self.project_root.to_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "devy cannot run containers for a project whose path is not valid UTF-8: {}",
+                self.project_root.display()
+            )
+        })
     }
 
-    /// Whether a container lacks this project's `sh.devy.project` label.
+    /// Who else a container belongs to, or `None` when it is this project's on this
+    /// machine. See `foreign_owner_for`.
+    fn foreign_owner(&self, state: &docker::ContainerState) -> Option<Foreign> {
+        foreign_owner_for(&self.project_root, self.host, state)
+    }
+
     fn is_foreign(&self, state: &docker::ContainerState) -> bool {
-        state.labels.get(PROJECT_LABEL) != Some(&self.project_label())
+        self.foreign_owner(state).is_some()
+    }
+
+    /// The error refusing to use container `name`, which belongs to `owner`: for another
+    /// machine's, with how to recover when it is really this user's from before the id
+    /// changed (a rebuilt devcontainer, a WSL session without `WSL_DISTRO_NAME`).
+    fn foreign_error(&self, name: &str, owner: Foreign) -> anyhow::Error {
+        let cli = self.cli.binary();
+        let hint = format!(
+            "; if it's yours (from before a devcontainer rebuild, or from another session), \
+             check its project path and creation time with `{cli} inspect {name}` first, \
+             then remove it with `{cli} rm -f {name}` and run devy again: the new container \
+             reuses its data volume, {name}, so only do this when that data is yours"
+        );
+        match owner {
+            Foreign::Project => anyhow::anyhow!("container {name} belongs to another project"),
+            Foreign::Host => {
+                anyhow::anyhow!("container {name} belongs to {}{hint}", owner.describe())
+            }
+            Foreign::Unidentified => anyhow::anyhow!(
+                "container {name} has a {HOST_LABEL} label, but devy can't identify this \
+                 machine (under WSL, run devy from a wsl.exe session){hint}"
+            ),
+        }
     }
 
     /// Refuses to touch container `name` when it exists but another project (or anyone
     /// else) created it. Stopping or removing it, or its same-named volume, would act on
     /// someone else's data.
     fn ensure_not_foreign(&self, name: &str) -> Result<()> {
-        if let Some(state) = self.runtime.inspect_container(name)?
-            && self.is_foreign(&state)
-        {
-            anyhow::bail!("container {name} belongs to another project");
+        self.inspect_not_foreign_within(name, None).map(drop)
+    }
+
+    /// [`Self::ensure_not_foreign`], returning the inspected state (`None` when there is
+    /// no such container) so the caller can act on that exact container by ID, and
+    /// failing when the CLI hasn't answered within `timeout` (when one is given).
+    fn inspect_not_foreign_within(
+        &self,
+        name: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Option<docker::ContainerState>> {
+        let state = self.runtime.inspect_container_within(name, timeout)?;
+        if let Some(owner) = state.as_ref().and_then(|s| self.foreign_owner(s)) {
+            return Err(self.foreign_error(name, owner));
         }
-        Ok(())
+        Ok(state)
     }
 
     fn spec(&self, dep: &Dependency) -> Result<(DockerSpec, ImageRef)> {
@@ -241,7 +334,7 @@ impl<'a> DockerRunner<'a> {
             name: name.clone(),
             hostname: modules::canonical_name(&dep.name).to_string(),
             labels: vec![
-                (PROJECT_LABEL.into(), self.project_label()),
+                (PROJECT_LABEL.into(), self.project_label()?.to_string()),
                 (
                     SERVICE_LABEL.into(),
                     modules::canonical_name(&dep.name).into(),
@@ -254,9 +347,71 @@ impl<'a> DockerRunner<'a> {
             image: self.reference(dep)?,
             args: spec.args,
         };
+        // Without an id the label is left off, so `devy prune` never removes the
+        // container (see `host_id`).
+        if let Some(host) = self.host {
+            run.labels.push((HOST_LABEL.into(), host.into()));
+        }
         run.labels
             .push((CONFIG_LABEL.into(), format!("{:016x}", config_hash(&run))));
         Ok(run)
+    }
+}
+
+/// Whom a container that isn't this project's on this machine belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Foreign {
+    /// It lacks this project's `sh.devy.project` label.
+    Project,
+    /// Its `sh.devy.host` label is another machine's or user's.
+    Host,
+    /// It has a `sh.devy.host` label, but this machine has no id to match it against.
+    Unidentified,
+}
+
+impl Foreign {
+    /// "another project", "another machine or user …", for "container X belongs to …".
+    fn describe(self) -> String {
+        match self {
+            Foreign::Project => "another project".into(),
+            Foreign::Host => format!(
+                "another machine or user sharing this container daemon (its {HOST_LABEL} \
+                 label isn't this machine's)"
+            ),
+            Foreign::Unidentified => format!(
+                "another machine or user, as far as devy can tell (it has a {HOST_LABEL} \
+                 label, but devy can't identify this machine)"
+            ),
+        }
+    }
+}
+
+/// Whom a container with `state` belongs to when it isn't the project at
+/// `project_root` on the machine with host id `host`: `None` when it is that project's.
+/// - `Project` when it lacks `sh.devy.project` = `project_root` (always, for a root that
+///   can't be a label; see `project_label`).
+/// - `Host` when its `sh.devy.host` label is present but isn't `host`, or `Unidentified`
+///   when this machine has no id. Two machines sharing a daemon with the same project
+///   path would otherwise act on each other's containers.
+///
+/// A container without the label (from an older devy, or created while the machine had
+/// no id) stays this project's, on every machine sharing the daemon.
+fn foreign_owner_for(
+    project_root: &Path,
+    host: Option<&str>,
+    state: &docker::ContainerState,
+) -> Option<Foreign> {
+    let ours = project_root
+        .to_str()
+        .is_some_and(|root| state.labels.get(PROJECT_LABEL).map(String::as_str) == Some(root));
+    if !ours {
+        return Some(Foreign::Project);
+    }
+    match (state.labels.get(HOST_LABEL), host) {
+        (None, _) => None,
+        (Some(_), None) => Some(Foreign::Unidentified),
+        (Some(label), Some(host)) if label != host => Some(Foreign::Host),
+        _ => None,
     }
 }
 
@@ -336,12 +491,13 @@ impl ServiceRunner for DockerRunner<'_> {
             .iter()
             .find(|(k, _)| k == CONFIG_LABEL)
             .map(|(_, v)| v.as_str());
-        match self.runtime.inspect_container(&run.name)? {
-            // Never start, reuse or replace a container another project (or anyone else)
-            // created under this name.
-            Some(state) if self.is_foreign(&state) => {
-                anyhow::bail!("container {} belongs to another project", run.name)
-            }
+        let existing = self.runtime.inspect_container(&run.name)?;
+        // Never start, reuse or replace a container another project (or anyone else)
+        // created under this name.
+        if let Some(owner) = existing.as_ref().and_then(|s| self.foreign_owner(s)) {
+            return Err(self.foreign_error(&run.name, owner));
+        }
+        match existing {
             Some(state) if state.labels.get(CONFIG_LABEL).map(String::as_str) == hash => {
                 if state.running {
                     Ok(())
@@ -369,11 +525,12 @@ impl ServiceRunner for DockerRunner<'_> {
         // Leave another project's container (and its volume) alone, but let `down`
         // carry on with the remaining services.
         if let Some(state) = self.runtime.inspect_container(&name)?
-            && self.is_foreign(&state)
+            && let Some(owner) = self.foreign_owner(&state)
         {
             output::warn(&format!(
-                "{}: container {name} belongs to another project — not removing it",
-                dep.name
+                "{}: container {name} belongs to {} — not removing it",
+                dep.name,
+                owner.describe()
             ));
             return Ok(false);
         }
@@ -385,11 +542,51 @@ impl ServiceRunner for DockerRunner<'_> {
     }
 
     fn log_source(&self, dep: &Dependency, lines: u32, follow: bool) -> Result<LogSource> {
+        self.container_log_source(dep, lines, follow, None)
+    }
+
+    fn log_source_within(
+        &self,
+        dep: &Dependency,
+        lines: u32,
+        timeout: std::time::Duration,
+    ) -> Result<LogSource> {
+        self.container_log_source(dep, lines, false, Some(timeout))
+    }
+}
+
+impl DockerRunner<'_> {
+    /// `<cli> logs` for the service's container, by ID, once it is known not to be
+    /// another owner's; the owner check fails after `timeout`, when one is given. With
+    /// no container there is nothing to read: an empty file list, which reads as "no
+    /// logs yet".
+    fn container_log_source(
+        &self,
+        dep: &Dependency,
+        lines: u32,
+        follow: bool,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<LogSource> {
+        let name = self.container_name(dep);
+        // Another owner's output must not be shown (or sent to `--explain`) as this service's.
+        let Some(state) = self.inspect_not_foreign_within(&name, timeout)? else {
+            // No container, so nothing has logged yet. The CLI isn't run by name: a
+            // container someone else creates under it after the check would be read.
+            return Ok(LogSource::Files(vec![]));
+        };
+        // Read the container that was checked, by ID, so one swapped in under the name
+        // after the check isn't read instead.
+        if !prune::is_container_id(&state.id) {
+            anyhow::bail!(
+                "`{}` did not report an ID for container {name}",
+                self.runtime.cli_name()
+            );
+        }
         let mut args: Vec<String> = vec!["logs".into(), "--tail".into(), lines.to_string()];
         if follow {
             args.push("-f".into());
         }
-        args.push(self.container_name(dep));
+        args.push(state.id);
         Ok(LogSource::Command(LogCommand {
             program: self.runtime.cli_name().into(),
             args,

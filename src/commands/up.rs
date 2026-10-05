@@ -38,6 +38,10 @@ pub fn run(update: bool, bootstrap: bool) -> Result<()> {
     record_outcome(&project_root, result, &progress)
 }
 
+/// The `up` step that refuses unsafe devy-managed directories. A failure there writes no
+/// failure record, since the record would go into the refused `.devy/`.
+const MANAGED_PATHS_STEP: &str = "check managed paths";
+
 /// The line printed after `error:` when a failure was recorded.
 pub(crate) fn doctor_hint() -> String {
     format!(
@@ -61,6 +65,9 @@ pub(crate) fn record_outcome(
             }
             Ok(())
         }
+        // `.devy/` itself was refused (tracked by git, foreign-owned, a nested
+        // repository, …), so nothing may be written into it, the record included.
+        Err(err) if progress.step == Some(MANAGED_PATHS_STEP) => Err(err),
         Err(err) => {
             let record = failure_record::FailureRecord::for_project(project_root, &err, progress);
             match failure_record::write(project_root, &record) {
@@ -209,7 +216,7 @@ pub(crate) fn up_tracked(
 
     // Before anything runs or writes: the directories devy writes into and runs from must
     // not be symlinks, foreign-owned or committed to the repository.
-    progress.enter("check managed paths");
+    progress.enter(MANAGED_PATHS_STEP);
     let venvs = config
         .normalized_dependencies()
         .map(|deps| modules::managed_venvs(&deps))
@@ -238,7 +245,12 @@ pub(crate) fn up_tracked(
 
     // Load the existing lock for orphan comparison regardless of --update.
     progress.enter("read lock");
-    let existing_lock = LockFile::load(lock_path).context("Failed to read devy.lock")?;
+    // In a linked git worktree, ports come from `.devy/worktree.yml` instead of the lock.
+    let recorded = ports::RecordedPorts::with_lock(
+        project_root,
+        LockFile::load(lock_path).context("Failed to read devy.lock")?,
+    );
+    let existing_lock = recorded.lock();
 
     // Docker-managed services pin images by the locked digest; --update re-resolves tags.
     let runners = Runners::new(
@@ -246,7 +258,7 @@ pub(crate) fn up_tracked(
         runtime,
         config,
         project_root,
-        existing_lock.as_ref(),
+        existing_lock,
         opts.update,
     );
     if deps.iter().any(|d| d.docker) {
@@ -264,7 +276,7 @@ pub(crate) fn up_tracked(
         }
         None
     } else {
-        existing_lock.clone()
+        existing_lock.cloned()
     };
 
     progress.enter("validate config");
@@ -288,14 +300,20 @@ pub(crate) fn up_tracked(
         for warning in warnings {
             output::warn(&format!("{}: {}", dep.name, warning));
         }
+        if recorded.in_worktree()
+            && let Some(warning) = ports::shared_fixed_port_warning(dep, pm)
+        {
+            output::warn(&warning);
+        }
     }
 
     // Assign stable ports to service deps before conflict detection.
-    // Uses the existing lock (not the version-pinning lock) so ports survive --update.
+    // Uses the existing lock (not the version-pinning lock), or the worktree's own port
+    // file, so ports survive --update.
     progress.enter("resolve ports");
-    ports::resolve_and_check(
+    let resolved_ports = ports::resolve_and_check(
         &mut effective_deps,
-        existing_lock.as_ref(),
+        recorded.source(),
         pm,
         ports::PortMode::Assign,
     )?;
@@ -314,7 +332,24 @@ pub(crate) fn up_tracked(
     // Doing this before service start means a service failure doesn't leave the
     // lock stale for the already-installed packages.
     progress.enter("write lock");
-    write_lock(&effective_deps, &runners, lock_path)?;
+    if recorded.in_worktree() {
+        // A worktree keeps its ports to itself, so the committed lock never churns.
+        write_lock(
+            &effective_deps,
+            &runners,
+            lock_path,
+            LockPorts::Previous(existing_lock),
+        )?;
+        let worktree_ports = ports::worktree_ports_for(&effective_deps, &resolved_ports, pm);
+        if worktree_ports.write_if_changed(project_root)? {
+            output::success(&format!(
+                "Worktree ports written to {}",
+                crate::worktree::PORTS_PATH
+            ));
+        }
+    } else {
+        write_lock(&effective_deps, &runners, lock_path, LockPorts::Resolved)?;
+    }
 
     progress.enter("configure environment");
 
@@ -368,7 +403,7 @@ pub(crate) fn up_tracked(
 
     // Warn about deps that were in the lock file but are no longer in devy.yml.
     // Runs even in --update mode so removals are always surfaced.
-    if let Some(ref old_lock) = existing_lock {
+    if let Some(old_lock) = existing_lock {
         let dep_names: std::collections::HashSet<&str> = deps
             .iter()
             .map(|d| modules::canonical_name(&d.name))
@@ -521,7 +556,9 @@ pub(crate) fn start_service_if_needed(runner: &dyn ServiceRunner, dep: &Dependen
     if !module.is_service() {
         return Ok(());
     }
-    if runner.is_running(dep)? {
+    // A service running only under an outdated unit name is started anyway: `start`
+    // replaces that unit once the new one is ready to start.
+    if runner.is_running(dep)? && !runner.needs_migration(dep) {
         output::skip(&format!("{} service already running", dep.name));
     } else {
         output::step(&format!("Starting {} service", dep.name));
@@ -577,10 +614,25 @@ fn lockable(
     }
 }
 
+/// Where [`write_lock`] takes each entry's `assigned_port` from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LockPorts<'a> {
+    /// The ports resolved for this run.
+    Resolved,
+    /// The previous lock's value for each entry, or none where it had none: in a linked
+    /// worktree, whose ports live in `.devy/worktree.yml` (design D6).
+    Previous(Option<&'a LockFile>),
+}
+
 /// Records each dependency's resolved version, source and port. A docker-managed service
 /// records `source: docker`, its image tag as the version and the pulled image's digest.
 /// Leaves the file alone when the lock is already up to date.
-pub(crate) fn write_lock(deps: &[Dependency], runners: &Runners, path: &Path) -> Result<()> {
+pub(crate) fn write_lock(
+    deps: &[Dependency],
+    runners: &Runners,
+    path: &Path,
+    lock_ports: LockPorts<'_>,
+) -> Result<()> {
     let pm = runners.package.pm();
     let mut locked = BTreeMap::new();
     for dep in deps {
@@ -605,18 +657,16 @@ pub(crate) fn write_lock(deps: &[Dependency], runners: &Runners, path: &Path) ->
         } else {
             module.source().unwrap_or(pm.name())
         };
+        let canonical = modules::canonical_name(&dep.name);
         // Only record ports the backend actually applies; others always use the default.
-        let assigned_port = module
-            .port_key()
-            .filter(|_| ports::port_applicable(dep, pm))
-            .and_then(|key| {
-                dep.extra
-                    .get(key)
-                    .and_then(|v| v.as_u64())
-                    .and_then(|raw| u16::try_from(raw).ok())
-            });
+        let assigned_port = match lock_ports {
+            LockPorts::Resolved => ports::recordable_port(dep, pm),
+            LockPorts::Previous(previous) => previous
+                .and_then(|l| l.get(canonical))
+                .and_then(|d| d.assigned_port),
+        };
         locked.insert(
-            modules::canonical_name(&dep.name).to_string(),
+            canonical.to_string(),
             LockedDep {
                 resolved_version: resolved,
                 source: source.to_string(),
@@ -962,6 +1012,24 @@ mod tests {
             pm.started_services.borrow().is_empty(),
             "start must not be called when service is already running"
         );
+        assert!(
+            pm.migrated_services.borrow().is_empty(),
+            "migration is left to the backend's start"
+        );
+    }
+
+    #[test]
+    fn start_service_if_needed_replaces_a_service_running_under_a_legacy_name() {
+        // Running only under its legacy unit name: `start` must run so the backend
+        // retires that unit and starts the per-project one.
+        let pm = MockPackageManager {
+            service_running: true,
+            legacy_services: vec!["mysql"],
+            ..Default::default()
+        };
+        let dep = Dependency::simple("mysql");
+        start_service_if_needed(&PackageRunner::new(&pm, Path::new("/tmp")), &dep).unwrap();
+        assert_eq!(*pm.started_services.borrow(), ["mysql"]);
     }
 
     #[test]
@@ -1011,7 +1079,13 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("node")];
-        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
+        write_lock(
+            &deps,
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+            LockPorts::Resolved,
+        )
+        .unwrap();
         assert!(path.exists(), "write_lock must create the lock file");
     }
 
@@ -1020,7 +1094,13 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("redis")];
-        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
+        write_lock(
+            &deps,
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+            LockPorts::Resolved,
+        )
+        .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("redis"), "lock file must contain dep name");
     }
@@ -1030,9 +1110,21 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("node")];
-        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
+        write_lock(
+            &deps,
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+            LockPorts::Resolved,
+        )
+        .unwrap();
         let content_after_first = std::fs::read_to_string(&path).unwrap();
-        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
+        write_lock(
+            &deps,
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+            LockPorts::Resolved,
+        )
+        .unwrap();
         let content_after_second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             content_after_first, content_after_second,
@@ -1046,7 +1138,13 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("postgres")];
-        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
+        write_lock(
+            &deps,
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+            LockPorts::Resolved,
+        )
+        .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(
             content.contains("postgresql"),
@@ -1119,6 +1217,7 @@ mod tests {
             &[lock_pinned_node("24.20.0")],
             &package_runners(&pm, Path::new("/tmp")),
             &path,
+            LockPorts::Resolved,
         )
         .unwrap();
         assert_eq!(locked_version(&path, "node").as_deref(), Some("24.20.0"));
@@ -1141,6 +1240,7 @@ mod tests {
             &[lock_pinned_node("24.20.0")],
             &package_runners(&pm, Path::new("/tmp")),
             &path,
+            LockPorts::Resolved,
         )
         .unwrap();
         assert_eq!(locked_version(&path, "node").as_deref(), Some("24.21.0"));
@@ -1160,6 +1260,7 @@ mod tests {
             &[Dependency::simple("node")],
             &package_runners(&pm, Path::new("/tmp")),
             &path,
+            LockPorts::Resolved,
         )
         .unwrap();
         assert_eq!(locked_version(&path, "node").as_deref(), Some("24.21.0"));
@@ -1704,6 +1805,22 @@ mod tests {
     }
 
     #[test]
+    fn record_outcome_writes_nothing_when_managed_paths_were_refused() {
+        let dir = crate::test_support::tmp_dir();
+        let progress = UpProgress {
+            step: Some(MANAGED_PATHS_STEP),
+            ..Default::default()
+        };
+        let err = record_outcome(&dir, Err(anyhow::anyhow!("refused")), &progress).unwrap_err();
+        assert_eq!(err.to_string(), "refused");
+        assert!(
+            err.downcast_ref::<HintedError>().is_none(),
+            "no doctor hint"
+        );
+        assert!(!dir.join(".devy").exists(), "nothing may be written");
+    }
+
+    #[test]
     fn record_outcome_replaces_previous_record() {
         let dir = crate::test_support::tmp_dir();
         std::fs::write(dir.join("devy.yml"), "name: x\n").unwrap();
@@ -1898,7 +2015,13 @@ mod tests {
             .iter()
             .map(|dep| apply_lock_from_source(dep, lock.as_ref(), &pm))
             .collect();
-        ports::resolve_ports(&mut deps, lock.as_ref(), &pm, ports::PortMode::ReadOnly).unwrap();
+        ports::resolve_ports(
+            &mut deps,
+            ports::PortSource::Lock(lock.as_ref()),
+            &pm,
+            ports::PortMode::ReadOnly,
+        )
+        .unwrap();
         let resolved = project_env::resolve(&config, &deps, &pm, &dir, ports::PortMode::ReadOnly);
 
         assert_eq!(resolved.vars, *env_mgr.last_vars.borrow());
@@ -2040,7 +2163,13 @@ mod tests {
             crate::config::ExtraValue::Number(16379u64.into()),
         );
         let deps = vec![Dependency::with_extra("redis", extra)];
-        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
+        write_lock(
+            &deps,
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+            LockPorts::Resolved,
+        )
+        .unwrap();
         let lock = crate::lock::LockFile::load(&path).unwrap().unwrap();
         let locked_dep = lock.get("redis").unwrap();
         assert_eq!(
@@ -2055,7 +2184,13 @@ mod tests {
         let path = tmp_path();
         let pm = MockPackageManager::default();
         let deps = vec![Dependency::simple("node")];
-        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
+        write_lock(
+            &deps,
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+            LockPorts::Resolved,
+        )
+        .unwrap();
         let lock = crate::lock::LockFile::load(&path).unwrap().unwrap();
         let locked_dep = lock.get("node").unwrap();
         assert!(
@@ -2074,9 +2209,21 @@ mod tests {
             ..Default::default()
         };
         let mut deps = vec![Dependency::simple("redis")];
-        ports::resolve_ports(&mut deps, None, &pm, ports::PortMode::Assign).unwrap();
+        ports::resolve_ports(
+            &mut deps,
+            ports::PortSource::Lock(None),
+            &pm,
+            ports::PortMode::Assign,
+        )
+        .unwrap();
         let injected = deps[0].extra.get("port").and_then(|v| v.as_u64()).unwrap() as u16;
-        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
+        write_lock(
+            &deps,
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+            LockPorts::Resolved,
+        )
+        .unwrap();
         let lock = crate::lock::LockFile::load(&path).unwrap().unwrap();
         assert_eq!(
             lock.get("redis").unwrap().assigned_port,
@@ -2179,7 +2326,13 @@ mod tests {
             crate::config::ExtraValue::Number(6380u64.into()),
         );
         let deps = vec![Dependency::with_extra("redis", extra)];
-        write_lock(&deps, &package_runners(&pm, Path::new("/tmp")), &path).unwrap();
+        write_lock(
+            &deps,
+            &package_runners(&pm, Path::new("/tmp")),
+            &path,
+            LockPorts::Resolved,
+        )
+        .unwrap();
         let lock = crate::lock::LockFile::load(&path).unwrap().unwrap();
         assert_eq!(lock.get("redis").unwrap().assigned_port, None);
     }
@@ -2275,6 +2428,250 @@ mod tests {
         );
         let lock = LockFile::load(&lock).unwrap().unwrap();
         assert_eq!(lock.get("redis").unwrap().assigned_port, None);
+    }
+
+    // ── linked worktrees ──────────────────────────────────────────────────────
+
+    fn nix_service_pm() -> MockPackageManager {
+        MockPackageManager {
+            name: "nix",
+            installed: true,
+            service_running: true,
+            ..Default::default()
+        }
+    }
+
+    fn write_redis_lock(path: &Path, port: u16) {
+        let mut locked = BTreeMap::new();
+        locked.insert(
+            "redis".into(),
+            LockedDep {
+                resolved_version: None,
+                source: "nix".into(),
+                assigned_port: Some(port),
+                image_digest: None,
+            },
+        );
+        LockFile {
+            dependencies: locked,
+            ..Default::default()
+        }
+        .write(path)
+        .unwrap();
+    }
+
+    /// Runs `devy up` for `yaml` in `root` with devy.lock at `<root>/devy.lock`, returning
+    /// the environment written and every warning.
+    fn up_in(
+        yaml: &str,
+        pm: &MockPackageManager,
+        root: &Path,
+        update: bool,
+    ) -> (HashMap<String, String>, Vec<String>) {
+        let config: crate::config::DevyConfig = yaml::from_str(yaml).unwrap();
+        let env_mgr = MockEnvManager {
+            is_available: true,
+            ..Default::default()
+        };
+        let warnings = crate::output::with_warn_messages(|| {
+            up_impl(
+                &config,
+                pm,
+                &env_mgr,
+                UpOptions {
+                    update,
+                    bootstrap: false,
+                },
+                root,
+                &root.join(crate::lock::PATH),
+            )
+            .unwrap();
+        });
+        let vars = env_mgr.last_vars.borrow().clone();
+        (vars, warnings)
+    }
+
+    #[test]
+    fn worktree_up_records_ports_in_its_own_file_and_keeps_the_lock() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        let lock_path = feat.join(crate::lock::PATH);
+        write_redis_lock(&lock_path, 51000);
+        let mtime = backdate(&lock_path);
+
+        let (vars, _) = up_in(
+            "dependencies:\n  - redis\n",
+            &nix_service_pm(),
+            &feat,
+            false,
+        );
+
+        let recorded = crate::worktree::WorktreePorts::load(&feat);
+        let port = recorded.get("redis").expect("redis port recorded");
+        assert_ne!(port, 51000, "a worktree must not use the lock's port");
+        assert_eq!(vars.get("REDIS_PORT"), Some(&port.to_string()));
+        let lock = LockFile::load(&lock_path).unwrap().unwrap();
+        assert_eq!(lock.get("redis").unwrap().assigned_port, Some(51000));
+        assert_eq!(
+            std::fs::metadata(&lock_path).unwrap().modified().unwrap(),
+            mtime,
+            "devy.lock must not be rewritten when only ports differ"
+        );
+        assert_eq!(
+            std::fs::read_to_string(feat.join(".devy/.gitignore")).unwrap(),
+            "*\n"
+        );
+
+        // A second run reuses the worktree's port.
+        let (vars, _) = up_in(
+            "dependencies:\n  - redis\n",
+            &nix_service_pm(),
+            &feat,
+            false,
+        );
+        assert_eq!(vars.get("REDIS_PORT"), Some(&port.to_string()));
+    }
+
+    #[test]
+    fn worktree_up_gives_a_new_service_no_assigned_port_in_the_lock() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        let lock_path = feat.join(crate::lock::PATH);
+        write_redis_lock(&lock_path, 51000);
+
+        up_in(
+            "dependencies:\n  - redis\n  - memcached\n",
+            &nix_service_pm(),
+            &feat,
+            false,
+        );
+
+        let lock = LockFile::load(&lock_path).unwrap().unwrap();
+        assert_eq!(lock.get("redis").unwrap().assigned_port, Some(51000));
+        assert_eq!(lock.get("memcached").unwrap().assigned_port, None);
+        assert!(
+            crate::worktree::WorktreePorts::load(&feat)
+                .get("memcached")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn worktree_up_update_keeps_worktree_ports() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        write_redis_lock(&feat.join(crate::lock::PATH), 51000);
+        let mut recorded = crate::worktree::WorktreePorts::default();
+        recorded.ports.insert("redis".into(), 52000);
+        recorded.write_if_changed(&feat).unwrap();
+
+        let (vars, _) = up_in("dependencies:\n  - redis\n", &nix_service_pm(), &feat, true);
+
+        assert_eq!(vars.get("REDIS_PORT").map(String::as_str), Some("52000"));
+        assert_eq!(
+            crate::worktree::WorktreePorts::load(&feat).get("redis"),
+            Some(52000)
+        );
+    }
+
+    #[test]
+    fn up_outside_a_worktree_never_writes_the_worktree_file() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        up_in("dependencies:\n  - redis\n", &nix_service_pm(), &dir, false);
+        assert!(!dir.join(crate::worktree::PORTS_PATH).exists());
+        let lock = LockFile::load(&dir.join(crate::lock::PATH))
+            .unwrap()
+            .unwrap();
+        assert!(lock.get("redis").unwrap().assigned_port.is_some());
+    }
+
+    #[test]
+    fn worktree_up_warns_about_a_fixed_nix_port() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        let yaml = "dependencies:\n  - redis:\n      port: 6380\n";
+        let (_, warnings) = up_in(yaml, &nix_service_pm(), &feat, false);
+        assert!(
+            warnings.iter().any(|w| w
+                == "'redis' has a fixed port 6380 in devy.yml, so it can't run in this worktree and the main checkout at the same time"),
+            "{warnings:?}"
+        );
+        // The explicit port isn't recorded, so removing `port:` isolates the worktree.
+        assert_eq!(
+            crate::worktree::WorktreePorts::load(&feat).get("redis"),
+            None
+        );
+        let (vars, _) = up_in(
+            "dependencies:\n  - redis\n",
+            &nix_service_pm(),
+            &feat,
+            false,
+        );
+        assert_ne!(vars.get("REDIS_PORT").map(String::as_str), Some("6380"));
+    }
+
+    #[test]
+    fn worktree_up_does_not_warn_about_a_recorded_port() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        for _ in 0..2 {
+            let (_, warnings) = up_in(
+                "dependencies:\n  - redis\n",
+                &nix_service_pm(),
+                &feat,
+                false,
+            );
+            assert!(
+                !warnings.iter().any(|w| w.contains("fixed port")),
+                "{warnings:?}"
+            );
+        }
+        assert!(
+            crate::worktree::WorktreePorts::load(&feat)
+                .get("redis")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn worktree_up_with_brew_writes_no_worktree_file() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        let pm = MockPackageManager {
+            name: "brew",
+            ..nix_service_pm()
+        };
+        up_in("dependencies:\n  - redis\n", &pm, &feat, false);
+        assert!(!feat.join(crate::worktree::PORTS_PATH).exists());
+    }
+
+    #[test]
+    fn worktree_up_does_not_warn_about_a_brew_port() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        let pm = MockPackageManager {
+            name: "brew",
+            ..nix_service_pm()
+        };
+        let yaml = "dependencies:\n  - redis:\n      port: 6380\n";
+        let (_, warnings) = up_in(yaml, &pm, &feat, false);
+        assert!(
+            !warnings.iter().any(|w| w.contains("fixed port")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn main_checkout_up_does_not_warn_about_a_fixed_port() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir(dir.join(".git")).unwrap();
+        let yaml = "dependencies:\n  - redis:\n      port: 6380\n";
+        let (_, warnings) = up_in(yaml, &nix_service_pm(), &dir, false);
+        assert!(
+            !warnings.iter().any(|w| w.contains("fixed port")),
+            "{warnings:?}"
+        );
     }
 
     // ── docker-managed services ──────────────────────────────────────────────

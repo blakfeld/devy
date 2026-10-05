@@ -126,6 +126,15 @@ enum Commands {
     },
     /// Open a GitHub pull request for the current branch in the browser
     Pr,
+    /// Remove services and containers left behind by removed checkouts
+    Prune {
+        /// Remove them without asking
+        #[arg(long)]
+        yes: bool,
+        /// Also remove the data volumes of removed containers
+        #[arg(long)]
+        volumes: bool,
+    },
     /// Export the environment as a Nix shell.nix or flake.nix
     Export {
         /// Output format
@@ -265,6 +274,7 @@ impl Cli {
                 show_context,
             } => commands::doctor::run(*yes, *no_ai, *show_context),
             Commands::Pr => commands::pr::run(),
+            Commands::Prune { yes, volumes } => commands::prune::run(*yes, *volumes),
             Commands::Export { format } => commands::export::run(*format),
             Commands::Hook { shell } => commands::hook::run(shell),
             Commands::Exec { argv } => commands::exec_env::run(argv),
@@ -386,6 +396,22 @@ mod tests {
         let builtins = builtin_subcommands();
         assert!(builtins.contains(&"exec".to_string()));
         assert!(builtins.contains(&"agent-setup".to_string()));
+    }
+
+    #[test]
+    fn prune_is_a_builtin_with_yes_and_volumes_flags() {
+        assert!(builtin_subcommands().contains(&"prune".to_string()));
+        for (args, want) in [
+            (&["devy", "prune"][..], (false, false)),
+            (&["devy", "prune", "--yes"][..], (true, false)),
+            (&["devy", "prune", "--volumes"][..], (false, true)),
+            (&["devy", "prune", "--volumes", "--yes"][..], (true, true)),
+        ] {
+            match Cli::try_parse_from(args).unwrap().command {
+                Commands::Prune { yes, volumes } => assert_eq!((yes, volumes), want, "{args:?}"),
+                _ => panic!("expected prune"),
+            }
+        }
     }
 
     #[test]

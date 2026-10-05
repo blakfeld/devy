@@ -15,7 +15,9 @@ use crate::config::{Dependency, DevyConfig};
 use crate::modules;
 use crate::output::{clean, clean_line, clean_log};
 use crate::package_manager::{self, LogCommand, LogCommandKind, LogSource};
-use crate::service_runner::docker::ContainerRuntime;
+use crate::service_runner::docker::{
+    ContainerRuntime, format_timeout, read_pipe, recv_pipe, wait_within,
+};
 use crate::service_runner::{Runners, ServiceRunner};
 
 use super::service;
@@ -117,25 +119,52 @@ pub(crate) fn logs_impl(
         }
     };
 
+    // With one service, failing to find its log source is the command's error. With
+    // several, the failure (e.g. a container that belongs to someone else, or a container
+    // runtime that can't be reached) is kept and reported in place, below, so the other
+    // services are still shown.
     let mut sources = Vec::new();
     for dep in &services {
-        let source = runners
+        let source = match runners
             .runner_for(dep)
-            .log_source(dep, opts.lines, opts.follow)?;
-        if let LogSource::Unsupported(msg) = source {
-            bail!("{msg}");
-        }
+            .log_source(dep, opts.lines, opts.follow)
+        {
+            Ok(LogSource::Unsupported(msg)) => bail!("{msg}"),
+            Ok(source) => Ok(source),
+            Err(e) if !single => Err(e),
+            Err(e) => return Err(e),
+        };
         sources.push((dep, source));
     }
 
     if opts.follow {
         return follow(&sources, single, opts.lines, out, stop, tty);
     }
+    // With several services, one whose logs can't be read (e.g. a log file devy refuses
+    // to open) is reported in place and the others are still shown.
+    let mut unreadable = Vec::new();
     for (dep, source) in &sources {
         if !single {
             writeln!(out, "\n{}", clean_line(&dep.name).as_ref().bold())?;
         }
-        match collect(source, opts.lines, None)? {
+        let source = match source {
+            Ok(source) => source,
+            Err(e) => {
+                info(out, &format!("{e:#}"))?;
+                unreadable.push(dep.name.as_str());
+                continue;
+            }
+        };
+        let tail = match collect(source, opts.lines, None) {
+            Ok(tail) => tail,
+            Err(e) if !single => {
+                info(out, &format!("{e:#}"))?;
+                unreadable.push(dep.name.as_str());
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        match tail {
             Tail::Text(text) => {
                 let text = clean_log(&text, tty);
                 out.write_all(text.as_bytes())?;
@@ -149,12 +178,23 @@ pub(crate) fn logs_impl(
             info(out, &format!("also see {}", path.display()))?;
         }
     }
+    if !unreadable.is_empty() {
+        bail!("Could not read the logs of {}", unreadable.join(", "));
+    }
     Ok(())
 }
 
-/// `· <msg>`, as `output::info` prints it (cleaned).
+/// `· <msg>`, as `output::info` prints it (cleaned). The lines of a multi-line message
+/// (e.g. a CLI's stderr) after the first are indented under it, so none can pass for a
+/// `<name> | ` log line or a service header.
 pub(crate) fn info(out: &mut dyn Write, msg: &str) -> std::io::Result<()> {
-    writeln!(out, "  {} {}", "·".cyan(), clean(msg))
+    let msg = clean(msg);
+    let mut lines = msg.trim_end().lines();
+    writeln!(out, "  {} {}", "·".cyan(), lines.next().unwrap_or_default())?;
+    for line in lines {
+        writeln!(out, "    {line}")?;
+    }
+    Ok(())
 }
 
 /// `· No logs yet for <name>`, with the expected path when the source is one file.
@@ -195,8 +235,9 @@ pub(crate) enum Tail {
 }
 
 /// The last `lines` lines of `dep`'s log for AI context, read through its runner as
-/// `devy logs` does but filtered by [`for_ai`]. Command sources are killed after
-/// `timeout`; an unsupported backend is an error.
+/// `devy logs` does but filtered by [`for_ai`]. Every command run (the container owner
+/// check, then the log command) shares the `timeout` and is killed when it runs out; an
+/// unsupported backend is an error.
 pub(crate) fn recent(
     runner: &dyn ServiceRunner,
     dep: &Dependency,
@@ -204,8 +245,13 @@ pub(crate) fn recent(
     lines: u32,
     timeout: Duration,
 ) -> Result<Tail> {
-    let source = for_ai(runner.log_source(dep, lines, false)?, project_root)?;
-    collect(&source, lines, Some(timeout))
+    let deadline = Instant::now() + timeout;
+    let source = for_ai(runner.log_source_within(dep, lines, timeout)?, project_root)?;
+    collect(
+        &source,
+        lines,
+        Some(deadline.saturating_duration_since(Instant::now())),
+    )
 }
 
 /// `source` without log files that may not go into AI context: a file inside the
@@ -271,13 +317,88 @@ pub(crate) fn collect(source: &LogSource, lines: u32, timeout: Option<Duration>)
     }
 }
 
+/// Opens the log file at `path` for reading: `None` when it (or its directory) is
+/// missing. Only a regular file is read, opened without following a symlink, so a log
+/// file swapped for a link to another file (or a FIFO) is refused rather than shown. On
+/// Unix its directory must also be one only the user or root controls
+/// ([`check_log_dir`]), checked at every open: a directory that didn't exist when the
+/// source was built, or was removed and recreated while following, may have been made by
+/// another user. The file opened must itself be owned by the user or root
+/// ([`check_log_owner`]), which closes the gap between the directory check and the open
+/// and covers a file planted in a shared (sticky or group-writable) directory.
+fn open_log(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let opened = check_log_dir(path)
+        .and_then(|()| crate::fs_safe::open_regular_nofollow(path))
+        .and_then(|file| check_log_owner(path, &file).map(|()| file));
+    match opened {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `uid` is the current user or root, who alone may own a log devy reads.
+#[cfg(unix)]
+fn trusted_owner(uid: u32) -> bool {
+    crate::fs_safe::is_user_or_root(uid)
+}
+
+/// Refuses an opened log file (checked on the open handle) that another user owns.
+#[cfg(unix)]
+fn check_log_owner(path: &Path, file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if trusted_owner(file.metadata()?.uid()) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{} is owned by another user; devy will not read it",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(not(unix))]
+fn check_log_owner(_path: &Path, _file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Refuses a log file whose directory isn't a real directory owned by the user or root,
+/// or is writable by everyone without the sticky bit: anyone else could plant or swap
+/// the file there. `NotFound` when the directory is missing. Group-writable directories
+/// owned by the user are accepted (a umask of 002 makes them by default).
+#[cfg(unix)]
+fn check_log_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    let meta = std::fs::symlink_metadata(dir)?;
+    let world_writable = meta.mode() & 0o002 != 0 && meta.mode() & 0o1000 == 0;
+    if !meta.is_dir() || !trusted_owner(meta.uid()) || world_writable {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} is not a directory only you or root can write to; devy will not read logs from it",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_log_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// The last `n` lines of the file at `path` and its length, scanning backwards from the
-/// end in `BLOCK`-sized reads. A missing file has no lines.
+/// end in `BLOCK`-sized reads. A missing file has no lines; anything but a regular file
+/// is refused ([`open_log`]).
 pub(crate) fn tail_file(path: &Path, n: u32) -> std::io::Result<(Vec<String>, u64)> {
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], 0)),
-        Err(e) => return Err(e),
+    let Some(mut file) = open_log(path)? else {
+        return Ok((vec![], 0));
     };
     let len = file.metadata()?.len();
     let mut pos = len;
@@ -333,45 +454,36 @@ fn capture(cmd: &LogCommand, timeout: Option<Duration>) -> Result<CmdOutput> {
     // The command keeps its copies of the pipe's write end open until dropped.
     drop(command);
 
-    let read_all = |mut pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
-        })
-    };
+    let deadline = timeout.map(|t| Instant::now() + t);
     let (stdout, stderr) = match merged_reader {
-        Some(reader) => (read_all(Box::new(reader)), None),
+        Some(reader) => (read_pipe(Box::new(reader)), None),
         None => (
-            read_all(Box::new(child.stdout.take().expect("stdout is piped"))),
-            Some(read_all(Box::new(
+            read_pipe(Box::new(child.stdout.take().expect("stdout is piped"))),
+            Some(read_pipe(Box::new(
                 child.stderr.take().expect("stderr is piped"),
             ))),
         ),
     };
 
-    let deadline = timeout.map(|t| Instant::now() + t);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "`{}` timed out after {} s",
-                cmd.program,
-                timeout.unwrap_or_default().as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    let timed_out = || {
+        anyhow!(
+            "`{}` timed out after {}",
+            cmd.program,
+            format_timeout(timeout.unwrap_or_default())
+        )
     };
+    let Some(status) = wait_within(&mut child, timeout)? else {
+        return Err(timed_out());
+    };
+    // With a timeout, the pipes are read only until the deadline (plus a grace): a
+    // process the CLI left behind holding them open must not hold devy past it.
     Ok(CmdOutput {
         success: status.success(),
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr
-            .map(|s| s.join().unwrap_or_default())
-            .unwrap_or_default(),
+        stdout: recv_pipe(&stdout, deadline).ok_or_else(timed_out)?,
+        stderr: match stderr {
+            Some(rx) => recv_pipe(&rx, deadline).ok_or_else(timed_out)?,
+            None => String::new(),
+        },
     })
 }
 
@@ -447,6 +559,8 @@ pub(crate) struct FileFollower {
     path: PathBuf,
     offset: u64,
     partial: Vec<u8>,
+    /// Whether the last poll's open was refused.
+    refused: bool,
 }
 
 impl FileFollower {
@@ -455,16 +569,28 @@ impl FileFollower {
             path,
             offset,
             partial: Vec::new(),
+            refused: false,
         }
     }
 
     /// Complete lines written since the last poll. At most `MAX_LINE` bytes of a line are
-    /// kept, so a long line without a newline cannot grow memory without bound.
+    /// kept, so a long line without a newline cannot grow memory without bound. The file
+    /// is reopened each poll with the same checks as [`tail_file`] ([`open_log`]), so a
+    /// log replaced by a symlink, or a directory recreated by another user, is refused
+    /// (`InvalidData`). A refusal can be a passing race (a file rotated between the check
+    /// and the open reads as "changed"), so it is returned only when the previous poll
+    /// was refused too; a first one reads as no new lines.
     pub fn poll(&mut self) -> std::io::Result<Vec<String>> {
-        let mut file = match std::fs::File::open(&self.path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(e),
+        let opened = match open_log(&self.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData && !self.refused => {
+                self.refused = true;
+                return Ok(vec![]);
+            }
+            other => other,
+        };
+        self.refused = false;
+        let Some(mut file) = opened? else {
+            return Ok(vec![]);
         };
         let len = file.metadata()?.len();
         if len < self.offset {
@@ -511,7 +637,7 @@ impl FileFollower {
 /// Prints the last lines of every source, then streams new lines until `stop` is set.
 /// With several services each line is prefixed `<name> | `.
 fn follow(
-    sources: &[(&Dependency, LogSource)],
+    sources: &[(&Dependency, Result<LogSource>)],
     single: bool,
     lines: u32,
     out: &mut dyn Write,
@@ -526,14 +652,38 @@ fn follow(
         }
     };
 
+    // Whether a log file was refused, at startup or partway through following.
+    let mut refused = false;
+    // Services whose log source couldn't be found (only with several services).
+    let mut unfollowed: Vec<&str> = Vec::new();
     // Files: print their tails now, then poll from where each tail ended.
     let mut followers: Vec<(String, FileFollower)> = Vec::new();
     for (dep, source) in sources {
+        let source = match source {
+            Ok(source) => source,
+            Err(e) => {
+                info(out, &format!("{}not following: {e:#}", prefix(&dep.name)))?;
+                unfollowed.push(dep.name.as_str());
+                continue;
+            }
+        };
         if let LogSource::Files(paths) = source {
             let mut any = false;
             for path in paths {
-                let (tail, len) = tail_file(path, lines)
-                    .with_context(|| format!("Failed to read {}", path.display()))?;
+                let (tail, len) = match tail_file(path, lines) {
+                    Ok(read) => read,
+                    // With several services, a refused file is noted and not followed.
+                    Err(e) if !single && e.kind() == std::io::ErrorKind::InvalidData => {
+                        any = true;
+                        refused = true;
+                        info(out, &format!("{}not following: {e}", prefix(&dep.name)))?;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("Failed to read {}", path.display()));
+                    }
+                };
                 any |= !tail.is_empty();
                 for line in tail {
                     writeln!(out, "{}{}", prefix(&dep.name), clean_log(&line, tty))?;
@@ -551,14 +701,24 @@ fn follow(
     let done = AtomicBool::new(false);
     let done = &done;
     let result = std::thread::scope(|scope| -> Result<()> {
-        let (tx, rx) = mpsc::channel::<(String, String)>();
+        let (tx, rx) = mpsc::channel::<(String, Followed)>();
 
         for (prefix, mut follower) in followers {
             let tx = tx.clone();
             scope.spawn(move || {
                 while !stop.load(Ordering::SeqCst) && !done.load(Ordering::SeqCst) {
-                    for line in follower.poll().unwrap_or_default() {
-                        if tx.send((prefix.clone(), line)).is_err() {
+                    let lines = match follower.poll() {
+                        Ok(lines) => lines,
+                        // Refused (see `FileFollower::poll`): say so once and stop.
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            let _ = tx.send((prefix.clone(), Followed::Refused(e.to_string())));
+                            return;
+                        }
+                        // Anything else may pass (e.g. the file mid-rotation).
+                        Err(_) => vec![],
+                    };
+                    for line in lines {
+                        if tx.send((prefix.clone(), Followed::Line(line))).is_err() {
                             return;
                         }
                     }
@@ -569,7 +729,7 @@ fn follow(
 
         let streamed = || -> Result<()> {
             for (dep, source) in sources {
-                let LogSource::Command(cmd) = source else {
+                let Ok(LogSource::Command(cmd)) = source else {
                     continue;
                 };
                 let mut child =
@@ -591,7 +751,7 @@ fn follow(
                     scope.spawn(move || {
                         let mut reader = BufReader::new(pipe);
                         while let Some(line) = read_line_lossy(&mut reader) {
-                            if tx.send((prefix.clone(), line)).is_err() {
+                            if tx.send((prefix.clone(), Followed::Line(line))).is_err() {
                                 return;
                             }
                         }
@@ -599,7 +759,8 @@ fn follow(
                 }
             }
             drop(tx);
-            print_until_stopped(&rx, out, stop, tty)
+            refused |= print_until_stopped(&rx, out, stop, tty)?;
+            Ok(())
         };
         let result = streamed();
         // Ends the file pollers and the commands, so their threads finish.
@@ -617,16 +778,48 @@ fn follow(
         return Ok(());
     }
     // Every stream ended on its own: report a log command that failed.
-    let failed = children
+    let failed: Vec<&str> = children
         .iter_mut()
-        .find_map(|(program, child)| match child.try_wait() {
-            Ok(Some(status)) if !status.success() => Some(program.clone()),
+        .filter_map(|(program, child)| match child.try_wait() {
+            Ok(Some(status)) if !status.success() => Some(program.as_str()),
             _ => None,
-        });
-    match failed {
-        Some(program) => Err(anyhow!("`{program}` exited with an error")),
+        })
+        .collect();
+    match follow_error(&failed, &unfollowed, refused) {
+        Some(msg) => Err(anyhow!("{msg}")),
         None => Ok(()),
     }
+}
+
+/// Why following ended badly, once every stream has ended on its own: each log command
+/// that `failed` (once per program), the services never followed, and a log file devy
+/// `refused`, joined into one message. `None` when there is nothing to report.
+fn follow_error(failed: &[&str], unfollowed: &[&str], refused: bool) -> Option<String> {
+    let mut reasons: Vec<String> = Vec::new();
+    for program in failed {
+        let reason = format!("`{program}` exited with an error");
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    if !unfollowed.is_empty() {
+        reasons.push(format!(
+            "Could not follow the logs of {}",
+            unfollowed.join(", ")
+        ));
+    }
+    if refused {
+        reasons.push("Stopped following a log file devy refused to read".to_string());
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+/// What a follower thread reports.
+enum Followed {
+    /// A line of log output.
+    Line(String),
+    /// The file is no longer followed: devy refused to read it (the reason).
+    Refused(String),
 }
 
 /// Longest line kept from a followed log command; the rest of a longer line is dropped.
@@ -672,24 +865,31 @@ fn read_line_lossy(reader: &mut dyn BufRead) -> Option<String> {
     Some(String::from_utf8_lossy(&line).into_owned())
 }
 
-/// Writes received lines until `stop` is set or every sender is gone.
+/// Writes received lines until `stop` is set or every sender is gone; a refused file is
+/// reported as a devy note, not as a log line. Returns whether any file was refused.
 fn print_until_stopped(
-    rx: &mpsc::Receiver<(String, String)>,
+    rx: &mpsc::Receiver<(String, Followed)>,
     out: &mut dyn Write,
     stop: &AtomicBool,
     tty: bool,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut refused = false;
     while !stop.load(Ordering::SeqCst) {
         match rx.recv_timeout(POLL) {
-            Ok((prefix, line)) => {
+            Ok((prefix, Followed::Line(line))) => {
                 writeln!(out, "{prefix}{}", clean_log(&line, tty))?;
+                out.flush()?;
+            }
+            Ok((prefix, Followed::Refused(why))) => {
+                refused = true;
+                info(out, &format!("{prefix}not following: {why}"))?;
                 out.flush()?;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    Ok(())
+    Ok(refused)
 }
 
 #[cfg(test)]
@@ -699,6 +899,7 @@ mod tests {
     use crate::modules::LaunchSpec;
     use crate::package_manager::PackageManager;
     use crate::service_runner::package_runners;
+    use crate::test_support::{private_tmp_dir, tmp_dir};
     use std::collections::HashMap;
 
     /// A backend whose services log to `<dir>/<service name>.log`.
@@ -887,6 +1088,288 @@ mod tests {
         );
     }
 
+    /// A `Write` whose bytes another thread can read while it is being written.
+    #[cfg(unix)]
+    #[derive(Clone, Default)]
+    struct SharedOut(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    #[cfg(unix)]
+    impl Write for SharedOut {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl SharedOut {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// A followed log swapped for a symlink is reported once as a devy note (not as a log
+    /// line), following it stops, and the command fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_swapped_for_a_symlink_while_following_is_reported() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("redis.log");
+        std::fs::write(&path, "first\n").unwrap();
+        std::fs::write(dir.join("secret"), "secret\n").unwrap();
+        let pm = FilesPm {
+            name: "nix",
+            dir: dir.to_path_buf(),
+        };
+        let config = crate::test_support::make_config(&["redis"], HashMap::new());
+        let stop = AtomicBool::new(false);
+        let out = SharedOut::default();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut writer = out.clone();
+        let result = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                logs_impl(
+                    &config,
+                    &dir,
+                    &package_runners(&pm, &dir),
+                    &opts(Some("redis"), 10, true),
+                    &mut writer,
+                    &stop,
+                    false,
+                )
+            });
+            // Swap only once the tail has been printed and following has begun.
+            while !out.text().contains("first\n") && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(dir.join("secret"), &path).unwrap();
+            // The only follower ends on its own; `stop` is a safety net.
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap()
+        });
+        let text = out.text();
+        assert!(text.starts_with("first\n"), "{text}");
+        assert!(
+            text.contains("not following:") && text.contains("is a symlink"),
+            "{text}"
+        );
+        assert!(!text.contains("secret\n"), "{text}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("refused to read"), "{err}");
+    }
+
+    /// A log file (or its directory) another user owns is refused; the open handle's
+    /// owner is what counts, so a file swapped in after the directory check is caught too.
+    #[cfg(unix)]
+    #[test]
+    fn log_files_owned_by_another_user_are_refused() {
+        let other = crate::fs_safe::current_uid() + 1;
+        if crate::fs_safe::current_uid() == 0 {
+            return; // Root-owned files are always trusted.
+        }
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("a.log");
+        std::fs::write(&path, "line\n").unwrap();
+        let file = crate::fs_safe::open_regular_nofollow(&path).unwrap();
+        assert!(check_log_owner(&path, &file).is_ok());
+        let err =
+            crate::fs_safe::with_fake_owner(other, || check_log_owner(&path, &file)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("owned by another user"), "{err}");
+        // Through `tail_file`, the directory check refuses it first.
+        let err = crate::fs_safe::with_fake_owner(other, || tail_file(&path, 10)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("only you or root"), "{err}");
+    }
+
+    /// A refusal seen on only one poll (e.g. a rotation racing the open) doesn't end
+    /// following; the follower picks the file up again.
+    #[cfg(unix)]
+    #[test]
+    fn a_passing_refusal_does_not_stop_following() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("a.log");
+        std::fs::write(&path, "old\n").unwrap();
+        let mut f = FileFollower::new(path.clone(), 4);
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing-target"), &path).unwrap();
+        assert!(f.poll().unwrap().is_empty());
+        std::fs::remove_file(&path).unwrap();
+        // Recreated shorter than what was read, so it is read from the top.
+        std::fs::write(&path, "n\n").unwrap();
+        assert_eq!(f.poll().unwrap(), ["n"]);
+        // Refused on two polls in a row: reported.
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing-target"), &path).unwrap();
+        assert!(f.poll().unwrap().is_empty());
+        let err = f.poll().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// With several services, a refused log file is reported in place, the other
+    /// services' logs are still shown, and the command fails at the end.
+    #[cfg(unix)]
+    #[test]
+    fn one_refused_log_does_not_hide_the_other_services() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("nginx.log"), "nginx up\n").unwrap();
+        std::fs::write(dir.join("secret"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), dir.join("redis.log")).unwrap();
+        let pm = FilesPm {
+            name: "brew",
+            dir: dir.to_path_buf(),
+        };
+        let config = crate::test_support::make_config(&["redis", "nginx"], HashMap::new());
+        let mut out = Vec::new();
+        let err = logs_impl(
+            &config,
+            &dir,
+            &package_runners(&pm, &dir),
+            &opts(None, 10, false),
+            &mut out,
+            &AtomicBool::new(false),
+            false,
+        )
+        .unwrap_err();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("nginx up"), "{out}");
+        assert!(out.contains("is a symlink"), "{out}");
+        assert!(!out.contains("secret\n"), "{out}");
+        assert_eq!(err.to_string(), "Could not read the logs of redis");
+    }
+
+    /// In follow mode, a log file refused when following starts fails the command the
+    /// same way as one refused partway through: with every file refused, there is
+    /// nothing to follow and `devy logs -f` exits with an error rather than 0.
+    #[cfg(unix)]
+    #[test]
+    fn following_fails_when_every_log_is_refused_at_startup() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join("secret"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), dir.join("redis.log")).unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), dir.join("nginx.log")).unwrap();
+        let pm = FilesPm {
+            name: "brew",
+            dir: dir.to_path_buf(),
+        };
+        let config = crate::test_support::make_config(&["redis", "nginx"], HashMap::new());
+        let mut out = Vec::new();
+        let err = logs_impl(
+            &config,
+            &dir,
+            &package_runners(&pm, &dir),
+            &opts(None, 10, true),
+            &mut out,
+            &AtomicBool::new(false),
+            false,
+        )
+        .unwrap_err();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("redis | not following:"), "{out}");
+        assert!(out.contains("nginx | not following:"), "{out}");
+        assert!(!out.contains("secret\n"), "{out}");
+        assert!(err.to_string().contains("refused to read"), "{err}");
+    }
+
+    /// In follow mode, a log file refused at startup is noted while the other services
+    /// are still followed; once the last follower stops on its own the command fails,
+    /// as it does for a file refused partway through.
+    #[cfg(unix)]
+    #[test]
+    fn following_continues_past_a_log_refused_at_startup_then_fails() {
+        let dir = crate::test_support::tmp_dir();
+        let nginx = dir.join("nginx.log");
+        std::fs::write(&nginx, "nginx up\n").unwrap();
+        std::fs::write(dir.join("secret"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret"), dir.join("redis.log")).unwrap();
+        let pm = FilesPm {
+            name: "brew",
+            dir: dir.to_path_buf(),
+        };
+        let config = crate::test_support::make_config(&["redis", "nginx"], HashMap::new());
+        let stop = AtomicBool::new(false);
+        let out = SharedOut::default();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut writer = out.clone();
+        let result = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                logs_impl(
+                    &config,
+                    &dir,
+                    &package_runners(&pm, &dir),
+                    &opts(None, 10, true),
+                    &mut writer,
+                    &stop,
+                    false,
+                )
+            });
+            while !out.text().contains("nginx | nginx up\n") && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&nginx)
+                .unwrap()
+                .write_all(b"nginx later\n")
+                .unwrap();
+            while !out.text().contains("nginx | nginx later\n") && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // End the remaining follower on its own (a refusal partway through).
+            std::fs::remove_file(&nginx).unwrap();
+            std::os::unix::fs::symlink(dir.join("secret"), &nginx).unwrap();
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            stop.store(true, Ordering::SeqCst);
+            handle.join().unwrap()
+        });
+        let text = out.text();
+        assert!(text.contains("redis | not following:"), "{text}");
+        assert!(text.contains("nginx | nginx later\n"), "{text}");
+        assert!(!text.contains("secret\n"), "{text}");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("refused to read"), "{err}");
+    }
+
+    /// A log file's directory must be one only the user (or root) can write to, checked
+    /// at every open, so one created later by someone else is never read from.
+    #[cfg(unix)]
+    #[test]
+    fn log_files_in_a_world_writable_directory_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::test_support::tmp_dir();
+        let dir = base.join("logs");
+        let path = dir.join("a.log");
+        // Missing directory: no lines yet, and nothing is created.
+        let mut f = FileFollower::new(path.clone(), 0);
+        assert!(f.poll().unwrap().is_empty());
+        assert_eq!(tail_file(&path, 10).unwrap(), (vec![], 0));
+        assert!(!dir.exists());
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&path, "line\n").unwrap();
+        for mode in [0o777, 0o773] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = tail_file(&path, 10).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("only you or root"), "{err}");
+            assert!(f.poll().unwrap().is_empty() && f.poll().is_err());
+        }
+        // Sticky (like /tmp) or not writable by others: read.
+        for mode in [0o1777, 0o775, 0o700] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(tail_file(&path, 10).unwrap().0, ["line"]);
+        }
+        assert_eq!(f.poll().unwrap(), ["line"]);
+    }
+
     // ── tail_file ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -979,6 +1462,30 @@ mod tests {
         let mut f = FileFollower::new(path.clone(), numbered(1..=3).len() as u64);
         std::fs::write(&path, "fresh\n").unwrap();
         assert_eq!(f.poll().unwrap(), ["fresh"]);
+    }
+
+    /// Log files are opened without following symlinks and must be regular files, both
+    /// when tailed and on every follow poll.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_or_special_log_files_are_refused() {
+        let dir = crate::test_support::tmp_dir();
+        let target = dir.join("secret");
+        std::fs::write(&target, "secret\n").unwrap();
+        let link = dir.join("a.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = tail_file(&link, 10).unwrap_err();
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        let err = tail_file(&dir, 10).unwrap_err();
+        assert!(err.to_string().contains("is not a regular file"), "{err}");
+        // A followed file later swapped for a symlink is refused (on a second poll).
+        let path = dir.join("b.log");
+        std::fs::write(&path, "old\n").unwrap();
+        let mut f = FileFollower::new(path.clone(), 4);
+        assert!(f.poll().unwrap().is_empty());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(f.poll().unwrap().is_empty() && f.poll().is_err());
     }
 
     #[test]
@@ -1116,6 +1623,39 @@ mod tests {
         assert!(err.to_string().contains("`devy-no-such-log-tool`"), "{err}");
     }
 
+    /// With a timeout, a process the log command leaves behind holding its pipes open
+    /// can't keep `capture` waiting past it, merged (container) or not; without one, a
+    /// command that finishes is read in full.
+    #[cfg(unix)]
+    #[test]
+    fn capture_does_not_wait_on_pipes_held_past_the_timeout() {
+        let sh = |script: &str, kind: LogCommandKind| LogCommand {
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            kind,
+        };
+        for kind in [LogCommandKind::Container, LogCommandKind::UserJournal] {
+            let start = Instant::now();
+            let err = capture(
+                &sh("sleep 5 & echo started", kind.clone()),
+                Some(Duration::from_millis(300)),
+            )
+            .unwrap_err();
+            assert!(
+                start.elapsed() < Duration::from_secs(4),
+                "{:?}",
+                start.elapsed()
+            );
+            assert_eq!(err.to_string(), "`sh` timed out after 300 ms");
+
+            let out = capture(&sh("echo out; echo err >&2", kind.clone()), None).unwrap();
+            assert!(out.success);
+            assert!(out.stdout.contains("out\n"), "{out:?}");
+            let all = format!("{}{}", out.stdout, out.stderr);
+            assert!(all.contains("err\n"), "{out:?}");
+        }
+    }
+
     // ── logs_impl: one service ────────────────────────────────────────────────
 
     #[test]
@@ -1169,6 +1709,194 @@ mod tests {
         assert!(!out.contains("boom"), "contents are not printed: {out}");
         let out = run_logs(&dir, "brew", &["nginx"], &o).unwrap();
         assert!(!out.contains("also see"), "{out}");
+    }
+
+    // ── nix sources ──────────────────────────────────────────────────────────
+
+    /// `devy logs <name>` against the real nix backend, with its launchd agents (when
+    /// `launchd`) or systemd units in `units` and its log files in `logs`.
+    fn nix_logs(root: &Path, launchd: bool, units: &Path, logs: &Path, name: &str) -> String {
+        let pm = crate::package_manager::NixPackageManager::with_test_dirs(
+            root, "app", launchd, units, logs,
+        );
+        let config = crate::test_support::make_config(&[name], HashMap::new());
+        let mut out = Vec::new();
+        logs_impl(
+            &config,
+            root,
+            &package_runners(&pm, root),
+            &opts(Some(name), 10, false),
+            &mut out,
+            &AtomicBool::new(false),
+            false,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// The journal unit `devy logs` reads for `name` under nix with systemd units in `units`.
+    fn nix_journal_unit(root: &Path, units: &Path, name: &str) -> String {
+        let pm = crate::package_manager::NixPackageManager::with_test_dirs(
+            root, "app", false, units, units,
+        );
+        let dep = Dependency::simple(name);
+        let LogSource::Command(cmd) = package_runners(&pm, root)
+            .runner_for(&dep)
+            .log_source(&dep, 10, false)
+            .unwrap()
+        else {
+            panic!("expected a journal command");
+        };
+        assert_eq!(cmd.kind, LogCommandKind::UserJournal);
+        cmd.args[2].clone()
+    }
+
+    #[test]
+    fn nix_on_macos_reads_the_per_project_log_file() {
+        let (root, units, logs) = (tmp_dir(), tmp_dir(), private_tmp_dir());
+        let pm = crate::package_manager::NixPackageManager::with_test_dirs(
+            &root, "app", true, &units, &logs,
+        );
+        let (_, log_file) = pm.unit_and_log_names("redis");
+        assert!(log_file.starts_with("devy-app-") && log_file.ends_with("-redis.log"));
+        std::fs::write(logs.join(&log_file), "per-project\n").unwrap();
+        std::fs::write(logs.join("redis.log"), "legacy\n").unwrap();
+        assert_eq!(
+            nix_logs(&root, true, &units, &logs, "redis"),
+            "per-project\n"
+        );
+    }
+
+    /// The redis data directory of a legacy unit, which makes it `root`'s.
+    fn legacy_data_dir(root: &Path) -> String {
+        modules::nix_data_dir(root, "redis").display().to_string()
+    }
+
+    #[test]
+    fn nix_on_macos_falls_back_to_the_legacy_log_file() {
+        let (root, units, logs) = (tmp_dir(), tmp_dir(), private_tmp_dir());
+        std::fs::write(logs.join("redis.log"), "legacy\n").unwrap();
+        // Only this project's legacy agent makes the shared legacy log file its own.
+        let agent = units.join("sh.devy.redis.plist");
+        let plist = |dir: &str| {
+            format!("<plist><dict><key>WorkingDirectory</key><string>{dir}</string></dict></plist>")
+        };
+        std::fs::write(&agent, plist(&legacy_data_dir(Path::new("/src/other")))).unwrap();
+        assert!(nix_logs(&root, true, &units, &logs, "redis").contains("No logs yet"));
+        std::fs::write(&agent, plist(&legacy_data_dir(&root))).unwrap();
+        assert_eq!(nix_logs(&root, true, &units, &logs, "redis"), "legacy\n");
+    }
+
+    /// `devy logs` against the nix backend with launchd agents, returning the error.
+    #[cfg(unix)]
+    fn nix_logs_err(root: &Path, units: &Path, logs: &Path, name: &str, follow: bool) -> String {
+        let pm = crate::package_manager::NixPackageManager::with_test_dirs(
+            root, "app", true, units, logs,
+        );
+        let config = crate::test_support::make_config(&[name], HashMap::new());
+        let err = logs_impl(
+            &config,
+            root,
+            &package_runners(&pm, root),
+            &opts(Some(name), 10, follow),
+            &mut Vec::new(),
+            &AtomicBool::new(true),
+            false,
+        )
+        .unwrap_err();
+        format!("{err:#}")
+    }
+
+    /// The launchd log directory must be private to the user: one another user owns, or
+    /// that others can write to, is refused (in follow mode too) rather than read.
+    #[cfg(unix)]
+    #[test]
+    fn nix_on_macos_refuses_a_log_dir_that_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, units, logs) = (tmp_dir(), tmp_dir(), private_tmp_dir());
+        let pm = crate::package_manager::NixPackageManager::with_test_dirs(
+            &root, "app", true, &units, &logs,
+        );
+        let (_, log_file) = pm.unit_and_log_names("redis");
+        std::fs::write(logs.join(&log_file), "planted\n").unwrap();
+        let foreign = crate::fs_safe::with_fake_owner(crate::fs_safe::current_uid() + 1, || {
+            nix_logs_err(&root, &units, &logs, "redis", false)
+        });
+        assert!(
+            foreign.contains("refusing to read service logs")
+                && foreign.contains("not owned by the current user"),
+            "{foreign}"
+        );
+        for (mode, follow) in [(0o777, false), (0o770, true), (0o757, false)] {
+            std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = nix_logs_err(&root, &units, &logs, "redis", follow);
+            assert!(err.contains(&format!("has mode {mode:03o}")), "{err}");
+            assert!(!err.contains("planted"), "{err}");
+        }
+        std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(nix_logs(&root, true, &units, &logs, "redis"), "planted\n");
+    }
+
+    /// Before the log directory exists there are no logs, and reading doesn't create it.
+    #[test]
+    fn nix_on_macos_without_a_log_dir_reports_no_logs_and_creates_nothing() {
+        let (root, units, base) = (tmp_dir(), tmp_dir(), tmp_dir());
+        let logs = base.join("devy-logs");
+        let out = nix_logs(&root, true, &units, &logs, "redis");
+        let expected = format!("No logs yet for redis (expected at {}", logs.display());
+        assert!(out.contains(&expected), "{out}");
+        assert!(!logs.exists());
+    }
+
+    /// A launchd log file replaced by a symlink is refused, not followed.
+    #[cfg(unix)]
+    #[test]
+    fn nix_on_macos_refuses_a_symlinked_log_file() {
+        let (root, units, logs, outside) = (tmp_dir(), tmp_dir(), private_tmp_dir(), tmp_dir());
+        let pm = crate::package_manager::NixPackageManager::with_test_dirs(
+            &root, "app", true, &units, &logs,
+        );
+        let (_, log_file) = pm.unit_and_log_names("redis");
+        std::fs::write(outside.join("secret"), "secret\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), logs.join(&log_file)).unwrap();
+        for follow in [false, true] {
+            let err = nix_logs_err(&root, &units, &logs, "redis", follow);
+            assert!(err.contains("is a symlink"), "{err}");
+            assert!(!err.contains("secret\n"), "{err}");
+        }
+    }
+
+    #[test]
+    fn nix_on_linux_reads_the_per_project_unit_journal() {
+        let (root, units) = (tmp_dir(), tmp_dir());
+        let pm = crate::package_manager::NixPackageManager::with_test_dirs(
+            &root, "app", false, &units, &units,
+        );
+        let (unit, _) = pm.unit_and_log_names("redis");
+        assert!(unit.starts_with("devy-app-") && unit.ends_with("-redis.service"));
+        assert_eq!(nix_journal_unit(&root, &units, "redis"), unit);
+        // With both units present, the per-project one is read.
+        std::fs::write(units.join("devy-redis.service"), "").unwrap();
+        std::fs::write(units.join(&unit), "").unwrap();
+        assert_eq!(nix_journal_unit(&root, &units, "redis"), unit);
+    }
+
+    #[test]
+    fn nix_on_linux_falls_back_to_the_legacy_unit_journal() {
+        let (root, units) = (tmp_dir(), tmp_dir());
+        let unit = |dir: &str| format!("[Service]\nWorkingDirectory={dir}\n");
+        let path = units.join("devy-redis.service");
+        std::fs::write(&path, unit(&legacy_data_dir(Path::new("/src/other")))).unwrap();
+        assert_ne!(
+            nix_journal_unit(&root, &units, "redis"),
+            "devy-redis.service",
+            "another project's legacy unit is not read"
+        );
+        std::fs::write(&path, unit(&legacy_data_dir(&root))).unwrap();
+        assert_eq!(
+            nix_journal_unit(&root, &units, "redis"),
+            "devy-redis.service"
+        );
     }
 
     #[test]
@@ -1308,5 +2036,329 @@ mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "r1\n");
+    }
+
+    // ── a docker service whose container can't be checked ───────────────────────
+
+    use crate::service_runner::docker::{
+        CmdOutput as DockerOutput, FakeRunner, fail as docker_fail, ok as docker_ok,
+    };
+
+    /// redis runs in docker, nginx through the package manager (logging to `<dir>`).
+    const MIXED: &str =
+        "name: app\ndependencies:\n  - redis: { service_manager: docker }\n  - nginx\n";
+
+    /// `container inspect` refused by an unreachable daemon, with a hostile escape.
+    fn daemon_down() -> DockerOutput {
+        docker_fail(
+            "Cannot connect to the Docker daemon\x1b]52;c;ZWNobyBoaQ==\x07 at unix:///x.sock",
+        )
+    }
+
+    /// `container inspect` of a container another project created.
+    fn other_projects_container() -> DockerOutput {
+        let labels = serde_json::json!({ crate::service_runner::PROJECT_LABEL: "/src/evil" });
+        docker_ok(
+            &serde_json::json!({"State": {"Running": true}, "Config": {"Labels": labels}})
+                .to_string(),
+        )
+    }
+
+    /// Runs `logs_impl` for [`MIXED`] with the container CLI answering `inspect`.
+    fn run_mixed(
+        dir: &Path,
+        inspect: fn() -> DockerOutput,
+        o: &Options,
+        out: &mut dyn Write,
+        stop: &AtomicBool,
+    ) -> Result<()> {
+        let config: DevyConfig = serde_norway::from_str(MIXED).unwrap();
+        let pm = FilesPm {
+            name: "brew",
+            dir: dir.to_path_buf(),
+        };
+        let fake = FakeRunner::new(move |call| {
+            assert_eq!(call[1..3], ["container", "inspect"], "only the owner check");
+            inspect()
+        });
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &fake),
+            &config,
+            dir,
+            None,
+            false,
+        );
+        logs_impl(&config, dir, &runners, o, out, stop, false)
+    }
+
+    /// With several services, a docker service whose container can't be checked (the
+    /// daemon is down, or the container is another project's) is noted in place, the
+    /// other services are still shown, and the command fails at the end.
+    #[test]
+    fn a_docker_service_that_cannot_be_checked_does_not_hide_the_others() {
+        for (inspect, expected) in [
+            (
+                daemon_down as fn() -> DockerOutput,
+                "Cannot connect to the Docker daemon",
+            ),
+            (other_projects_container, "belongs to another project"),
+        ] {
+            let dir = crate::test_support::tmp_dir();
+            std::fs::write(dir.join("nginx.log"), "nginx up\n").unwrap();
+            let mut out = Vec::new();
+            let err = run_mixed(
+                &dir,
+                inspect,
+                &opts(None, 10, false),
+                &mut out,
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("redis"), "{out}");
+            assert!(out.contains(expected), "{out}");
+            assert!(out.contains("nginx up\n"), "{out}");
+            assert!(!out.contains('\x1b') && !out.contains('\x07'), "{out:?}");
+            assert_eq!(err.to_string(), "Could not read the logs of redis");
+        }
+    }
+
+    /// With no container, `devy logs` (with or without follow) and `recent` report no
+    /// logs yet without running `<cli> logs` (by name) at all: `run_mixed` allows only
+    /// the owner check.
+    #[test]
+    fn a_docker_service_without_a_container_has_no_logs_yet() {
+        let no_container = || docker_fail("Error: No such container: devy-app-redis");
+        for follow in [false, true] {
+            let dir = crate::test_support::tmp_dir();
+            let mut out = Vec::new();
+            run_mixed(
+                &dir,
+                no_container,
+                &opts(Some("redis"), 10, follow),
+                &mut out,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("No logs yet for redis"), "{out}");
+        }
+
+        let config: DevyConfig = serde_norway::from_str(MIXED).unwrap();
+        let dir = crate::test_support::tmp_dir();
+        let pm = FilesPm {
+            name: "brew",
+            dir: dir.to_path_buf(),
+        };
+        let fake = FakeRunner::new(move |call| {
+            assert_eq!(call[1..3], ["container", "inspect"], "only the owner check");
+            no_container()
+        });
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &fake),
+            &config,
+            &dir,
+            None,
+            false,
+        );
+        let deps = config.normalized_dependencies().unwrap();
+        let redis = deps.iter().find(|d| d.name == "redis").unwrap();
+        let tail = recent(
+            runners.runner_for(redis),
+            redis,
+            &dir,
+            10,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(tail, Tail::Empty);
+    }
+
+    /// With one service, a container that can't be checked is the command's error.
+    #[test]
+    fn one_docker_service_that_cannot_be_checked_fails_immediately() {
+        let dir = crate::test_support::tmp_dir();
+        let mut out = Vec::new();
+        let err = run_mixed(
+            &dir,
+            other_projects_container,
+            &opts(Some("redis"), 10, false),
+            &mut out,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(out.is_empty(), "{:?}", String::from_utf8_lossy(&out));
+        assert!(
+            err.to_string().contains("belongs to another project"),
+            "{err}"
+        );
+    }
+
+    /// `recent` (doctor, ask) is bounded by its timeout even when the container owner
+    /// check never answers: the hung CLI is killed and the error names it.
+    #[cfg(unix)]
+    #[test]
+    fn recent_times_out_when_the_owner_check_hangs() {
+        let config: DevyConfig = serde_norway::from_str(MIXED).unwrap();
+        let dir = crate::test_support::tmp_dir();
+        let pm = FilesPm {
+            name: "brew",
+            dir: dir.to_path_buf(),
+        };
+        let hanging = crate::service_runner::docker::HangingRunner;
+        let runners = Runners::new(
+            &pm,
+            ContainerRuntime::new(config.container_cli, &hanging),
+            &config,
+            &dir,
+            None,
+            false,
+        );
+        let deps = config.normalized_dependencies().unwrap();
+        let redis = deps.iter().find(|d| d.name == "redis").unwrap();
+        let start = Instant::now();
+        let err = recent(
+            runners.runner_for(redis),
+            redis,
+            &dir,
+            10,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(
+            err.to_string().contains("`docker` did not answer within"),
+            "{err:#}"
+        );
+    }
+
+    /// In follow mode, a docker service whose container can't be checked is noted while
+    /// the others are still followed; once they stop on their own the command fails.
+    #[cfg(unix)]
+    #[test]
+    fn following_continues_past_a_docker_service_that_cannot_be_checked() {
+        for (inspect, expected) in [
+            (
+                daemon_down as fn() -> DockerOutput,
+                "Cannot connect to the Docker daemon",
+            ),
+            (other_projects_container, "belongs to another project"),
+        ] {
+            let dir = crate::test_support::tmp_dir();
+            let nginx = dir.join("nginx.log");
+            std::fs::write(&nginx, "nginx up\n").unwrap();
+            std::fs::write(dir.join("secret"), "secret\n").unwrap();
+            let stop = AtomicBool::new(false);
+            let out = SharedOut::default();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut writer = out.clone();
+            let result = std::thread::scope(|scope| {
+                let handle = scope
+                    .spawn(|| run_mixed(&dir, inspect, &opts(None, 10, true), &mut writer, &stop));
+                while !out.text().contains("nginx | nginx up\n") && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&nginx)
+                    .unwrap()
+                    .write_all(b"nginx later\n")
+                    .unwrap();
+                while !out.text().contains("nginx | nginx later\n") && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // End the remaining follower on its own.
+                std::fs::remove_file(&nginx).unwrap();
+                std::os::unix::fs::symlink(dir.join("secret"), &nginx).unwrap();
+                while !handle.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                stop.store(true, Ordering::SeqCst);
+                handle.join().unwrap()
+            });
+            let text = out.text();
+            assert!(text.contains("redis | not following:"), "{text}");
+            assert!(text.contains(expected), "{text}");
+            assert!(text.contains("nginx | nginx later\n"), "{text}");
+            assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text:?}");
+            // nginx was refused too (swapped for a symlink): both reasons are reported.
+            let err = result.unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "Could not follow the logs of redis; \
+                 Stopped following a log file devy refused to read"
+            );
+        }
+    }
+
+    #[test]
+    fn follow_error_reports_every_reason() {
+        assert_eq!(follow_error(&[], &[], false), None);
+        assert_eq!(
+            follow_error(&["docker"], &[], false).as_deref(),
+            Some("`docker` exited with an error")
+        );
+        assert_eq!(
+            follow_error(&[], &["redis", "minio"], false).as_deref(),
+            Some("Could not follow the logs of redis, minio")
+        );
+        assert_eq!(
+            follow_error(&[], &[], true).as_deref(),
+            Some("Stopped following a log file devy refused to read")
+        );
+        assert_eq!(
+            follow_error(&["docker", "journalctl", "docker"], &["redis"], true).as_deref(),
+            Some(
+                "`docker` exited with an error; `journalctl` exited with an error; \
+                 Could not follow the logs of redis; \
+                 Stopped following a log file devy refused to read"
+            )
+        );
+    }
+
+    /// A multi-line error (e.g. a CLI's stderr) noted for one service keeps its later
+    /// lines indented under the note, so they can't pass for a `<name> | ` log line or a
+    /// service header.
+    #[test]
+    fn multi_line_service_errors_stay_inside_their_note() {
+        let mut out = Vec::new();
+        info(&mut out, "first\nnginx | forged\n\nredis\n").unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.ends_with(" first\n    nginx | forged\n    \n    redis\n"),
+            "{out:?}"
+        );
+
+        fn forged() -> DockerOutput {
+            docker_fail("Cannot connect to the Docker daemon\nnginx | forged line\nredis")
+        }
+        for follow in [false, true] {
+            let dir = crate::test_support::tmp_dir();
+            let mut out = Vec::new();
+            // When following, stop at once: the note is printed before following starts.
+            let result = run_mixed(
+                &dir,
+                forged,
+                &opts(None, 10, follow),
+                &mut out,
+                &AtomicBool::new(follow),
+            );
+            assert_eq!(result.is_err(), !follow, "{result:?}");
+            let out = String::from_utf8(out).unwrap();
+            assert!(
+                out.contains("\n    nginx | forged line\n    redis\n"),
+                "{out}"
+            );
+            assert!(
+                !out.lines().any(|l| l.starts_with("nginx | forged")),
+                "{out}"
+            );
+        }
     }
 }

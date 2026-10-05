@@ -160,7 +160,7 @@ mod tests {
         };
         crate::commands::ports::resolve_ports(
             &mut deps,
-            None,
+            crate::commands::ports::PortSource::Lock(None),
             &pm,
             crate::commands::ports::PortMode::ReadOnly,
         )
