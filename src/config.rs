@@ -557,6 +557,60 @@ fn owned_by_current_user(_path: &Path) -> bool {
     true
 }
 
+/// Whether `root`, a project root recorded in a unit or container label, is a removed
+/// checkout, so it has no `devy.yml`: an absolute path that no longer exists (not even as
+/// a symlink) in a parent directory that does. Kept, so `devy prune` never removes a live
+/// project's resources on a guess:
+/// - a relative path;
+/// - a root whose parent is missing (an unmounted volume, or a path from another machine
+///   sharing a container daemon) or can't be checked;
+/// - a root whose parent is an empty `/etc/fstab` mount target: the mountpoint of an
+///   unmounted volume, which (unlike macOS's `/Volumes/<name>`) stays behind;
+/// - a root directory that still exists without a `devy.yml` (a branch that predates it);
+/// - a root holding U+FFFD, which may be the lossy rendering of a path that isn't UTF-8,
+///   so its absence proves nothing about the real path.
+pub(crate) fn is_removed_checkout(root: &str) -> bool {
+    let fstab = if cfg!(target_os = "linux") {
+        std::fs::read_to_string("/etc/fstab").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    is_removed_checkout_with(root, &fstab)
+}
+
+/// `is_removed_checkout` with the contents of `/etc/fstab` injected.
+fn is_removed_checkout_with(root: &str, fstab: &str) -> bool {
+    if root.contains(char::REPLACEMENT_CHARACTER) {
+        return false;
+    }
+    let root = Path::new(root);
+    let Some(parent) = root.parent().filter(|_| root.is_absolute()) else {
+        return false;
+    };
+    let unmounted_mountpoint = || {
+        fstab
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .any(|target| {
+                // fstab writes a space, tab, newline or backslash in a path as an octal escape.
+                let target = target
+                    .replace("\\040", " ")
+                    .replace("\\011", "\t")
+                    .replace("\\012", "\n")
+                    .replace("\\134", "\\");
+                Path::new(&target) == parent
+            })
+            && std::fs::read_dir(parent).is_ok_and(|mut entries| entries.next().is_none())
+    };
+    parent.is_dir()
+        && !unmounted_mountpoint()
+        && matches!(
+            std::fs::symlink_metadata(root),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+}
+
 /// Rejects an `image` that isn't a plain `[registry/]repository[:tag]`. It is passed to
 /// the container CLI as an argument, where a value starting with `-` would read as a flag.
 fn validate_image(dep: &str, image: &str) -> Result<()> {
@@ -576,6 +630,79 @@ mod tests {
 
     fn tmp_dir() -> crate::test_support::TempDir {
         crate::test_support::tmp_dir()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lossy_root_is_never_a_removed_checkout() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = tmp_dir();
+        // A live project at a non-UTF-8 path, recorded lossily: the lossy path doesn't
+        // exist, but the project does. Best-effort: macOS (APFS) refuses such names,
+        // and the lossy path is missing from an existing parent either way.
+        let live = base.join(std::ffi::OsStr::from_bytes(b"app-\xff"));
+        if std::fs::create_dir(&live).is_ok() {
+            std::fs::write(live.join("devy.yml"), "name: app\n").unwrap();
+        }
+        let lossy = live.to_string_lossy();
+        assert!(lossy.contains(char::REPLACEMENT_CHARACTER));
+        assert!(!is_removed_checkout(&lossy));
+        // A genuinely missing root that merely contains U+FFFD is kept too.
+        assert!(!is_removed_checkout(
+            base.join("gone-\u{FFFD}").to_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn is_removed_checkout_needs_an_absolute_root_without_devy_yml() {
+        let live = tmp_dir();
+        std::fs::write(live.join("devy.yml"), "name: app\n").unwrap();
+        assert!(!is_removed_checkout(live.to_str().unwrap()));
+        assert!(is_removed_checkout(live.join("gone").to_str().unwrap()));
+        // A missing parent (an unmounted volume, another machine's path) is not removed.
+        let unmounted = live.join("no-such-volume").join("app");
+        assert!(!is_removed_checkout(unmounted.to_str().unwrap()));
+        // Nor is one under the empty mountpoint of an unmounted fstab volume.
+        let mountpoint = live.join("mnt");
+        std::fs::create_dir(&mountpoint).unwrap();
+        let app = mountpoint.join("app");
+        let app = app.to_str().unwrap();
+        let fstab = format!(
+            "# comment\nUUID=1 {} ext4 defaults 0 2\n",
+            mountpoint.display()
+        );
+        assert!(!is_removed_checkout_with(app, &fstab));
+        // An empty directory that's no mount target, e.g. a worktrees directory whose only
+        // worktree was removed, is just a parent.
+        assert!(is_removed_checkout_with(
+            app,
+            "UUID=1 /data ext4 defaults 0 2\n"
+        ));
+        assert!(is_removed_checkout_with(
+            app,
+            &format!("# UUID=1 {} ext4", mountpoint.display())
+        ));
+        // fstab's octal escapes are decoded.
+        let spaced = live.join("my disk");
+        std::fs::create_dir(&spaced).unwrap();
+        let escaped = format!(
+            "UUID=2 {} ext4 defaults 0 2\n",
+            spaced.display().to_string().replace(' ', "\\040")
+        );
+        let spaced_app = spaced.join("app");
+        assert!(!is_removed_checkout_with(
+            spaced_app.to_str().unwrap(),
+            &escaped
+        ));
+        // A mounted (non-empty) fstab target is an ordinary parent.
+        std::fs::write(mountpoint.join("other"), "").unwrap();
+        assert!(is_removed_checkout_with(app, &fstab));
+        // A checkout on a branch without a devy.yml still exists.
+        let branch = live.join("old-branch");
+        std::fs::create_dir(&branch).unwrap();
+        assert!(!is_removed_checkout(branch.to_str().unwrap()));
+        assert!(!is_removed_checkout("relative/root"));
+        assert!(!is_removed_checkout(""));
     }
 
     // ── DevyCommand::from ─────────────────────────────────────────────────────

@@ -267,7 +267,7 @@ impl Module for MinioModule {
             PortMode::ReadOnly => recorded_console_port(&data_dir, main),
             // Refuses a symlinked component, like `nix_launch_for`, so a repository can't
             // redirect the port file out of the project.
-            PortMode::Assign => crate::fs_safe::ensure_dir_in(project_root, &data_dir)
+            PortMode::Assign => crate::fs_safe::ensure_devy_subdir(project_root, &data_dir)
                 .and_then(|()| launch_console_port(dep, &data_dir))
                 .inspect_err(|e| {
                     crate::output::warn(&format!(

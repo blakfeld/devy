@@ -37,12 +37,12 @@ pub(crate) fn project_environment(
     // PATH, so a repository that commits `.venv/bin/sudo` (or symlinks the profile
     // elsewhere) would choose what runs. Every consumer gets the same check as `up`.
     crate::fs_safe::check_managed_paths(project_root, &crate::modules::managed_venvs(&normalized))?;
-    let lock = ports::load_lock(project_root)?;
+    let recorded = ports::RecordedPorts::load(project_root)?;
     let mut deps: Vec<_> = normalized
         .iter()
-        .map(|dep| apply_lock_from_source(dep, lock.as_ref(), pm))
+        .map(|dep| apply_lock_from_source(dep, recorded.lock(), pm))
         .collect();
-    ports::resolve_ports(&mut deps, lock.as_ref(), pm, PortMode::ReadOnly)?;
+    ports::resolve_ports(&mut deps, recorded.source(), pm, PortMode::ReadOnly)?;
     Ok(project_env::resolve(
         config,
         &deps,

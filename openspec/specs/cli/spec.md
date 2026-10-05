@@ -6,12 +6,12 @@ Defines the `devy` command-line surface: the built-in subcommands, how user-defi
 ## Requirements
 
 ### Requirement: Built-in subcommands
-The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`, `stop`, `restart`, `down`, `status`, `check`, `doctor`, `hook`, `pr`, `export`, `logs`, `ask`, `exec` and `agent-setup`, plus the hidden `_commands` and `_services` subcommands used by shell completion, and `--help` SHALL list the visible ones.
+The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`, `stop`, `restart`, `down`, `status`, `check`, `doctor`, `hook`, `pr`, `export`, `logs`, `ask`, `exec`, `agent-setup` and `prune`, plus the hidden `_commands` and `_services` subcommands used by shell completion, and `--help` SHALL list the visible ones.
 
 #### Scenario: Help lists core subcommands
 - **WHEN** the user runs `devy --help`
 - **THEN** the process exits 0
-- **AND** the output lists `up`, `down`, `check`, `doctor`, `init`, `hook`, `status`, `logs`, `ask`, `exec` and `agent-setup`
+- **AND** the output lists `up`, `down`, `check`, `doctor`, `init`, `hook`, `status`, `logs`, `ask`, `exec`, `agent-setup` and `prune`
 - **AND** the output does not list `allow`
 
 #### Scenario: Hidden subcommand is not advertised
@@ -38,6 +38,10 @@ The CLI SHALL provide the built-in subcommands `up`, `init`, `services`, `start`
 #### Scenario: Built-in exec shadows project command
 - **WHEN** `devy.yml` defines a project command named `exec` and the user runs `devy exec env`
 - **THEN** the built-in `exec` subcommand runs `env` with the project environment
+
+#### Scenario: Prune runs without a devy.yml
+- **WHEN** the user runs `devy prune` in a directory with no `devy.yml` above it
+- **THEN** devy runs the prune command rather than failing to find a config
 
 ### Requirement: Unknown subcommands dispatch to project commands
 The CLI SHALL treat any subcommand that is not built in as the name of a project command from `devy.yml`, passing any remaining arguments through to it, and built-in names SHALL take precedence over project commands of the same name.

@@ -29,14 +29,20 @@ fn docker_runner<'a>(
     update: bool,
 ) -> DockerRunner<'a> {
     let config = config(yaml);
-    DockerRunner::new(
+    let mut runner = DockerRunner::new(
         ContainerRuntime::new(config.container_cli, fake),
         &config,
         Path::new(ROOT),
         lock,
         update,
-    )
+    );
+    // Pinned, so the tests don't depend on (or fail without) this machine's id.
+    runner.set_host(Some(TEST_HOST));
+    runner
 }
+
+/// The host id the tests run as.
+const TEST_HOST: &str = "0123456789abcdef";
 
 fn slug() -> String {
     modules::helpers::project_slug("app", Path::new(ROOT))
@@ -328,9 +334,72 @@ fn start_creates_missing_container() {
             format!(
                 "docker run -d --name {name} --hostname redis \
                  --label sh.devy.project={ROOT} --label sh.devy.service=redis \
-                 --label sh.devy.config={hash} -p 127.0.0.1:51000:6379 \
-                 -v {name}:/data redis:7"
+                 --label sh.devy.host={host} --label sh.devy.config={hash} \
+                 -p 127.0.0.1:51000:6379 -v {name}:/data redis:7",
+                host = TEST_HOST,
             ),
+        ]
+    );
+}
+
+#[test]
+fn the_host_label_does_not_change_the_config_hash() {
+    let fake = FakeRunner::ok();
+    let run = docker_runner(&fake, "name: app\n", None, false)
+        .run_spec(&docker_dep("redis", Some(51000)))
+        .unwrap();
+    assert!(
+        run.labels
+            .contains(&(HOST_LABEL.to_string(), TEST_HOST.to_string())),
+        "{:?}",
+        run.labels
+    );
+    let mut other_host = run.clone();
+    for (k, v) in &mut other_host.labels {
+        if k == HOST_LABEL {
+            *v = "0000000000000000".into();
+        }
+    }
+    assert_eq!(config_hash(&run), config_hash(&other_host));
+}
+
+#[test]
+fn containers_without_the_host_label_are_still_this_projects() {
+    // Created by an older devy: same project and config, but no `sh.devy.host`.
+    let fake_for_spec = FakeRunner::ok();
+    let dep = docker_dep("redis", Some(51000));
+    let labels: Vec<(String, String)> = docker_runner(&fake_for_spec, "name: app\n", None, false)
+        .run_spec(&dep)
+        .unwrap()
+        .labels
+        .into_iter()
+        .filter(|(k, _)| k != HOST_LABEL)
+        .collect();
+    let state = inspect_json(true, &labels);
+    let fake = FakeRunner::new(move |call| {
+        if call[1] == "container" {
+            ok(&state)
+        } else {
+            ok("")
+        }
+    });
+    let runner = docker_runner(&fake, "name: app\n", None, false);
+    // Running with the same config: reused, not recreated.
+    runner.start(&dep).unwrap();
+    runner.stop(&dep).unwrap();
+    assert!(runner.remove(&dep, true).unwrap());
+    let name = format!("devy-{}-redis", slug());
+    let acting: Vec<String> = fake
+        .lines()
+        .into_iter()
+        .filter(|l| !l.contains("container inspect"))
+        .collect();
+    assert_eq!(
+        acting,
+        [
+            format!("docker stop {name}"),
+            format!("docker rm -f {name}"),
+            format!("docker volume rm {name}"),
         ]
     );
 }
@@ -484,6 +553,36 @@ fn start_refuses_container_from_another_project() {
             "only the inspect: no start, rm or run"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_project_root_runs_no_container() {
+    use std::os::unix::ffi::OsStrExt;
+    let config = config("name: app\n");
+    let root = Path::new(std::ffi::OsStr::from_bytes(b"/src/app-\xff"));
+    // Even a container labeled with the lossy rendering of the root isn't this project's.
+    let lossy = vec![(
+        PROJECT_LABEL.to_string(),
+        root.to_string_lossy().into_owned(),
+    )];
+    let state = inspect_json(true, &lossy);
+    let fake = FakeRunner::new(move |_| ok(&state));
+    let runner = DockerRunner::new(
+        ContainerRuntime::new(config.container_cli, &fake),
+        &config,
+        root,
+        None,
+        false,
+    );
+    let dep = docker_dep("redis", Some(51000));
+    let err = runner.run_spec(&dep).unwrap_err();
+    assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    let err = runner.start(&dep).unwrap_err();
+    assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    assert!(fake.lines().is_empty(), "{:?}", fake.lines());
+    assert!(!runner.is_running(&dep).unwrap());
+    assert!(runner.stop(&dep).is_err());
 }
 
 #[test]
@@ -787,6 +886,165 @@ fn stop_refuses_and_remove_skips_container_from_another_project() {
     );
 }
 
+/// The labels of the container `run_spec` creates for redis, with `sh.devy.host` set to
+/// `host` (or removed).
+fn redis_labels_on(host: Option<&str>) -> Vec<(String, String)> {
+    let fake = FakeRunner::ok();
+    let mut labels: Vec<(String, String)> = docker_runner(&fake, "name: app\n", None, false)
+        .run_spec(&docker_dep("redis", Some(51000)))
+        .unwrap()
+        .labels
+        .into_iter()
+        .filter(|(k, _)| k != HOST_LABEL)
+        .collect();
+    if let Some(h) = host {
+        labels.push((HOST_LABEL.to_string(), h.to_string()));
+    }
+    labels
+}
+
+/// Runs start, stop and remove against a running redis container labeled with `labels`,
+/// as the machine with host id `host`; returns the errors of start and stop, the
+/// warnings of remove, and the CLI calls.
+fn act_on(
+    labels: Vec<(String, String)>,
+    host: Option<&'static str>,
+) -> (Result<()>, Result<()>, bool, Vec<String>, Vec<String>) {
+    let state = inspect_json(true, &labels);
+    let fake = FakeRunner::new(move |call| {
+        if call[1] == "container" {
+            ok(&state)
+        } else {
+            ok("")
+        }
+    });
+    let mut runner = docker_runner(&fake, "name: app\n", None, false);
+    runner.set_host(host);
+    let dep = docker_dep("redis", Some(51000));
+    let start = runner.start(&dep);
+    let stop = runner.stop(&dep);
+    let running = runner.is_running(&dep).unwrap();
+    let mut removed = false;
+    let warnings = crate::output::with_warn_messages(|| {
+        removed = runner.remove(&dep, false).unwrap();
+    });
+    let acting = fake
+        .lines()
+        .into_iter()
+        .filter(|l| !l.contains("container inspect"))
+        .collect();
+    assert_eq!(removed, start.is_ok(), "remove agrees with start");
+    (start, stop, running, warnings, acting)
+}
+
+#[test]
+fn start_stop_and_remove_refuse_another_hosts_container() {
+    let name = format!("devy-{}-redis", slug());
+    let (start, stop, running, warnings, acting) =
+        act_on(redis_labels_on(Some("ffffffffffffffff")), Some(TEST_HOST));
+    for err in [start.unwrap_err(), stop.unwrap_err()] {
+        let err = err.to_string();
+        assert!(
+            err.starts_with(&format!(
+                "container {name} belongs to another machine or user sharing this container daemon"
+            )),
+            "{err}"
+        );
+        // How to recover when it's really this user's, from before the id changed.
+        assert!(
+            err.contains(&format!("remove it with `docker rm -f {name}`")),
+            "{err}"
+        );
+    }
+    // Not this service running, so `down` skips stopping it.
+    assert!(!running);
+    assert!(
+        warnings[0].contains("belongs to another machine or user"),
+        "{warnings:?}"
+    );
+    assert!(acting.is_empty(), "only inspects: {acting:?}");
+}
+
+#[test]
+fn a_machine_without_an_id_refuses_labeled_containers() {
+    let (start, stop, running, warnings, acting) = act_on(redis_labels_on(Some(TEST_HOST)), None);
+    for err in [start.unwrap_err(), stop.unwrap_err()] {
+        let err = err.to_string();
+        assert!(
+            err.contains(
+                "devy can't identify this machine (under WSL, run devy from a wsl.exe session)"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("docker rm -f"), "{err}");
+    }
+    assert!(!running);
+    assert!(
+        warnings[0].contains("devy can't identify this machine"),
+        "{warnings:?}"
+    );
+    assert!(acting.is_empty(), "only inspects: {acting:?}");
+}
+
+#[test]
+fn same_host_and_unlabelled_containers_are_this_projects() {
+    let name = format!("devy-{}-redis", slug());
+    for (labels, host) in [
+        (redis_labels_on(Some(TEST_HOST)), Some(TEST_HOST)),
+        (redis_labels_on(None), Some(TEST_HOST)),
+        // A container without the label is the project's even without an id.
+        (redis_labels_on(None), None),
+    ] {
+        let (start, stop, running, warnings, acting) = act_on(labels, host);
+        start.unwrap();
+        stop.unwrap();
+        assert!(running);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            acting,
+            [
+                format!("docker stop {name}"),
+                format!("docker rm -f {name}")
+            ]
+        );
+    }
+}
+
+#[test]
+fn foreign_owner_rules() {
+    let state = docker::ContainerState {
+        id: String::new(),
+        running: true,
+        labels: [
+            (PROJECT_LABEL.to_string(), ROOT.to_string()),
+            (HOST_LABEL.to_string(), TEST_HOST.to_string()),
+        ]
+        .into(),
+        volumes: Vec::new(),
+    };
+    let root = Path::new(ROOT);
+    assert_eq!(foreign_owner_for(root, Some(TEST_HOST), &state), None);
+    assert_eq!(
+        foreign_owner_for(root, Some("ffffffffffffffff"), &state),
+        Some(Foreign::Host)
+    );
+    assert_eq!(
+        foreign_owner_for(root, None, &state),
+        Some(Foreign::Unidentified)
+    );
+    // Without the label, ownership is by project alone, with or without an id.
+    let mut unlabelled = state.clone();
+    unlabelled.labels.remove(HOST_LABEL);
+    assert_eq!(foreign_owner_for(root, None, &unlabelled), None);
+    assert_eq!(foreign_owner_for(root, Some(TEST_HOST), &unlabelled), None);
+    // The project label decides first.
+    assert_eq!(
+        foreign_owner_for(Path::new("/src/other"), Some(TEST_HOST), &state),
+        Some(Foreign::Project)
+    );
+    assert_eq!(Foreign::Project.describe(), "another project");
+}
+
 #[test]
 fn docker_warnings_only_for_docker_managed() {
     let mut kafka = Dependency::simple("kafka");
@@ -801,13 +1059,17 @@ fn docker_logs_tail_the_container() {
         ("name: app\n", "docker"),
         ("name: app\ncontainer_cli: podman\n", "podman"),
     ] {
-        let fake = FakeRunner::ok();
-        let runner = docker_runner(&fake, yaml, None, false);
+        let mut state: serde_json::Value =
+            serde_json::from_str(&inspect_json(true, &redis_labels_on(Some(TEST_HOST)))).unwrap();
+        state["Id"] = "4f1c9e0a".into();
+        let state = state.to_string();
+        let fake = FakeRunner::new(move |_| ok(&state));
+        let mut runner = docker_runner(&fake, yaml, None, false);
+        runner.set_host(Some(TEST_HOST));
         let dep = docker_dep("redis", None);
-        let name = format!("devy-{}-redis", slug());
         for (follow, expected) in [
-            (false, vec!["logs", "--tail", "50", name.as_str()]),
-            (true, vec!["logs", "--tail", "50", "-f", name.as_str()]),
+            (false, vec!["logs", "--tail", "50", "4f1c9e0a"]),
+            (true, vec!["logs", "--tail", "50", "-f", "4f1c9e0a"]),
         ] {
             let LogSource::Command(cmd) = runner.log_source(&dep, 50, follow).unwrap() else {
                 panic!("expected a command");
@@ -816,7 +1078,103 @@ fn docker_logs_tail_the_container() {
             assert_eq!(cmd.args, expected);
             assert_eq!(cmd.kind, LogCommandKind::Container);
         }
-        assert!(fake.lines().is_empty(), "building the command runs nothing");
+        assert!(
+            fake.lines().iter().all(|l| l.contains("container inspect")),
+            "building the command only checks the owner: {:?}",
+            fake.lines()
+        );
+    }
+}
+
+/// With no container there is nothing to read, and the CLI is never run by name (a
+/// container created under it after the check could be someone else's).
+#[test]
+fn docker_logs_without_a_container_are_empty() {
+    let fake = FakeRunner::new(|call| {
+        if call[1] == "container" {
+            fail("No such container")
+        } else {
+            ok("")
+        }
+    });
+    let runner = docker_runner(&fake, "name: app\n", None, false);
+    let dep = docker_dep("redis", None);
+    for follow in [false, true] {
+        assert_eq!(
+            runner.log_source(&dep, 50, follow).unwrap(),
+            LogSource::Files(vec![])
+        );
+    }
+    assert_eq!(
+        runner
+            .log_source_within(&dep, 50, std::time::Duration::from_secs(5))
+            .unwrap(),
+        LogSource::Files(vec![])
+    );
+    assert!(
+        fake.lines().iter().all(|l| l.contains("container inspect")),
+        "{:?}",
+        fake.lines()
+    );
+}
+
+#[test]
+fn docker_logs_read_the_checked_container_by_id() {
+    let name = format!("devy-{}-redis", slug());
+    // A hex ID is used; anything else (a CLI that reports none, or one that could read
+    // as a flag) is an error, never a fall back to the name.
+    for (id, target) in [("4f1c9e0a", Some("4f1c9e0a")), ("", None), ("--all", None)] {
+        let mut state: serde_json::Value =
+            serde_json::from_str(&inspect_json(true, &redis_labels_on(Some(TEST_HOST)))).unwrap();
+        state["Id"] = id.into();
+        let state = state.to_string();
+        let fake = FakeRunner::new(move |_| ok(&state));
+        let mut runner = docker_runner(&fake, "name: app\n", None, false);
+        runner.set_host(Some(TEST_HOST));
+        let dep = docker_dep("redis", None);
+        let followed = runner.log_source(&dep, 50, true);
+        let within = runner.log_source_within(&dep, 50, std::time::Duration::from_secs(5));
+        let Some(target) = target else {
+            for result in [followed, within] {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    format!("`docker` did not report an ID for container {name}")
+                );
+            }
+            continue;
+        };
+        let Ok(LogSource::Command(cmd)) = followed else {
+            panic!("expected a command");
+        };
+        assert_eq!(cmd.args, ["logs", "--tail", "50", "-f", target]);
+        let Ok(LogSource::Command(cmd)) = within else {
+            panic!("expected a command");
+        };
+        assert_eq!(cmd.args, ["logs", "--tail", "50", target]);
+    }
+}
+
+#[test]
+fn docker_logs_refuse_another_owners_container() {
+    for (labels, expected) in [
+        (
+            vec![(PROJECT_LABEL.to_string(), "/src/evil".to_string())],
+            "belongs to another project",
+        ),
+        (
+            redis_labels_on(Some("ffffffffffffffff")),
+            "belongs to another machine or user",
+        ),
+    ] {
+        let state = inspect_json(true, &labels);
+        let fake = FakeRunner::new(move |_| ok(&state));
+        let mut runner = docker_runner(&fake, "name: app\n", None, false);
+        runner.set_host(Some(TEST_HOST));
+        let err = runner
+            .log_source(&docker_dep("redis", None), 50, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "{err}");
     }
 }
 

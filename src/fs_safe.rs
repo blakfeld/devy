@@ -179,11 +179,48 @@ pub fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
 /// check and the open is refused. A missing file keeps its `NotFound` kind; anything
 /// else devy refuses is `InvalidData`.
 pub fn read_regular_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    read_capped(open_regular_nofollow(path)?, path, cap)
+}
+
+/// [`read_regular_capped`] for a file that may be a non-redirecting reparse point on
+/// Windows: a OneDrive/Cloud Files placeholder, a deduplicated file or a WOF-compressed
+/// one. Opened with `FILE_FLAG_OPEN_REPARSE_POINT`, such a file can yield its reparse
+/// stub instead of its content, so [`open_regular_following_placeholders`] opens it
+/// normally. Elsewhere it is exactly [`read_regular_capped`].
+pub fn read_regular_capped_following_placeholders(
+    path: &Path,
+    cap: u64,
+) -> std::io::Result<Vec<u8>> {
+    read_capped(open_regular_following_placeholders(path)?, path, cap)
+}
+
+/// Reads at most `cap` bytes of `file` (opened from `path`), refusing a longer file
+/// with `InvalidData`.
+fn read_capped(file: File, path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("{} is larger than {cap} bytes", path.display()),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Opens `path` for reading when it is a regular file: not a symlink (or, on Windows, a
+/// junction or other link), FIFO or device. The file opened must be the regular file
+/// checked, so a swap between the check and the open is refused. A missing file keeps
+/// its `NotFound` kind; anything else devy refuses is `InvalidData`.
+pub fn open_regular_nofollow(path: &Path) -> std::io::Result<File> {
     let invalid = |what: &str| {
         std::io::Error::new(ErrorKind::InvalidData, format!("{} {what}", path.display()))
     };
     let checked = fs::symlink_metadata(path)?;
+    if checked.file_type().is_symlink() {
+        return Err(invalid("is a symlink; devy does not follow it"));
+    }
     if !checked.file_type().is_file() {
         return Err(invalid("is not a regular file"));
     }
@@ -192,12 +229,55 @@ pub fn read_regular_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     if !opened.file_type().is_file() || !same_inode(&checked, &opened) {
         return Err(invalid("changed while it was being read"));
     }
-    let mut bytes = Vec::new();
-    file.take(cap + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > cap {
-        return Err(invalid(&format!("is larger than {cap} bytes")));
+    Ok(file)
+}
+
+/// [`open_regular_nofollow`], except that on Windows the file is opened normally rather
+/// than with `FILE_FLAG_OPEN_REPARSE_POINT`, so a non-redirecting reparse point (cloud
+/// placeholder, dedup, WOF) yields its content. A redirecting link (symlink, junction,
+/// mount point: `is_symlink`) is still refused by the `symlink_metadata` check, and the
+/// handle opened must be the file checked ([`same_file_windows`]), so a swap between
+/// the check and the open is refused once noticed. Unlike `open_regular_nofollow`, a
+/// link swapped in during that window is followed by the open itself before being
+/// refused. Elsewhere this is exactly [`open_regular_nofollow`] (`O_NOFOLLOW`).
+pub fn open_regular_following_placeholders(path: &Path) -> std::io::Result<File> {
+    #[cfg(not(windows))]
+    {
+        open_regular_nofollow(path)
     }
-    Ok(bytes)
+    #[cfg(windows)]
+    {
+        let invalid = |what: &str| {
+            std::io::Error::new(ErrorKind::InvalidData, format!("{} {what}", path.display()))
+        };
+        let checked = fs::symlink_metadata(path)?;
+        if checked.file_type().is_symlink() {
+            return Err(invalid("is a symlink; devy does not follow it"));
+        }
+        if !checked.file_type().is_file() {
+            return Err(invalid("is not a regular file"));
+        }
+        let file = File::open(path)?;
+        let opened = file.metadata()?;
+        if !opened.file_type().is_file() || !same_file_windows(&checked, &opened) {
+            return Err(invalid("changed while it was being read"));
+        }
+        Ok(file)
+    }
+}
+
+/// Whether `a` (from `symlink_metadata`) and `b` (from the opened handle) describe the
+/// same file. Stable std exposes no file index or volume serial number
+/// (`windows_by_handle` is unstable), so this compares the creation time, last write
+/// time and size, which a cloud file's hydration and a deduplicated or compressed
+/// file's reparse data leave unchanged. The attributes are not compared, because
+/// hydration can change them (`RECALL_ON_DATA_ACCESS`, `OFFLINE`, pinning).
+#[cfg(windows)]
+fn same_file_windows(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    a.creation_time() == b.creation_time()
+        && a.last_write_time() == b.last_write_time()
+        && a.file_size() == b.file_size()
 }
 
 #[cfg(unix)]
@@ -312,8 +392,9 @@ fn user_dir_name() -> String {
     }
 }
 
-/// Where `user_dir` lives, without creating or checking it.
-#[cfg(any(test, target_os = "macos"))]
+/// Where `user_dir` lives, without creating or checking it. Before reading anything
+/// there, check it with [`existing_private_dir`] (read-only) or use [`user_dir`].
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 pub fn user_dir_path() -> PathBuf {
     user_base().join(user_dir_name())
 }
@@ -322,6 +403,18 @@ pub fn user_dir_path() -> PathBuf {
 /// missing and owner- and mode-checked when it exists.
 pub fn user_dir() -> Result<PathBuf> {
     private_dir(&user_base(), &user_dir_name(), false)
+}
+
+/// Checks that `dir`, when it exists, is a real directory owned by the current user
+/// with mode 0700 (as [`private_dir`] requires of an existing directory); a missing
+/// `dir` passes. Fails with an ownership or mode error otherwise, or when it can't be
+/// examined. Never creates anything.
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+pub fn existing_private_dir(dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        _ => check_private(dir, expected_owner()),
+    }
 }
 
 /// Creates `<base>/<prefix>` (or `<base>/<prefix>-<random>` when `random`) with mode
@@ -345,6 +438,13 @@ pub fn with_fake_owner<T>(uid: u32, f: impl FnOnce() -> T) -> T {
     let result = f();
     FAKE_OWNER.with(|c| c.set(None));
     result
+}
+
+/// Whether `uid` is the current user (as [`with_fake_owner`] presents it in tests) or
+/// root: the only owners devy trusts for files it reads from shared places.
+#[cfg(unix)]
+pub fn is_user_or_root(uid: u32) -> bool {
+    uid == expected_owner() || uid == 0
 }
 
 /// The uid `private_dir` requires as owner: the current user's.
@@ -466,6 +566,57 @@ pub const MANAGED_DIRS: [&str; 2] = [".devy", ".shadowenv.d"];
 
 /// `.devy/nix-profile`, relative to the project root.
 pub const NIX_PROFILE: &str = ".devy/nix-profile";
+
+/// devy's per-checkout state directory, relative to the project root.
+pub const DEVY_DIR: &str = ".devy";
+
+/// What `.devy/.gitignore` holds when devy creates it: ignore everything in `.devy/`.
+const DEVY_GITIGNORE: &[u8] = b"*\n";
+
+/// Creates `<root>/.devy` when missing (refusing a symlinked or non-directory component,
+/// as [`ensure_dir_in`] does) and makes sure `.devy/.gitignore` exists, so git ignores
+/// devy's state without the user editing their own ignore rules. A missing
+/// `.gitignore` is created with `*`; an existing one, or anything else at that name
+/// (including a symlink), is never modified. Every creation of `.devy/` goes through
+/// here. Returns the `.devy` path.
+pub fn ensure_devy_dir(root: &Path) -> Result<PathBuf> {
+    let devy = root.join(DEVY_DIR);
+    ensure_dir_in(root, &devy)?;
+    let ignore = devy.join(".gitignore");
+    match create_new_nofollow(&ignore) {
+        Ok(mut file) => {
+            let written = file
+                .write_all(DEVY_GITIGNORE)
+                .and_then(|()| set_mode(&file, 0o644));
+            if let Err(e) = written {
+                drop(file);
+                let _ = fs::remove_file(&ignore);
+                return Err(e).with_context(|| format!("Failed to write {}", ignore.display()));
+            }
+        }
+        // Already there (or a symlink, which `create_new` refuses without following).
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) if is_nofollow_error(&e) => {}
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to create {}", ignore.display()));
+        }
+    }
+    Ok(devy)
+}
+
+/// Creates `dir`, which must be inside `<root>/.devy`, after [`ensure_devy_dir`], with
+/// the same symlink refusals as [`ensure_dir_in`].
+pub fn ensure_devy_subdir(root: &Path, dir: &Path) -> Result<()> {
+    let devy = ensure_devy_dir(root)?;
+    if !dir.starts_with(&devy) {
+        bail!(
+            "refusing to create {}: it is outside {}",
+            dir.display(),
+            devy.display()
+        );
+    }
+    ensure_dir_in(root, dir)
+}
 
 fn refusal(rel: &Path, what: &str) -> anyhow::Error {
     anyhow!(
@@ -1043,6 +1194,80 @@ mod tests {
         assert!(!victim.exists(), "the link target must not be created");
     }
 
+    // ── ensure_devy_dir ───────────────────────────────────────────────────────
+
+    #[test]
+    fn ensure_devy_dir_creates_the_gitignore_once() {
+        let root = tmp_dir();
+        let devy = ensure_devy_dir(&root).unwrap();
+        assert_eq!(devy, root.join(".devy"));
+        let ignore = devy.join(".gitignore");
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), "*\n");
+        // A second call leaves the file as it is, even after the user edits it.
+        fs::write(&ignore, "*\n!keep\n").unwrap();
+        ensure_devy_dir(&root).unwrap();
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), "*\n!keep\n");
+    }
+
+    #[test]
+    fn ensure_devy_dir_keeps_existing_content() {
+        let root = tmp_dir();
+        fs::create_dir(root.join(".devy")).unwrap();
+        fs::write(root.join(".devy/.gitignore"), "custom\n").unwrap();
+        ensure_devy_dir(&root).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".devy/.gitignore")).unwrap(),
+            "custom\n"
+        );
+    }
+
+    #[test]
+    fn ensure_devy_dir_adds_the_gitignore_to_an_existing_dir() {
+        let root = tmp_dir();
+        fs::create_dir_all(root.join(".devy/data")).unwrap();
+        ensure_devy_dir(&root).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(".devy/.gitignore")).unwrap(),
+            "*\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_devy_dir_does_not_follow_a_gitignore_symlink() {
+        let root = tmp_dir();
+        let outside = tmp_dir();
+        let victim = outside.join("victim");
+        fs::create_dir(root.join(".devy")).unwrap();
+        symlink(&victim, &root.join(".devy/.gitignore"));
+        ensure_devy_dir(&root).unwrap();
+        assert!(!victim.exists(), "the link target must not be created");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_devy_dir_refuses_a_symlinked_devy_dir() {
+        let root = tmp_dir();
+        let outside = tmp_dir();
+        symlink(&outside, &root.join(".devy"));
+        let err = ensure_devy_dir(&root).unwrap_err().to_string();
+        assert!(err.contains("it is a symbolic link"), "{err}");
+        assert!(!outside.join(".gitignore").exists());
+    }
+
+    #[test]
+    fn ensure_devy_subdir_creates_the_dir_and_the_gitignore() {
+        let root = tmp_dir();
+        let data = root.join(".devy/data/redis");
+        ensure_devy_subdir(&root, &data).unwrap();
+        assert!(data.is_dir());
+        assert!(root.join(".devy/.gitignore").is_file());
+        let err = ensure_devy_subdir(&root, &root.join("elsewhere"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is outside"), "{err}");
+    }
+
     // ── open_lock_file / ensure_dir_in ────────────────────────────────────────
 
     #[cfg(unix)]
@@ -1161,6 +1386,104 @@ mod tests {
         symlink(&outside, &base.join("sock"));
         let err = private_dir(&base, "sock", false).unwrap_err().to_string();
         assert!(err.contains("not a directory owned"), "{err}");
+    }
+
+    /// The read-only check never creates the directory, and refuses one that
+    /// `private_dir` would refuse.
+    #[test]
+    fn existing_private_dir_checks_without_creating() {
+        let base = tmp_dir();
+        let dir = base.join("logs");
+        existing_private_dir(&dir).unwrap();
+        assert!(!dir.exists(), "nothing is created");
+        private_dir(&base, "logs", false).unwrap();
+        existing_private_dir(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let err = with_fake_owner(current_uid() + 1, || existing_private_dir(&dir))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not owned by the current user"), "{err}");
+            for mode in [0o777, 0o770, 0o755] {
+                fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+                let err = existing_private_dir(&dir).unwrap_err().to_string();
+                assert!(err.contains(&format!("has mode {mode:03o}")), "{err}");
+            }
+            fs::remove_dir(&dir).unwrap();
+            let outside = tmp_dir();
+            symlink(&outside, &dir);
+            let err = existing_private_dir(&dir).unwrap_err().to_string();
+            assert!(err.contains("not a directory owned"), "{err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_nofollow_refuses_links_and_special_files() {
+        let dir = tmp_dir();
+        let real = dir.join("real.log");
+        fs::write(&real, "x\n").unwrap();
+        assert!(open_regular_nofollow(&real).is_ok());
+        symlink(&real, &dir.join("link.log"));
+        let err = open_regular_nofollow(&dir.join("link.log")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+        let err = open_regular_nofollow(&dir).unwrap_err();
+        assert!(err.to_string().contains("is not a regular file"), "{err}");
+        let missing = open_regular_nofollow(&dir.join("missing.log")).unwrap_err();
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn read_following_placeholders_reads_regular_files_only() {
+        let dir = tmp_dir();
+        let real = dir.join("config");
+        fs::write(&real, "[core]\n").unwrap();
+        assert_eq!(
+            read_regular_capped_following_placeholders(&real, 64).unwrap(),
+            b"[core]\n"
+        );
+        let err = read_regular_capped_following_placeholders(&real, 3).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("larger than 3 bytes"), "{err}");
+        let err = read_regular_capped_following_placeholders(&dir, 64).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("is not a regular file"), "{err}");
+        let missing = read_regular_capped_following_placeholders(&dir.join("missing"), 64);
+        assert_eq!(missing.unwrap_err().kind(), ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_following_placeholders_refuses_symlinks() {
+        let dir = tmp_dir();
+        let real = dir.join("real");
+        fs::write(&real, "x\n").unwrap();
+        symlink(&real, &dir.join("link"));
+        let err = read_regular_capped_following_placeholders(&dir.join("link"), 64).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("is a symlink"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn same_file_windows_matches_one_file_and_not_another() {
+        let dir = tmp_dir();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        fs::write(&a, "same\n").unwrap();
+        let opened = File::open(&a).unwrap().metadata().unwrap();
+        assert!(same_file_windows(
+            &fs::symlink_metadata(&a).unwrap(),
+            &opened
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&b, "same\n").unwrap();
+        assert!(!same_file_windows(
+            &fs::symlink_metadata(&b).unwrap(),
+            &opened
+        ));
     }
 
     #[test]

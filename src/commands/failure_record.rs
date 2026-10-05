@@ -66,8 +66,7 @@ pub fn path(project_root: &Path) -> PathBuf {
 /// Replaces any existing record atomically. On Unix the file is owner-only (0600).
 pub fn write(project_root: &Path, record: &FailureRecord) -> Result<()> {
     let target = path(project_root);
-    let dir = target.parent().expect("PATH has a parent");
-    crate::fs_safe::ensure_dir_in(project_root, dir)?;
+    crate::fs_safe::ensure_devy_dir(project_root)?;
     let body = serde_json::to_string_pretty(record)?;
     crate::fs_safe::write_atomic(&target, body.as_bytes(), 0o600)
         .with_context(|| format!("Failed to write {PATH}"))
@@ -224,12 +223,17 @@ mod tests {
                 .error_chain
                 .starts_with("second")
         );
-        let leftovers: Vec<_> = std::fs::read_dir(dir.join(".devy"))
+        let mut leftovers: Vec<_> = std::fs::read_dir(dir.join(".devy"))
             .unwrap()
             .flatten()
             .map(|e| e.file_name())
             .collect();
-        assert_eq!(leftovers.len(), 1, "no temp files left: {leftovers:?}");
+        leftovers.sort();
+        assert_eq!(
+            leftovers,
+            [".gitignore", "last-up-failure.json"],
+            "no temp files left"
+        );
     }
 
     #[cfg(unix)]

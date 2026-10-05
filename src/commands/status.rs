@@ -39,6 +39,8 @@ pub(crate) struct StatusReport {
     /// A failed state query. The rows gathered before it are kept and nothing after it
     /// is read.
     pub error: Option<anyhow::Error>,
+    /// Set when the project is in a linked git worktree.
+    pub worktree: Option<crate::worktree::LinkedWorktree>,
 }
 
 /// A project command from devy.yml.
@@ -59,8 +61,8 @@ pub(crate) fn status_report(
 ) -> Result<StatusReport> {
     let mut deps = config.normalized_dependencies()?;
     // Resolve ports as `up` would so service probes see the locked port; never writes.
-    let lock = ports::load_lock(project_root)?;
-    let resolved = ports::resolve_ports(&mut deps, lock.as_ref(), pm, PortMode::ReadOnly)?;
+    let recorded = ports::RecordedPorts::load(project_root)?;
+    let resolved = ports::resolve_ports(&mut deps, recorded.source(), pm, PortMode::ReadOnly)?;
 
     let mut commands: Vec<CommandInfo> = config
         .commands
@@ -76,7 +78,7 @@ pub(crate) fn status_report(
         .collect();
     commands.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let runners = Runners::new(pm, runtime, config, project_root, lock.as_ref(), false);
+    let runners = Runners::new(pm, runtime, config, project_root, recorded.lock(), false);
     let (rows, error) = shared::dep_rows(&deps, &resolved, &runners);
 
     let mut report = StatusReport {
@@ -91,6 +93,7 @@ pub(crate) fn status_report(
         commands,
         error,
         deps,
+        worktree: recorded.worktree().cloned(),
     };
     if report.error.is_none() {
         report.path_prepends = report
@@ -107,11 +110,39 @@ pub(crate) fn status_report(
     Ok(report)
 }
 
+/// The line `devy status` prints under its header in a linked worktree.
+fn worktree_line(worktree: &crate::worktree::LinkedWorktree) -> String {
+    match (&worktree.main_project_root, &worktree.main_checkout) {
+        (Some(main), _) => format!("worktree of {}", display_path(main)),
+        (None, Some(main)) => format!(
+            "worktree of {} (main project directory not read)",
+            display_path(main)
+        ),
+        (None, None) => "worktree (no main checkout)".to_string(),
+    }
+}
+
+/// `path` as users write it: without the `\\?\` verbatim prefix Windows' `canonicalize`
+/// adds (`\\?\UNC\host\share` becomes `\\host\share`).
+fn display_path(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    if let Some(rest) = shown.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = shown.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        shown
+    }
+}
+
 /// Prints the report as the `devy status` tables. Returns the state-query error, if any,
 /// after printing the rows gathered before it.
 fn print_text(report: StatusReport) -> Result<()> {
     let project_name = report.project.as_deref().unwrap_or("project");
     output::header(&format!("devy status · {}", project_name));
+    if let Some(line) = report.worktree.as_ref().map(worktree_line) {
+        println!("{}", output::clean_line(&line));
+    }
 
     if !report.deps.is_empty() {
         output::header("Dependencies");
@@ -522,5 +553,68 @@ mod tests {
         );
         // The text table keeps showing module entries only.
         assert_eq!(report.path_prepends, expected[1..]);
+    }
+
+    #[test]
+    fn worktree_line_names_the_main_project_root_or_its_absence() {
+        let mut worktree = crate::worktree::LinkedWorktree {
+            common_dir: "/src/app/.git".into(),
+            top_level: "/src/app-feat".into(),
+            main_checkout: Some("/src/app".into()),
+            main_project_root: Some(std::path::Path::new("/src/app").join("api")),
+        };
+        assert_eq!(
+            worktree_line(&worktree),
+            format!(
+                "worktree of {}",
+                std::path::Path::new("/src/app").join("api").display()
+            )
+        );
+        worktree.main_project_root = None;
+        assert_eq!(
+            worktree_line(&worktree),
+            format!(
+                "worktree of {} (main project directory not read)",
+                std::path::Path::new("/src/app").display()
+            )
+        );
+        worktree.main_checkout = None;
+        assert_eq!(worktree_line(&worktree), "worktree (no main checkout)");
+    }
+
+    #[test]
+    fn display_path_drops_the_windows_verbatim_prefix() {
+        use std::path::Path;
+        assert_eq!(display_path(Path::new(r"\\?\C:\src\app")), r"C:\src\app");
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\host\share\app")),
+            r"\\host\share\app"
+        );
+        assert_eq!(display_path(Path::new("/src/app")), "/src/app");
+    }
+
+    #[test]
+    fn status_report_detects_a_linked_worktree() {
+        let tmp = crate::test_support::tmp_dir();
+        let (main, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        let config = crate::test_support::make_config(&[], HashMap::new());
+        let pm = MockPackageManager::default();
+        let report = |root: &std::path::Path| {
+            status_report(
+                &config,
+                &pm,
+                ContainerRuntime::system(config.container_cli),
+                &MockEnvManager::default(),
+                root,
+            )
+            .unwrap()
+        };
+        let in_feat = report(&feat);
+        assert_eq!(
+            in_feat.worktree.and_then(|w| w.main_project_root),
+            Some(main.clone())
+        );
+        assert!(report(&main).worktree.is_none());
+        assert!(!feat.join(".devy").exists(), "status must not write files");
     }
 }

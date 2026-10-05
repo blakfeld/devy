@@ -498,6 +498,7 @@ _{bin}() {
     'export:Export the environment as a Nix shell.nix or flake.nix'
     'exec:Run a program with the project environment'
     'agent-setup:Write the coding agent skill'
+    'prune:Remove services left behind by removed checkouts'
   )
   # _describe splits each entry at its first unescaped `:` into name and description,
   # so colons in project command names (`db:migrate`) are escaped.
@@ -570,6 +571,11 @@ _{bin}() {
         '--force[Overwrite a skill {bin} did not write]' \
         '--agents-md[Create AGENTS.md if missing]' \
         '--print[Print the skill without writing]'
+      ;;
+    prune)
+      _arguments \
+        '--yes[Remove them without asking]' \
+        '--volumes[Also remove the data volumes of removed containers]'
       ;;
   esac
 }
@@ -1126,7 +1132,7 @@ _{bin}_complete_lines() {
 _{bin}_completions() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
   local subcmds
-  subcmds=(up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup)
+  subcmds=(up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup prune)
   COMPREPLY=()
 
   if [ "$COMP_CWORD" -eq 1 ]; then
@@ -1190,6 +1196,9 @@ _{bin}_completions() {
       ;;
     agent-setup)
       _{bin}_complete_words "$cur" --force --agents-md --print
+      ;;
+    prune)
+      _{bin}_complete_words "$cur" --yes --volumes
       ;;
   esac
 }
@@ -1446,7 +1455,7 @@ function __{bin}_complete_exec
 end
 
 function __{bin}_no_subcommand
-  not __fish_seen_subcommand_from up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup
+  not __fish_seen_subcommand_from up down services start stop restart status check doctor logs ask init hook pr export exec agent-setup prune
 end
 
 complete -c {bin} -f
@@ -1467,6 +1476,7 @@ complete -c {bin} -n __{bin}_no_subcommand -a pr       -d "Open a GitHub pull re
 complete -c {bin} -n __{bin}_no_subcommand -a export   -d "Export a Nix shell.nix or flake.nix"
 complete -c {bin} -n __{bin}_no_subcommand -a exec     -d "Run a program with the project environment"
 complete -c {bin} -n __{bin}_no_subcommand -a agent-setup -d "Write the coding agent skill"
+complete -c {bin} -n __{bin}_no_subcommand -a prune    -d "Remove services left behind by removed checkouts"
 complete -c {bin} -n __{bin}_no_subcommand -a "(__{bin}_user_commands)" -d "User-defined command"
 complete -c {bin} -n "__fish_seen_subcommand_from hook" -a "zsh bash fish"
 complete -c {bin} -n "__fish_seen_subcommand_from up" -l update  -d "Re-resolve all versions"
@@ -1489,6 +1499,8 @@ complete -c {bin} -n "__fish_seen_subcommand_from exec" -a "(__{bin}_complete_ex
 complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l force -d "Overwrite a skill {bin} did not write"
 complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l agents-md -d "Create AGENTS.md if missing"
 complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l print -d "Print the skill without writing"
+complete -c {bin} -n "__fish_seen_subcommand_from prune" -l yes -d "Remove them without asking"
+complete -c {bin} -n "__fish_seen_subcommand_from prune" -l volumes -d "Also remove the data volumes of removed containers"
 "#;
 
 #[cfg(test)]
@@ -1990,9 +2002,38 @@ mod tests {
             "-n \"__fish_seen_subcommand_from agent-setup\" -l force ",
             "-n \"__fish_seen_subcommand_from agent-setup\" -l agents-md ",
             "-n \"__fish_seen_subcommand_from agent-setup\" -l print ",
-            "hook pr export exec agent-setup\nend",
+            "hook pr export exec agent-setup prune\nend",
         ] {
             assert!(fish.contains(needle), "fish missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn snippets_complete_prune_and_its_flags() {
+        let zsh = zsh_snippet();
+        assert!(zsh.contains("    'prune:"), "{zsh}");
+        assert!(
+            zsh.contains(
+                "    prune)\n      _arguments \\\n        '--yes[Remove them without asking]' \\\n        \
+                 '--volumes[Also remove the data volumes of removed containers]'\n"
+            ),
+            "{zsh}"
+        );
+        let bash = bash_snippet();
+        assert!(bash.contains("exec agent-setup prune)\n"), "{bash}");
+        assert!(
+            bash.contains("    prune)\n      _devy_complete_words \"$cur\" --yes --volumes\n"),
+            "{bash}"
+        );
+        let fish = fish_snippet();
+        assert!(fish.contains("-a prune "), "{fish}");
+        for flag in ["yes", "volumes"] {
+            assert!(
+                fish.contains(&format!(
+                    "-n \"__fish_seen_subcommand_from prune\" -l {flag} "
+                )),
+                "{fish}"
+            );
         }
     }
 

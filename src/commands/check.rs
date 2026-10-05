@@ -114,6 +114,8 @@ pub(crate) enum Note {
     Issue(String),
     /// Printed, but not counted as an issue.
     Warning(String),
+    /// Printed as a `○` note; neither an issue nor a warning.
+    Info(String),
 }
 
 /// The environment-file state the checks compare against.
@@ -156,7 +158,7 @@ impl Findings {
             .iter()
             .filter_map(|n| match n {
                 Note::Issue(s) => Some(s.clone()),
-                Note::Warning(_) => None,
+                Note::Warning(_) | Note::Info(_) => None,
             })
             .collect();
         out.extend(self.deps.iter().flatten().filter_map(shared::DepRow::issue));
@@ -195,7 +197,7 @@ impl Findings {
             .iter()
             .filter_map(|n| match n {
                 Note::Warning(s) => Some(s.clone()),
-                Note::Issue(_) => None,
+                Note::Issue(_) | Note::Info(_) => None,
             })
             .collect()
     }
@@ -211,6 +213,7 @@ impl Findings {
                     output::warn(s);
                 }
                 Note::Warning(s) => output::warn(s),
+                Note::Info(s) => output::skip(s),
             }
         }
         if let Some(rows) = &self.deps {
@@ -255,11 +258,15 @@ fn collect_into(
 ) -> Result<()> {
     let deps = config.normalized_dependencies()?;
     // Resolve ports exactly as `up` would, without assigning new ones or writing the lock.
-    let lock = ports::load_lock(project_root)?;
+    let recorded = ports::RecordedPorts::load(project_root)?;
     let mut resolved_deps = deps.clone();
-    let resolved =
-        ports::resolve_and_check(&mut resolved_deps, lock.as_ref(), pm, PortMode::ReadOnly)?;
-    let runners = Runners::new(pm, runtime, config, project_root, lock.as_ref(), false);
+    let resolved = ports::resolve_and_check(
+        &mut resolved_deps,
+        recorded.source(),
+        pm,
+        PortMode::ReadOnly,
+    )?;
+    let runners = Runners::new(pm, runtime, config, project_root, recorded.lock(), false);
 
     if !deps.is_empty() {
         for dep in &deps {
@@ -285,7 +292,15 @@ fn collect_into(
                     .notes
                     .push(Note::Warning(format!("{}: {}", dep.name, warning)));
             }
+            if recorded.in_worktree() {
+                findings
+                    .notes
+                    .extend(ports::shared_fixed_port_warning(dep, pm).map(Note::Warning));
+            }
             findings.notes.extend(shell_issue(dep).map(Note::Issue));
+            findings
+                .notes
+                .extend(legacy_service_note(dep, pm).map(Note::Info));
         }
         let (rows, err) = shared::dep_rows(&resolved_deps, &resolved, &runners);
         findings.deps = Some(rows);
@@ -332,6 +347,18 @@ pub(crate) fn static_issues(config: &DevyConfig) -> Result<Vec<String>> {
     }
     issues.extend(explicit_port_conflict(&deps));
     Ok(issues)
+}
+
+/// A note for a package-managed service that still runs under a legacy unit name (nix),
+/// which its next start or stop migrates.
+fn legacy_service_note(dep: &Dependency, pm: &dyn PackageManager) -> Option<String> {
+    let module = modules::get(&dep.name);
+    if dep.docker || !module.is_service() {
+        return None;
+    }
+    let name = module.service_name(dep);
+    pm.uses_legacy_service_name(&name)
+        .then(|| format!("{name} uses a legacy service name; it will be migrated on next start"))
 }
 
 fn extra_key_issues(dep: &Dependency) -> Vec<String> {
@@ -641,6 +668,41 @@ mod tests {
     }
 
     #[test]
+    fn check_notes_a_legacy_service_name_without_counting_an_issue() {
+        let dir = crate::test_support::tmp_dir();
+        let config = make_config(&["postgres", "redis"], HashMap::new());
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            service_running: true,
+            // The backend service name, not the name in devy.yml.
+            legacy_services: vec!["postgresql"],
+            ..Default::default()
+        };
+        let findings = collect_findings(
+            &config,
+            &pm,
+            ContainerRuntime::system(config.container_cli),
+            &MockEnvManager::default(),
+            &dir,
+        );
+        assert_eq!(
+            findings.notes,
+            [Note::Info(
+                "postgresql uses a legacy service name; it will be migrated on next start".into()
+            )]
+        );
+        assert!(findings.issues().is_empty(), "{:?}", findings.issues());
+        assert!(findings.warnings().is_empty());
+        assert!(
+            pm.migrated_services.borrow().is_empty(),
+            "check is read-only"
+        );
+        let result = check_impl(&config, &pm, &MockEnvManager::default(), &dir);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
     fn check_impl_does_not_flag_service_manager_or_image_as_module_keys() {
         let yaml = "dependencies:\n  - redis: { service_manager: package, image: mirror/redis }\n";
         let config: DevyConfig = yaml::from_str(yaml).unwrap();
@@ -857,6 +919,81 @@ mod tests {
             &MockEnvManager::default(),
             &dir,
         )
+    }
+
+    // ── linked worktrees ─────────────────────────────────────────────────────
+
+    fn check_in(yaml: &str, pm_name: &'static str, root: &Path) -> Findings {
+        let config: DevyConfig = yaml::from_str(yaml).unwrap();
+        let pm = MockPackageManager {
+            name: pm_name,
+            installed: true,
+            service_running: true,
+            ..Default::default()
+        };
+        collect_findings(
+            &config,
+            &pm,
+            ContainerRuntime::system(config.container_cli),
+            &MockEnvManager::default(),
+            root,
+        )
+    }
+
+    const FIXED_REDIS: &str = "dependencies:\n  - redis:\n      port: 6380\n";
+    const FIXED_REDIS_WARNING: &str = "'redis' has a fixed port 6380 in devy.yml, so it can't run in this worktree and the main checkout at the same time";
+
+    #[test]
+    fn check_in_a_worktree_warns_about_a_fixed_nix_port_without_failing() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        let findings = check_in(FIXED_REDIS, "nix", &feat);
+        assert!(findings.hard_error.is_none(), "{:?}", findings.hard_error);
+        assert!(findings.issues().is_empty(), "{:?}", findings.issues());
+        assert!(
+            findings.warnings().iter().any(|w| w == FIXED_REDIS_WARNING),
+            "{:?}",
+            findings.warnings()
+        );
+    }
+
+    #[test]
+    fn check_in_a_worktree_does_not_warn_about_a_brew_port() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        let findings = check_in(FIXED_REDIS, "brew", &feat);
+        assert!(
+            !findings.warnings().iter().any(|w| w.contains("fixed port")),
+            "{:?}",
+            findings.warnings()
+        );
+    }
+
+    #[test]
+    fn check_in_a_worktree_does_not_warn_about_a_recorded_port() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        let mut recorded = crate::worktree::WorktreePorts::default();
+        recorded.ports.insert("redis".into(), 52000);
+        recorded.write_if_changed(&feat).unwrap();
+        let findings = check_in("dependencies:\n  - redis\n", "nix", &feat);
+        assert!(
+            !findings.warnings().iter().any(|w| w.contains("fixed port")),
+            "{:?}",
+            findings.warnings()
+        );
+    }
+
+    #[test]
+    fn check_in_the_main_checkout_does_not_warn_about_a_fixed_port() {
+        let tmp = crate::test_support::tmp_dir();
+        let (main, _) = crate::test_support::fake_linked_worktree(&tmp);
+        let findings = check_in(FIXED_REDIS, "nix", &main);
+        assert!(
+            !findings.warnings().iter().any(|w| w.contains("fixed port")),
+            "{:?}",
+            findings.warnings()
+        );
     }
 
     fn rendered(doc: &CheckDocument) -> serde_json::Value {

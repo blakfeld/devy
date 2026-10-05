@@ -458,8 +458,13 @@ mod tests {
             ..Default::default()
         };
         let mut deps = vec![Dependency::simple("redis"), Dependency::simple("jq")];
-        let resolved =
-            ports::resolve_ports(&mut deps, Some(&lock), &pm, PortMode::ReadOnly).unwrap();
+        let resolved = ports::resolve_ports(
+            &mut deps,
+            ports::PortSource::Lock(Some(&lock)),
+            &pm,
+            PortMode::ReadOnly,
+        )
+        .unwrap();
         let (rows, _) = dep_rows(&deps, &resolved, &package_runners(&pm, Path::new("/tmp")));
         assert_eq!(rows[0].port, Some(ResolvedPort::Locked(52113)));
         assert_eq!(rows[0].port.unwrap().source(), "lock");

@@ -308,7 +308,7 @@ pub(crate) fn nix_launch_for(
     // service would run on whatever state a repository committed under `.devy/data`.
     crate::fs_safe::check_managed_paths(project_root, &[])?;
     let data_dir = nix_data_dir(project_root, canonical_name(&dep.name));
-    crate::fs_safe::ensure_dir_in(project_root, &data_dir)
+    crate::fs_safe::ensure_devy_subdir(project_root, &data_dir)
         .with_context(|| format!("Failed to create {}", data_dir.display()))?;
     Ok(module.nix_launch(dep, &data_dir)?.map(|mut spec| {
         spec.working_dir.get_or_insert(data_dir);

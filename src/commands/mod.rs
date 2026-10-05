@@ -14,6 +14,7 @@ pub mod list_commands;
 pub mod logs;
 pub mod ports;
 pub mod pr;
+pub mod prune;
 pub mod service;
 pub mod shared;
 pub mod status;

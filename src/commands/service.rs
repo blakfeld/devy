@@ -4,10 +4,9 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::commands::ports::{self, PortMode};
+use crate::commands::ports::{self, PortMode, PortSource};
 use crate::commands::shared;
 use crate::config::{Dependency, DevyConfig};
-use crate::lock::LockFile;
 use crate::modules;
 use crate::output;
 use crate::package_manager::{self, PackageManager};
@@ -19,16 +18,16 @@ use crate::service_runner::{self, Runners, ServiceRunner};
 pub fn list(json: bool) -> Result<()> {
     let (config, project_root) = DevyConfig::load_with_root()?;
     let pm = package_manager::detect(&config, &project_root)?;
-    let lock = ports::load_lock(&project_root)?;
+    let recorded = ports::RecordedPorts::load(&project_root)?;
     let runners = Runners::new(
         pm.as_ref(),
         ContainerRuntime::system(config.container_cli),
         &config,
         &project_root,
-        lock.as_ref(),
+        recorded.lock(),
         false,
     );
-    list_impl(&config, &runners, lock.as_ref(), json)
+    list_impl(&config, &runners, recorded.source(), json)
 }
 
 /// One declared service, as `devy services` reports it.
@@ -49,14 +48,15 @@ struct ServicesDocument<'a> {
 }
 
 /// Every service in devy.yml in declaration order, with its running state and its port
-/// resolved read-only from `lock`. Never writes devy.lock.
+/// resolved read-only from `source`. Never writes devy.lock or `.devy/worktree.yml`.
 pub(crate) fn services_report(
     config: &DevyConfig,
     runners: &Runners,
-    lock: Option<&LockFile>,
+    source: PortSource<'_>,
 ) -> Result<Vec<ServiceInfo>> {
     let mut deps = config.normalized_dependencies()?;
-    let resolved = ports::resolve_ports(&mut deps, lock, runners.package.pm(), PortMode::ReadOnly)?;
+    let resolved =
+        ports::resolve_ports(&mut deps, source, runners.package.pm(), PortMode::ReadOnly)?;
     deps.iter()
         .zip(resolved)
         .filter(|(dep, _)| modules::get(&dep.name).is_service())
@@ -80,10 +80,10 @@ pub(crate) fn services_report(
 pub(crate) fn list_impl(
     config: &DevyConfig,
     runners: &Runners,
-    lock: Option<&LockFile>,
+    source: PortSource<'_>,
     json: bool,
 ) -> Result<()> {
-    let services = services_report(config, runners, lock)?;
+    let services = services_report(config, runners, source)?;
     if json {
         return super::json::print(&ServicesDocument {
             services: &services,
@@ -118,7 +118,9 @@ pub fn start(name: &str) -> Result<()> {
 pub(crate) fn start_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<()> {
     let module = modules::get(&dep.name);
 
-    if runner.is_running(dep)? {
+    // A service running only under an outdated unit name is started anyway: `start`
+    // replaces that unit once the new one is ready to start.
+    if runner.is_running(dep)? && !runner.needs_migration(dep) {
         output::skip(&format!("{} is already running", dep.name));
         return Ok(());
     }
@@ -144,7 +146,10 @@ pub fn stop(name: &str) -> Result<()> {
 }
 
 pub(crate) fn stop_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<()> {
-    if !runner.is_running(dep)? {
+    // Read before migrating: a running legacy unit counts, and migration stops it.
+    let running = runner.is_running(dep)?;
+    runner.migrate(dep)?;
+    if !running {
         output::skip(&format!("{} is already stopped", dep.name));
         return Ok(());
     }
@@ -164,7 +169,10 @@ pub fn restart(name: &str) -> Result<()> {
 pub(crate) fn restart_impl(dep: &Dependency, runner: &dyn ServiceRunner) -> Result<()> {
     let module = modules::get(&dep.name);
 
-    if runner.is_running(dep)? {
+    // Read before migrating: a running legacy unit counts, and migration stops it.
+    let running = runner.is_running(dep)?;
+    runner.migrate(dep)?;
+    if running {
         output::step(&format!("Stopping {}…", dep.name));
         runner.stop(dep)?;
         runner.wait_for_stopped(dep)?;
@@ -214,18 +222,15 @@ pub(crate) fn resolve_service(
     require_port: bool,
 ) -> Result<Dependency> {
     let mut dep = resolve_dep(config, name)?;
-    let lock = ports::load_lock(project_root)?;
+    let recorded = ports::RecordedPorts::load(project_root)?;
     let resolved = ports::resolve_ports(
         std::slice::from_mut(&mut dep),
-        lock.as_ref(),
+        recorded.source(),
         pm,
         PortMode::ReadOnly,
     )?;
     if require_port && resolved[0] == Some(ports::ResolvedPort::Unassigned) {
-        bail!(
-            "'{}' has no port in devy.lock yet — run `devy up` first",
-            dep.name
-        );
+        return Err(recorded.source().unassigned_error(&dep.name));
     }
     Ok(dep)
 }
@@ -325,6 +330,52 @@ mod tests {
             dep.name, "postgres",
             "must return the dep as written in devy.yml"
         );
+    }
+
+    #[test]
+    fn start_leaves_migration_to_the_backend_start() {
+        // `start_service` migrates by itself once the new unit is ready to start, so a
+        // start that fails early never retires a running legacy unit.
+        let pm = MockPackageManager::default();
+        start_impl(
+            &Dependency::simple("postgres"),
+            &PackageRunner::new(&pm, Path::new("/tmp")),
+        )
+        .unwrap();
+        assert!(pm.migrated_services.borrow().is_empty());
+        assert_eq!(*pm.started_services.borrow(), ["postgresql"]);
+    }
+
+    #[test]
+    fn start_replaces_a_service_running_under_a_legacy_name() {
+        let pm = MockPackageManager {
+            service_running: true,
+            legacy_services: vec!["postgresql"],
+            ..Default::default()
+        };
+        start_impl(
+            &Dependency::simple("postgres"),
+            &PackageRunner::new(&pm, Path::new("/tmp")),
+        )
+        .unwrap();
+        assert_eq!(*pm.started_services.borrow(), ["postgresql"]);
+    }
+
+    #[test]
+    fn stop_and_restart_migrate_the_service() {
+        type Impl = fn(&Dependency, &dyn ServiceRunner) -> Result<()>;
+        for (running, run) in [(true, stop_impl as Impl), (true, restart_impl)] {
+            let pm = MockPackageManager {
+                service_running: running,
+                ..Default::default()
+            };
+            run(
+                &Dependency::simple("postgres"),
+                &PackageRunner::new(&pm, Path::new("/tmp")),
+            )
+            .unwrap();
+            assert_eq!(*pm.migrated_services.borrow(), ["postgresql"]);
+        }
     }
 
     // ── stop_impl ─────────────────────────────────────────────────────────────
@@ -482,7 +533,7 @@ mod tests {
             list_impl(
                 &config,
                 &package_runners(&pm, Path::new("/tmp")),
-                None,
+                PortSource::Lock(None),
                 false
             )
             .is_ok()
@@ -500,7 +551,7 @@ mod tests {
             list_impl(
                 &config,
                 &package_runners(&pm, Path::new("/tmp")),
-                None,
+                PortSource::Lock(None),
                 false
             )
             .is_ok()
@@ -519,7 +570,7 @@ mod tests {
             list_impl(
                 &config,
                 &package_runners(&pm, Path::new("/tmp")),
-                None,
+                PortSource::Lock(None),
                 false
             )
             .is_err(),
@@ -598,6 +649,30 @@ mod tests {
         assert!(resolve_service(&config, "redis", &brew, &dir, true).is_ok());
     }
 
+    #[test]
+    fn start_in_a_worktree_ignores_the_locked_port() {
+        let tmp = crate::test_support::tmp_dir();
+        let (_, feat) = crate::test_support::fake_linked_worktree(&tmp);
+        write_lock_with_port(&feat, "redis", 51000);
+        let config = make_config(&["redis"]);
+        let nix = MockPackageManager {
+            name: "nix",
+            ..Default::default()
+        };
+        let err = resolve_service(&config, "redis", &nix, &feat, true).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'redis' has no port in this worktree yet — run `devy up` first"
+        );
+        assert!(!feat.join(crate::worktree::PORTS_PATH).exists());
+
+        let mut recorded = crate::worktree::WorktreePorts::default();
+        recorded.ports.insert("redis".into(), 52000);
+        recorded.write_if_changed(&feat).unwrap();
+        let dep = resolve_service(&config, "redis", &nix, &feat, true).unwrap();
+        assert_eq!(dep.extra.get("port").and_then(|v| v.as_u64()), Some(52000));
+    }
+
     // ── docker-managed services ──────────────────────────────────────────────
 
     use crate::service_runner::docker::{FakeRunner, ok};
@@ -646,7 +721,7 @@ mod tests {
             None,
             false,
         );
-        list_impl(&config, &runners, None, false).unwrap();
+        list_impl(&config, &runners, PortSource::Lock(None), false).unwrap();
         let lines = cli.lines();
         assert_eq!(lines.len(), 1, "only redis is a service: {lines:?}");
         assert!(lines[0].starts_with("docker container inspect"));
@@ -734,9 +809,9 @@ mod tests {
     fn services_doc(
         config: &DevyConfig,
         runners: &Runners,
-        lock: Option<&LockFile>,
+        lock: Option<&crate::lock::LockFile>,
     ) -> serde_json::Value {
-        let services = services_report(config, runners, lock).unwrap();
+        let services = services_report(config, runners, PortSource::Lock(lock)).unwrap();
         let out = crate::commands::json::render(&ServicesDocument {
             services: &services,
         })
@@ -836,7 +911,13 @@ mod tests {
             ..Default::default()
         };
         let lock = ports::load_lock(&dir).unwrap();
-        list_impl(&config, &package_runners(&pm, &dir), lock.as_ref(), true).unwrap();
+        list_impl(
+            &config,
+            &package_runners(&pm, &dir),
+            PortSource::Lock(lock.as_ref()),
+            true,
+        )
+        .unwrap();
         assert!(!dir.join(crate::lock::PATH).exists());
     }
 
@@ -848,7 +929,7 @@ mod tests {
         let err = list_impl(
             &config,
             &package_runners(&pm, Path::new("/tmp")),
-            None,
+            PortSource::Lock(None),
             false,
         )
         .unwrap_err();
@@ -866,8 +947,12 @@ mod tests {
             name: "nix",
             ..Default::default()
         };
-        let services =
-            services_report(&config, &package_runners(&pm, &dir), lock.as_ref()).unwrap();
+        let services = services_report(
+            &config,
+            &package_runners(&pm, &dir),
+            PortSource::Lock(lock.as_ref()),
+        )
+        .unwrap();
         assert_eq!(services[0].state.port, Some(52113));
     }
 }
