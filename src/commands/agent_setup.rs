@@ -2,7 +2,8 @@
 //! run tools in the project environment. `devy init` runs the same setup.
 
 use anyhow::{Context, Result, bail};
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::DevyConfig;
 use crate::output;
@@ -14,9 +15,49 @@ const AGENTS_BLOCK_TEMPLATE: &str = include_str!("agent_setup/AGENTS_BLOCK.md");
 
 /// Where the Claude Code skill is written, relative to the project root.
 pub const SKILL_PATH: &str = ".claude/skills/devy/SKILL.md";
+/// Where the skill for every other agent is written: the cross-tool `.agents/skills`.
+pub const SHARED_SKILL_PATH: &str = ".agents/skills/devy/SKILL.md";
 pub const AGENTS_MD: &str = "AGENTS.md";
+pub const GEMINI_MD: &str = "GEMINI.md";
 const BEGIN: &str = "<!-- devy:begin -->";
 const END: &str = "<!-- devy:end -->";
+
+/// Paths at the project root that show a non-Claude agent is used here, so the shared
+/// skill is written by default. A trailing `/` marks a directory marker, which counts
+/// only as a directory or a symlink.
+pub const DETECTION_MARKERS: [&str; 16] = [
+    ".agents/",
+    ".codex/",
+    ".gemini/",
+    GEMINI_MD,
+    ".cursor/",
+    ".cursorrules",
+    ".github/copilot-instructions.md",
+    ".github/instructions/",
+    ".github/skills/",
+    ".windsurf/",
+    ".windsurfrules",
+    ".devin/",
+    ".opencode/",
+    "opencode.json",
+    ".amp/",
+    AGENTS_MD,
+];
+
+/// When a file holding the devy block is created if it doesn't exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateWith {
+    /// With `--agents-md`.
+    AgentsMdFlag,
+    /// Never: the block is only maintained in an existing file.
+    Never,
+}
+
+/// The files that hold the devy block, in the order they are processed.
+const BLOCK_FILES: [(&str, CreateWith); 2] = [
+    (AGENTS_MD, CreateWith::AgentsMdFlag),
+    (GEMINI_MD, CreateWith::Never),
+];
 
 /// `template` with `{bin}` substituted and LF line endings, so the output is identical
 /// whichever platform devy was built on (Windows checkouts may convert to CRLF).
@@ -24,7 +65,7 @@ fn render(template: &str) -> String {
     template.replace("\r\n", "\n").replace("{bin}", BINARY)
 }
 
-/// The skill file's content.
+/// The skill file's content, the same for every target.
 pub fn skill() -> String {
     render(SKILL_TEMPLATE)
 }
@@ -39,35 +80,165 @@ fn agents_block() -> String {
     render(AGENTS_BLOCK_TEMPLATE).trim_end().to_string()
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// A skill file devy writes. Ordered as the files are processed and reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Target {
+    /// `.claude/skills`, read by Claude Code.
+    Claude,
+    /// `.agents/skills`, read by Codex, Gemini CLI, Cursor, Copilot, Windsurf/Devin,
+    /// OpenCode and Amp.
+    Shared,
+}
+
+impl Target {
+    pub const ALL: [Target; 2] = [Target::Claude, Target::Shared];
+
+    /// The skill's path relative to the project root.
+    pub fn path(self) -> &'static str {
+        match self {
+            Target::Claude => SKILL_PATH,
+            Target::Shared => SHARED_SKILL_PATH,
+        }
+    }
+}
+
+/// An agent `--agent` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AgentName {
+    Claude,
+    Codex,
+    Gemini,
+    Cursor,
+    Copilot,
+    Windsurf,
+    Opencode,
+    Amp,
+}
+
+impl AgentName {
+    /// The skill file this agent reads.
+    pub fn target(self) -> Target {
+        match self {
+            AgentName::Claude => Target::Claude,
+            AgentName::Codex
+            | AgentName::Gemini
+            | AgentName::Cursor
+            | AgentName::Copilot
+            | AgentName::Windsurf
+            | AgentName::Opencode
+            | AgentName::Amp => Target::Shared,
+        }
+    }
+}
+
+/// Which skill files to write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Selection {
+    /// The Claude skill, plus the shared one when [`detect`] finds another agent.
+    #[default]
+    Detect,
+    /// Exactly these targets (`--agent`).
+    Explicit(Vec<Target>),
+    /// Every target (`--all`).
+    All,
+}
+
+impl Selection {
+    /// The selection the `--agent` and `--all` flags ask for.
+    pub fn from_flags(agents: &[AgentName], all: bool) -> Self {
+        if all {
+            Selection::All
+        } else if agents.is_empty() {
+            Selection::Detect
+        } else {
+            Selection::Explicit(agents.iter().map(|a| a.target()).collect())
+        }
+    }
+
+    /// The targets to write under `root`, each once, Claude first.
+    pub fn targets(&self, root: &Path) -> Vec<Target> {
+        let mut targets = match self {
+            Selection::Detect if detect(root) => Target::ALL.to_vec(),
+            Selection::Detect => vec![Target::Claude],
+            Selection::Explicit(targets) => targets.clone(),
+            Selection::All => Target::ALL.to_vec(),
+        };
+        targets.sort();
+        targets.dedup();
+        targets
+    }
+}
+
+/// Whether any of [`DETECTION_MARKERS`] exists under `root`. Only existence is checked:
+/// a marker that is a symlink counts, even a dangling one, and is never followed. A
+/// directory marker that is a regular file doesn't count. A marker below a directory
+/// that is a symlink (`.github` linking elsewhere) is not looked for, so detection
+/// never looks outside the project.
+pub fn detect(root: &Path) -> bool {
+    DETECTION_MARKERS.iter().any(|marker| {
+        let wants_dir = marker.ends_with('/');
+        let mut path = root.to_path_buf();
+        let mut parts = Path::new(marker).components().peekable();
+        while let Some(part) = parts.next() {
+            path.push(part);
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                return false;
+            };
+            let last = parts.peek().is_none();
+            if !last && !meta.is_dir() {
+                return false;
+            }
+            if last && wants_dir && !(meta.is_dir() || meta.file_type().is_symlink()) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Options {
-    /// Overwrite a skill file devy didn't write.
+    /// Overwrite skill files devy didn't write.
     pub force: bool,
     /// Create AGENTS.md when it doesn't exist.
     pub agents_md: bool,
+    /// Which skill files to write.
+    pub selection: Selection,
 }
 
 /// What happened to one file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Created.
     Wrote,
     /// Changed in place.
     Updated,
     UpToDate,
-    /// AGENTS.md doesn't exist and wasn't requested.
+    /// A block file doesn't exist and wasn't requested.
     Absent,
     /// The skill exists without devy's marker and `force` wasn't given.
     NotOurs,
-    /// AGENTS.md has a begin marker without a matching end marker, or the reverse.
+    /// A block file has a begin marker without a matching end marker, or the reverse.
     UnbalancedMarkers,
+    /// The shared skill wasn't written because `dir`, on its path, is a symlink.
+    SkippedSymlink {
+        dir: String,
+    },
+    /// The file resolves to the same file as this skill or block file, already handled.
+    SameAs(&'static str),
+    /// The file couldn't be inspected or written; the message names it.
+    Failed(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What happened to each file, by its path relative to the project root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
-    pub skill: Outcome,
-    pub agents_md: Outcome,
+    pub skills: Vec<(&'static str, Outcome)>,
+    pub blocks: Vec<(&'static str, Outcome)>,
 }
+
+/// Appended to a dangling skill link's error when selecting the other skill would fix it.
+const CREATE_WITH_ALL_HINT: &str = " (run devy agent-setup --all to create it)";
 
 /// A file that couldn't be set up.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,53 +249,289 @@ pub struct Problem {
 }
 
 impl Report {
-    /// Prints a line per file written or already current.
-    pub fn print(&self) {
-        print_outcome(SKILL_PATH, self.skill);
-        print_outcome(AGENTS_MD, self.agents_md);
+    fn files(&self) -> impl Iterator<Item = &(&'static str, Outcome)> {
+        self.skills.iter().chain(&self.blocks)
     }
 
+    /// Prints a line per file written, already current or skipped.
+    pub fn print(&self) {
+        for (path, outcome) in self.files() {
+            print_outcome(path, outcome);
+        }
+    }
+
+    /// The files that couldn't be set up, in processing order.
     pub fn problems(&self) -> Vec<Problem> {
-        let mut problems = vec![];
-        if self.skill == Outcome::NotOurs {
-            problems.push(Problem {
-                message: format!("{SKILL_PATH} was not written by devy. Use --force to overwrite."),
-                fix: "run devy agent-setup --force to replace it",
-            });
-        }
-        if self.agents_md == Outcome::UnbalancedMarkers {
-            problems.push(Problem {
-                message: format!(
-                    "{AGENTS_MD} has a {BEGIN} marker without a matching {END}, or the reverse. \
-                     Fix the markers and rerun devy agent-setup."
-                ),
-                fix: "fix the markers, then run devy agent-setup",
-            });
-        }
-        problems
+        self.files()
+            .filter_map(|(path, outcome)| match outcome {
+                Outcome::NotOurs => Some(Problem {
+                    message: format!("{path} was not written by devy. Use --force to overwrite."),
+                    fix: "run devy agent-setup --force to replace it",
+                }),
+                Outcome::UnbalancedMarkers => Some(Problem {
+                    message: format!(
+                        "{path} has a {BEGIN} marker without a matching {END}, or the reverse. \
+                         Fix the markers and rerun devy agent-setup."
+                    ),
+                    fix: "fix the markers, then run devy agent-setup",
+                }),
+                Outcome::Failed(message) => Some(Problem {
+                    message: message.clone(),
+                    fix: if message.ends_with(CREATE_WITH_ALL_HINT) {
+                        "run devy agent-setup --all to create it"
+                    } else {
+                        "run devy agent-setup to retry"
+                    },
+                }),
+                _ => None,
+            })
+            .collect()
     }
 }
 
-fn print_outcome(path: &str, outcome: Outcome) {
+fn print_outcome(path: &str, outcome: &Outcome) {
     match outcome {
         Outcome::Wrote => output::success(&format!("wrote {path}")),
         Outcome::Updated => output::success(&format!("updated {path}")),
         Outcome::UpToDate => output::skip(&format!("{path} is up to date")),
-        Outcome::Absent | Outcome::NotOurs | Outcome::UnbalancedMarkers => {}
+        Outcome::SkippedSymlink { dir } => {
+            output::skip(&format!("skipped {path}: {dir} is a symlink"))
+        }
+        Outcome::SameAs(other) => output::skip(&format!("{path} is the same file as {other}")),
+        Outcome::Absent | Outcome::NotOurs | Outcome::UnbalancedMarkers | Outcome::Failed(_) => {}
     }
 }
 
-/// Writes the skill and maintains the AGENTS.md block under `root`. Files that can't be
-/// set up are reported in the outcome and left unchanged; I/O failures are errors.
-pub fn apply(root: &Path, opts: Options) -> Result<Report> {
-    Ok(Report {
-        skill: apply_skill(root, opts.force)?,
-        agents_md: apply_agents_md(root, opts.agents_md)?,
+/// A per-file error as an outcome, so the remaining files are still processed.
+fn or_failed(result: Result<Outcome>) -> Outcome {
+    result.unwrap_or_else(|e| Outcome::Failed(format!("{e:#}")))
+}
+
+/// Writes the selected skills and maintains the devy block in AGENTS.md and GEMINI.md
+/// under `root`. Every file is processed: one that can't be set up, including one
+/// whose I/O fails, is reported in its outcome and left unchanged.
+pub fn apply(root: &Path, opts: &Options) -> Report {
+    let mut report = Report {
+        skills: apply_skills(root, &opts.selection.targets(root), opts.force),
+        ..Default::default()
+    };
+    // A file reached through two names (GEMINI.md linking to AGENTS.md) is updated once.
+    let mut handled: Vec<(PathBuf, &'static str)> = vec![];
+    for (name, create) in BLOCK_FILES {
+        let path = root.join(name);
+        let resolved = std::fs::canonicalize(&path).ok();
+        let same_as = resolved
+            .as_ref()
+            .and_then(|r| handled.iter().find(|(h, _)| h == r))
+            .map(|(_, first)| *first);
+        let outcome = match same_as {
+            Some(first) => Outcome::SameAs(first),
+            None => or_failed(apply_block(root, name, create, opts.agents_md)),
+        };
+        // A file this run created only now resolves.
+        let resolved = resolved.or_else(|| {
+            (outcome == Outcome::Wrote)
+                .then(|| std::fs::canonicalize(&path).ok())
+                .flatten()
+        });
+        if let (Some(resolved), None) = (resolved, same_as) {
+            handled.push((resolved, name));
+        }
+        report.blocks.push((name, outcome));
+    }
+    report
+}
+
+/// The first directory on the path of `rel` (relative to `root`; the file's own name
+/// is not checked) that is a symlink, as a relative path with `/` separators.
+fn first_symlinked_dir(root: &Path, rel: &str) -> Option<String> {
+    let dir = Path::new(rel).parent()?;
+    let mut path = root.to_path_buf();
+    let mut shown: Vec<&str> = vec![];
+    for part in dir.components() {
+        let Component::Normal(name) = part else {
+            continue;
+        };
+        path.push(name);
+        shown.push(name.to_str()?);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => return Some(shown.join("/")),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// What [`plan_skill`] found for one skill target before anything is written.
+enum SkillPlan {
+    /// Settled without writing: skipped, or refused.
+    Done(Outcome),
+    /// The file the target reaches, to write once per group of targets that share it.
+    Write {
+        resolved: PathBuf,
+        /// The target itself is a symlink.
+        is_link: bool,
+        /// A symlink whose target doesn't exist yet.
+        dangling: bool,
+    },
+}
+
+/// Writes the selected skills, each file once: targets that resolve to the same file
+/// (one skill linking to the other, in either direction) form a group, written through
+/// its member that is not a link (else the first), while the others are reported as
+/// [`Outcome::SameAs`] it. Outcomes are in target order.
+fn apply_skills(root: &Path, targets: &[Target], force: bool) -> Vec<(&'static str, Outcome)> {
+    let plans: Vec<SkillPlan> = targets
+        .iter()
+        .map(|&t| plan_skill(root, t).unwrap_or_else(|e| SkillPlan::Done(failed(e))))
+        .collect();
+    let mut outcomes: Vec<Option<Outcome>> = vec![None; targets.len()];
+    for i in 0..targets.len() {
+        if outcomes[i].is_some() {
+            continue;
+        }
+        let SkillPlan::Write { resolved, .. } = &plans[i] else {
+            if let SkillPlan::Done(outcome) = &plans[i] {
+                outcomes[i] = Some(outcome.clone());
+            }
+            continue;
+        };
+        let members: Vec<usize> = (i..targets.len())
+            .filter(|&j| matches!(&plans[j], SkillPlan::Write { resolved: r, .. } if r == resolved))
+            .collect();
+        let primary = members
+            .iter()
+            .copied()
+            .find(|&j| matches!(plans[j], SkillPlan::Write { is_link: false, .. }))
+            .unwrap_or(i);
+        let rel = targets[primary].path();
+        outcomes[primary] = Some(match &plans[primary] {
+            // Never create a file through a link.
+            SkillPlan::Write {
+                dangling: true,
+                resolved,
+                ..
+            } => {
+                // The other skill, not selected this run, would make the link resolve.
+                let other_skill = Target::ALL.iter().any(|t| {
+                    !targets.contains(t)
+                        && resolve_lexically(&root.join(t.path())).as_ref() == Some(resolved)
+                });
+                let hint = if other_skill {
+                    CREATE_WITH_ALL_HINT
+                } else {
+                    ""
+                };
+                Outcome::Failed(format!(
+                    "{rel} links to {}, which does not exist{hint}",
+                    shown_in_root(root, resolved)
+                ))
+            }
+            _ => or_failed(apply_skill(root, targets[primary], force)),
+        });
+        for j in members.into_iter().filter(|&j| j != primary) {
+            outcomes[j] = Some(Outcome::SameAs(rel));
+        }
+    }
+    targets
+        .iter()
+        .zip(outcomes)
+        .map(|(t, o)| (t.path(), o.expect("every target has an outcome")))
+        .collect()
+}
+
+fn failed(e: anyhow::Error) -> Outcome {
+    Outcome::Failed(format!("{e:#}"))
+}
+
+/// Checks `target`'s directories and, when the skill is a symlink, where it leads,
+/// without writing anything.
+fn plan_skill(root: &Path, target: Target) -> Result<SkillPlan> {
+    if let Some(outcome) = check_skill_dirs(root, target)? {
+        return Ok(SkillPlan::Done(outcome));
+    }
+    let rel = target.path();
+    let path = root.join(rel);
+    let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        let resolved = resolve_lexically(&path).unwrap_or(path);
+        return Ok(SkillPlan::Write {
+            resolved,
+            is_link,
+            dangling: false,
+        });
+    }
+    // Only a missing target makes a link dangling; a loop is left to `resolve_in_root`.
+    let dangling = std::fs::metadata(&path).is_err_and(|e| e.kind() == ErrorKind::NotFound);
+    let resolved = if dangling {
+        let link = std::fs::read_link(&path)
+            .with_context(|| format!("Failed to resolve {}", path.display()))?;
+        let joined = path.parent().unwrap_or(root).join(&link);
+        let Some(resolved) = resolve_lexically(&joined) else {
+            bail!("{rel} links to {}, which does not exist", link.display());
+        };
+        require_in_root(root, &path, &resolved, "write")?;
+        resolved
+    } else {
+        resolve_in_root(root, &path, "write")?
+    };
+    require_skill_name(root, rel, &resolved)?;
+    Ok(SkillPlan::Write {
+        resolved,
+        is_link,
+        dangling,
     })
 }
 
-fn apply_skill(root: &Path, force: bool) -> Result<Outcome> {
-    let path = root.join(SKILL_PATH);
+/// A symlinked skill is followed only to another `SKILL.md`, checked before the marker
+/// and `--force`, so no other file (devy.yml, AGENTS.md) is ever replaced by a skill.
+fn require_skill_name(root: &Path, rel: &str, resolved: &Path) -> Result<()> {
+    if resolved.file_name().is_none_or(|n| n != "SKILL.md") {
+        bail!(
+            "{rel} links to {}, which is not a SKILL.md file",
+            shown_in_root(root, resolved)
+        );
+    }
+    Ok(())
+}
+
+/// `Some` when a directory on the skill's path is a symlink: the shared skill is then
+/// skipped, and the Claude skill fails.
+fn check_skill_dirs(root: &Path, target: Target) -> Result<Option<Outcome>> {
+    let rel = target.path();
+    let path = root.join(rel);
+    let dir = path.parent().context("skill path has no parent")?;
+    if let Some(linked) = first_symlinked_dir(root, rel) {
+        // A repository may link `.agents/skills` to `.claude/skills`. The Claude target
+        // already writes the file that link reaches, and devy never writes through a
+        // committed directory link, so the shared skill is skipped.
+        if target == Target::Shared {
+            return Ok(Some(Outcome::SkippedSymlink { dir: linked }));
+        }
+        // The Claude target fails, with `ensure_dir_in`'s error, as it does on write.
+        crate::fs_safe::ensure_dir_in(root, dir)?;
+        bail!(
+            "refusing to write {}: {linked} is a symlink",
+            path.display()
+        );
+    }
+    Ok(None)
+}
+
+/// Writes the skill for `target` under the overwrite rules. The checks of
+/// [`plan_skill`] are repeated, as the file is about to be read and written.
+fn apply_skill(root: &Path, target: Target, force: bool) -> Result<Outcome> {
+    if let Some(outcome) = check_skill_dirs(root, target)? {
+        return Ok(outcome);
+    }
+    let rel = target.path();
+    let path = root.join(rel);
+    let dir = path.parent().context("skill path has no parent")?;
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        let resolved = resolve_in_root(root, &path, "write")?;
+        require_skill_name(root, rel, &resolved)?;
+    }
     let content = skill();
     let existing = read_if_exists(root, &path)?;
     let outcome = match existing {
@@ -133,18 +540,24 @@ fn apply_skill(root: &Path, force: bool) -> Result<Outcome> {
         Some(_) => Outcome::Updated,
         None => Outcome::Wrote,
     };
-    let dir = path.parent().context("skill path has no parent")?;
     // Never through a symlinked `.claude` or `.claude/skills` a repository committed.
     crate::fs_safe::ensure_dir_in(root, dir)?;
     write_atomic(root, &path, &content)?;
     Ok(outcome)
 }
 
-fn apply_agents_md(root: &Path, create: bool) -> Result<Outcome> {
-    let path = root.join(AGENTS_MD);
+/// Maintains the devy block in the file `name` under `root`. The file is created only
+/// for [`CreateWith::AgentsMdFlag`] when `agents_md` is set.
+fn apply_block(root: &Path, name: &str, create: CreateWith, agents_md: bool) -> Result<Outcome> {
+    let path = root.join(name);
+    // A dangling GEMINI.md, which devy would never create, is as good as absent.
+    if create == CreateWith::Never && is_dangling_link(&path) {
+        return Ok(Outcome::Absent);
+    }
+    check_link_target(root, name, &path)?;
     let block = agents_block();
     let Some(old) = read_if_exists(root, &path)? else {
-        if !create {
+        if !(create == CreateWith::AgentsMdFlag && agents_md) {
             return Ok(Outcome::Absent);
         }
         write_atomic(root, &path, &format!("{block}\n"))?;
@@ -158,6 +571,51 @@ fn apply_agents_md(root: &Path, create: bool) -> Result<Outcome> {
     }
     write_atomic(root, &path, &new)?;
     Ok(Outcome::Updated)
+}
+
+/// Whether `path` is a symlink whose target doesn't exist. Nothing is read or written
+/// through such a link, so where it points doesn't matter.
+fn is_dangling_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+        && std::fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// Fails when the block file `name` is a symlink to an existing file that must not get
+/// the block: one whose name doesn't end in `.md` (`devy.yml`, a script), or a devy
+/// skill file, which the next run would rewrite, so the two would fight forever.
+fn check_link_target(root: &Path, name: &str, path: &Path) -> Result<()> {
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link {
+        return Ok(());
+    }
+    let target = resolve_in_root(root, path, "write")?;
+    let shown = shown_in_root(root, &target);
+    let is_markdown = target
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    if !is_markdown {
+        bail!("{name} links to {shown}, which is not a Markdown file");
+    }
+    let is_skill = Target::ALL
+        .iter()
+        .filter_map(|t| std::fs::canonicalize(root.join(t.path())).ok())
+        .any(|skill| skill == target);
+    if is_skill {
+        bail!("{name} links to {shown}, a devy skill file");
+    }
+    Ok(())
+}
+
+/// `target` (a canonical path) relative to `root` with `/` separators, for messages.
+fn shown_in_root(root: &Path, target: &Path) -> String {
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    target
+        .strip_prefix(&canonical_root)
+        .unwrap_or(target)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// `content` with exactly one devy block, `block`: the first existing block is replaced
@@ -262,6 +720,13 @@ fn resolve_in_root(root: &Path, path: &Path, verb: &str) -> Result<PathBuf> {
     }
     let target = std::fs::canonicalize(path)
         .with_context(|| format!("Failed to resolve {}", path.display()))?;
+    require_in_root(root, path, &target, verb)?;
+    Ok(target)
+}
+
+/// Fails unless `target`, the resolved form of the link `path`, is inside `root` and not
+/// under `.git`.
+fn require_in_root(root: &Path, path: &Path, target: &Path, verb: &str) -> Result<()> {
     let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let into_git = target.strip_prefix(&canonical_root).is_ok_and(|rel| {
         rel.components()
@@ -273,7 +738,32 @@ fn resolve_in_root(root: &Path, path: &Path, verb: &str) -> Result<PathBuf> {
             path.display()
         );
     }
-    Ok(target)
+    Ok(())
+}
+
+/// `path` with its longest existing ancestor canonicalized and the rest appended. `None`
+/// unless that rest is plain names whose first one really is missing (not a dangling
+/// symlink), so the result is the file that creating `path` would create; a `..` after
+/// a missing part could never be resolved.
+fn resolve_lexically(path: &Path) -> Option<PathBuf> {
+    let (base, mut resolved) = path
+        .ancestors()
+        .find_map(|a| std::fs::canonicalize(a).ok().map(|c| (a, c)))?;
+    let mut rest = path.strip_prefix(base).ok()?.components().peekable();
+    if let Some(first) = rest.peek() {
+        let missing = std::fs::symlink_metadata(base.join(first))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+        if !missing {
+            return None;
+        }
+    }
+    for part in rest {
+        let Component::Normal(name) = part else {
+            return None;
+        };
+        resolved.push(name);
+    }
+    Some(resolved)
 }
 
 /// Replaces `path` through a temp file in the same directory, so an interrupted write
@@ -315,42 +805,38 @@ pub fn run(opts: Options, print: bool) -> Result<()> {
     if print {
         return super::json::write_stdout(&skill());
     }
-    run_in(&project_root()?, opts)
+    run_in(&project_root()?, &opts)
 }
 
 /// `devy agent-setup` for the project at `root`: fails when a file couldn't be set up.
-fn run_in(root: &Path, opts: Options) -> Result<()> {
-    let report = apply(root, opts)?;
+fn run_in(root: &Path, opts: &Options) -> Result<()> {
+    let report = apply(root, opts);
     report.print();
-    let mut problems = report.problems().into_iter();
-    match problems.next() {
-        None => Ok(()),
-        Some(first) => {
-            for other in problems {
-                output::warn(&other.message);
-            }
-            bail!(first.message)
-        }
+    // In processing order: every problem but the last as a warning, the last as the error.
+    let mut problems = report.problems();
+    let Some(last) = problems.pop() else {
+        return Ok(());
+    };
+    for problem in problems {
+        output::warn(&problem.message);
     }
+    bail!(last.message)
 }
 
 /// The agent setup `devy init` runs after writing devy.yml in `root`. It never fails:
 /// devy.yml is already written, so problems become warnings.
 pub fn run_for_init(root: &Path) {
-    let problems = match apply(root, Options::default()) {
-        Ok(report) => {
-            report.print();
-            report.problems()
-        }
-        Err(e) => vec![Problem {
-            message: format!("{e:#}"),
-            fix: "run devy agent-setup to retry",
-        }],
-    };
-    for problem in problems {
+    let report = apply(root, &Options::default());
+    report.print();
+    for problem in report.problems() {
+        // The fix already says what the hint would, so don't repeat it.
+        let message = problem
+            .message
+            .strip_suffix(CREATE_WITH_ALL_HINT)
+            .unwrap_or(&problem.message);
         output::warn(&format!(
-            "agent setup skipped: {} — {}",
-            problem.message, problem.fix
+            "agent setup incomplete: {message} — {}",
+            problem.fix
         ));
     }
 }
@@ -363,7 +849,182 @@ mod tests {
         std::fs::read_to_string(root.join(path)).unwrap()
     }
 
+    /// The outcome reported for the file at `path` in `files`.
+    fn outcome_of(files: &[(&'static str, Outcome)], path: &str) -> Outcome {
+        files
+            .iter()
+            .find(|(p, _)| *p == path)
+            .unwrap_or_else(|| panic!("{path} not reported in {files:?}"))
+            .1
+            .clone()
+    }
+
+    fn skill_outcome(report: &Report) -> Outcome {
+        outcome_of(&report.skills, SKILL_PATH)
+    }
+
+    fn block_outcome(report: &Report, name: &str) -> Outcome {
+        outcome_of(&report.blocks, name)
+    }
+
+    fn all() -> Options {
+        Options {
+            selection: Selection::All,
+            ..Default::default()
+        }
+    }
+
+    // ── targets, selection and detection ─────────────────────────────────────
+
+    #[test]
+    fn every_agent_name_maps_to_its_target() {
+        use clap::ValueEnum;
+        let names: Vec<(String, Target)> = AgentName::value_variants()
+            .iter()
+            .map(|a| {
+                let name = a.to_possible_value().unwrap().get_name().to_string();
+                (name, a.target())
+            })
+            .collect();
+        let expected: Vec<(String, Target)> = [
+            ("claude", Target::Claude),
+            ("codex", Target::Shared),
+            ("gemini", Target::Shared),
+            ("cursor", Target::Shared),
+            ("copilot", Target::Shared),
+            ("windsurf", Target::Shared),
+            ("opencode", Target::Shared),
+            ("amp", Target::Shared),
+        ]
+        .into_iter()
+        .map(|(n, t)| (n.to_string(), t))
+        .collect();
+        assert_eq!(names, expected);
+        assert_eq!(Target::Claude.path(), ".claude/skills/devy/SKILL.md");
+        assert_eq!(Target::Shared.path(), ".agents/skills/devy/SKILL.md");
+    }
+
+    #[test]
+    fn selection_deduplicates_and_orders_targets() {
+        let dir = crate::test_support::tmp_dir();
+        let from = |agents: &[AgentName], all| Selection::from_flags(agents, all).targets(&dir);
+        assert_eq!(
+            from(
+                &[
+                    AgentName::Gemini,
+                    AgentName::Claude,
+                    AgentName::Cursor,
+                    AgentName::Claude
+                ],
+                false
+            ),
+            [Target::Claude, Target::Shared]
+        );
+        assert_eq!(
+            from(&[AgentName::Cursor, AgentName::Gemini], false),
+            [Target::Shared]
+        );
+        assert_eq!(from(&[AgentName::Claude], false), [Target::Claude]);
+        assert_eq!(from(&[], true), [Target::Claude, Target::Shared]);
+        assert_eq!(Selection::from_flags(&[], false), Selection::Detect);
+        assert_eq!(Selection::default(), Selection::Detect);
+        // No markers: Claude only.
+        assert_eq!(from(&[], false), [Target::Claude]);
+    }
+
+    #[test]
+    fn detect_finds_each_marker() {
+        let dir = crate::test_support::tmp_dir();
+        assert!(!detect(&dir), "no markers");
+        for marker in DETECTION_MARKERS {
+            let dir = crate::test_support::tmp_dir();
+            let path = dir.join(marker);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if !marker.ends_with('/') {
+                std::fs::write(&path, "x\n").unwrap();
+            } else {
+                std::fs::create_dir(&path).unwrap();
+            }
+            assert!(detect(&dir), "{marker} is a marker");
+            assert_eq!(
+                Selection::Detect.targets(&dir),
+                [Target::Claude, Target::Shared],
+                "{marker}"
+            );
+        }
+        // `.github` alone, as in most repositories, is not a marker.
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        assert!(!detect(&dir));
+    }
+
+    #[test]
+    fn detection_marker_list_matches_the_spec() {
+        assert_eq!(
+            DETECTION_MARKERS,
+            [
+                ".agents/",
+                ".codex/",
+                ".gemini/",
+                "GEMINI.md",
+                ".cursor/",
+                ".cursorrules",
+                ".github/copilot-instructions.md",
+                ".github/instructions/",
+                ".github/skills/",
+                ".windsurf/",
+                ".windsurfrules",
+                ".devin/",
+                ".opencode/",
+                "opencode.json",
+                ".amp/",
+                "AGENTS.md",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_marker_symlink_counts_and_is_not_followed() {
+        let dir = crate::test_support::tmp_dir();
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join(".cursor")).unwrap();
+        assert!(detect(&dir));
+
+        // A marker below a symlinked `.github` is never looked up through the link.
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        std::fs::create_dir(outside.join("instructions")).unwrap();
+        std::os::unix::fs::symlink(&*outside, dir.join(".github")).unwrap();
+        assert!(!detect(&dir));
+    }
+
     // ── templates ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn skill_name_matches_each_targets_directory_and_description_fits() {
+        let skill = skill();
+        let frontmatter = skill
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .expect("frontmatter")
+            .0;
+        let field = |key: &str| {
+            frontmatter
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+                .unwrap_or_else(|| panic!("no {key}"))
+                .to_string()
+        };
+        let description = field("description");
+        assert!(description.chars().count() <= 1024, "{}", description.len());
+        for target in Target::ALL {
+            let dir = Path::new(target.path())
+                .parent()
+                .and_then(Path::file_name)
+                .unwrap();
+            assert_eq!(field("name"), dir.to_str().unwrap(), "{target:?}");
+        }
+    }
 
     #[test]
     fn skill_has_frontmatter_and_covers_the_guidance() {
@@ -414,9 +1075,9 @@ mod tests {
     #[test]
     fn fresh_setup_writes_the_skill_only() {
         let dir = crate::test_support::tmp_dir();
-        let report = apply(&dir, Options::default()).unwrap();
-        assert_eq!(report.skill, Outcome::Wrote);
-        assert_eq!(report.agents_md, Outcome::Absent);
+        let report = apply(&dir, &Options::default());
+        assert_eq!(skill_outcome(&report), Outcome::Wrote);
+        assert_eq!(block_outcome(&report, AGENTS_MD), Outcome::Absent);
         assert_eq!(read(&dir, SKILL_PATH), skill());
         assert!(!dir.join(AGENTS_MD).exists());
         assert!(report.problems().is_empty());
@@ -425,9 +1086,9 @@ mod tests {
     #[test]
     fn rerun_is_up_to_date() {
         let dir = crate::test_support::tmp_dir();
-        apply(&dir, Options::default()).unwrap();
-        let report = apply(&dir, Options::default()).unwrap();
-        assert_eq!(report.skill, Outcome::UpToDate);
+        apply(&dir, &Options::default());
+        let report = apply(&dir, &Options::default());
+        assert_eq!(skill_outcome(&report), Outcome::UpToDate);
     }
 
     #[test]
@@ -436,8 +1097,8 @@ mod tests {
         std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
         let old = format!("---\nname: devy\n---\n{}\nold advice\n", marker());
         std::fs::write(dir.join(SKILL_PATH), old).unwrap();
-        let report = apply(&dir, Options::default()).unwrap();
-        assert_eq!(report.skill, Outcome::Updated);
+        let report = apply(&dir, &Options::default());
+        assert_eq!(skill_outcome(&report), Outcome::Updated);
         assert_eq!(read(&dir, SKILL_PATH), skill());
     }
 
@@ -447,7 +1108,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
         std::fs::write(dir.join(SKILL_PATH), "my own skill\n").unwrap();
 
-        let err = run_in(&dir, Options::default()).unwrap_err();
+        let err = run_in(&dir, &Options::default()).unwrap_err();
         assert_eq!(
             err.to_string(),
             ".claude/skills/devy/SKILL.md was not written by devy. Use --force to overwrite."
@@ -456,7 +1117,7 @@ mod tests {
 
         run_in(
             &dir,
-            Options {
+            &Options {
                 force: true,
                 ..Default::default()
             },
@@ -471,14 +1132,14 @@ mod tests {
     fn existing_agents_md_gains_the_block() {
         let dir = crate::test_support::tmp_dir();
         std::fs::write(dir.join(AGENTS_MD), "# Agents\n\nUse tabs.\n").unwrap();
-        let report = apply(&dir, Options::default()).unwrap();
-        assert_eq!(report.agents_md, Outcome::Updated);
+        let report = apply(&dir, &Options::default());
+        assert_eq!(block_outcome(&report, AGENTS_MD), Outcome::Updated);
         assert_eq!(
             read(&dir, AGENTS_MD),
             format!("# Agents\n\nUse tabs.\n\n{}\n", agents_block())
         );
-        let again = apply(&dir, Options::default()).unwrap();
-        assert_eq!(again.agents_md, Outcome::UpToDate);
+        let again = apply(&dir, &Options::default());
+        assert_eq!(block_outcome(&again, AGENTS_MD), Outcome::UpToDate);
     }
 
     #[test]
@@ -489,7 +1150,7 @@ mod tests {
             format!("# Agents\n{BEGIN}\nold devy text\n{END}\n\n## Style\nUse tabs.\n"),
         )
         .unwrap();
-        apply(&dir, Options::default()).unwrap();
+        apply(&dir, &Options::default());
         assert_eq!(
             read(&dir, AGENTS_MD),
             format!("# Agents\n{}\n\n## Style\nUse tabs.\n", agents_block())
@@ -512,7 +1173,7 @@ mod tests {
         ] {
             let dir = crate::test_support::tmp_dir();
             std::fs::write(dir.join(AGENTS_MD), &doc).unwrap();
-            let err = run_in(&dir, Options::default()).unwrap_err();
+            let err = run_in(&dir, &Options::default()).unwrap_err();
             assert!(err.to_string().contains("AGENTS.md"), "{err}");
             assert_eq!(read(&dir, AGENTS_MD), doc, "AGENTS.md is left unchanged");
         }
@@ -523,13 +1184,12 @@ mod tests {
         let dir = crate::test_support::tmp_dir();
         let report = apply(
             &dir,
-            Options {
+            &Options {
                 agents_md: true,
                 ..Default::default()
             },
-        )
-        .unwrap();
-        assert_eq!(report.agents_md, Outcome::Wrote);
+        );
+        assert_eq!(block_outcome(&report, AGENTS_MD), Outcome::Wrote);
         assert_eq!(read(&dir, AGENTS_MD), format!("{}\n", agents_block()));
     }
 
@@ -547,7 +1207,7 @@ mod tests {
         let path = dir.join(AGENTS_MD);
         std::fs::write(&path, "x\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        apply(&dir, Options::default()).unwrap();
+        apply(&dir, &Options::default());
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
@@ -632,8 +1292,8 @@ mod tests {
         let dir = crate::test_support::tmp_dir();
         std::fs::write(dir.join("CLAUDE.md"), "# Guide\n").unwrap();
         std::os::unix::fs::symlink("CLAUDE.md", dir.join(AGENTS_MD)).unwrap();
-        let report = apply(&dir, Options::default()).unwrap();
-        assert_eq!(report.agents_md, Outcome::Updated);
+        let report = apply(&dir, &Options::default());
+        assert_eq!(block_outcome(&report, AGENTS_MD), Outcome::Updated);
         assert!(
             std::fs::symlink_metadata(dir.join(AGENTS_MD))
                 .unwrap()
@@ -652,16 +1312,286 @@ mod tests {
     fn symlinked_skill_updates_its_target() {
         let dir = crate::test_support::tmp_dir();
         std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
-        std::fs::write(dir.join("shared-skill.md"), marker()).unwrap();
-        std::os::unix::fs::symlink(dir.join("shared-skill.md"), dir.join(SKILL_PATH)).unwrap();
-        apply(&dir, Options::default()).unwrap();
+        std::fs::create_dir(dir.join("shared")).unwrap();
+        std::fs::write(dir.join("shared/SKILL.md"), marker()).unwrap();
+        std::os::unix::fs::symlink(dir.join("shared/SKILL.md"), dir.join(SKILL_PATH)).unwrap();
+        apply(&dir, &Options::default());
         assert!(
             std::fs::symlink_metadata(dir.join(SKILL_PATH))
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(read(&dir, "shared-skill.md"), skill());
+        assert_eq!(read(&dir, "shared/SKILL.md"), skill());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_linking_to_a_non_skill_file_is_refused_even_with_force() {
+        for (link, target, shown) in [
+            ("../../../devy.yml", "devy.yml", "devy.yml"),
+            ("../../../AGENTS.md", AGENTS_MD, "AGENTS.md"),
+        ] {
+            let dir = crate::test_support::tmp_dir();
+            std::fs::write(dir.join(target), "keep me\n").unwrap();
+            std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+            std::os::unix::fs::symlink(link, dir.join(SKILL_PATH)).unwrap();
+            let report = apply(
+                &dir,
+                &Options {
+                    force: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                skill_outcome(&report),
+                Outcome::Failed(format!(
+                    "{SKILL_PATH} links to {shown}, which is not a SKILL.md file"
+                ))
+            );
+            assert_eq!(report.problems().len(), 1, "{:?}", report.problems());
+            // AGENTS.md gets its own block, as always, but never the skill.
+            let kept = read(&dir, target);
+            assert!(kept.starts_with("keep me\n"), "{kept}");
+            assert!(!kept.contains(&marker()), "{kept}");
+            if target == "devy.yml" {
+                assert_eq!(kept, "keep me\n");
+            }
+            assert!(
+                std::fs::symlink_metadata(dir.join(SKILL_PATH))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_skill_linked_to_the_shared_skill_is_the_same_file() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+        // The target doesn't exist yet: not even `.agents`.
+        std::os::unix::fs::symlink(
+            "../../../.agents/skills/devy/SKILL.md",
+            dir.join(SKILL_PATH),
+        )
+        .unwrap();
+        for run in 0..2 {
+            let report = apply(&dir, &all());
+            assert_eq!(
+                report.skills,
+                [
+                    (SKILL_PATH, Outcome::SameAs(SHARED_SKILL_PATH)),
+                    (
+                        SHARED_SKILL_PATH,
+                        if run == 0 {
+                            Outcome::Wrote
+                        } else {
+                            Outcome::UpToDate
+                        }
+                    ),
+                ],
+                "run {run}"
+            );
+            assert!(report.problems().is_empty(), "{:?}", report.problems());
+            assert!(
+                std::fs::symlink_metadata(dir.join(SKILL_PATH))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(read(&dir, SHARED_SKILL_PATH), skill());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hand_written_skill_reached_through_both_names_is_one_problem() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+        std::fs::create_dir_all(dir.join(".agents/skills/devy")).unwrap();
+        std::fs::write(dir.join(SHARED_SKILL_PATH), "mine\n").unwrap();
+        std::os::unix::fs::symlink(
+            "../../../.agents/skills/devy/SKILL.md",
+            dir.join(SKILL_PATH),
+        )
+        .unwrap();
+        let report = apply(&dir, &all());
+        assert_eq!(
+            report.skills,
+            [
+                (SKILL_PATH, Outcome::SameAs(SHARED_SKILL_PATH)),
+                (SHARED_SKILL_PATH, Outcome::NotOurs),
+            ]
+        );
+        let problems = report.problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].message.starts_with(SHARED_SKILL_PATH));
+        assert_eq!(read(&dir, SHARED_SKILL_PATH), "mine\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unresolvable_dangling_skill_links_never_join_the_shared_skill() {
+        for (setup_evil, link) in [
+            (false, "../../../nope/../.agents/skills/devy/SKILL.md"),
+            (true, "../../../evil/x/../../.agents/skills/devy/SKILL.md"),
+        ] {
+            let dir = crate::test_support::tmp_dir();
+            std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+            if setup_evil {
+                std::os::unix::fs::symlink("/nonexistent/zzz", dir.join("evil")).unwrap();
+            }
+            std::os::unix::fs::symlink(link, dir.join(SKILL_PATH)).unwrap();
+            let report = apply(&dir, &all());
+            assert_eq!(
+                skill_outcome(&report),
+                Outcome::Failed(format!(
+                    "{SKILL_PATH} links to {link}, which does not exist"
+                )),
+                "{link}"
+            );
+            // The shared skill is written on its own; the Claude link stays as it was.
+            assert_eq!(
+                outcome_of(&report.skills, SHARED_SKILL_PATH),
+                Outcome::Wrote
+            );
+            assert!(!dir.join("nope").exists());
+            assert!(std::fs::metadata(dir.join(SKILL_PATH)).is_err());
+            assert_eq!(report.problems().len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn climbing_skill_link_through_the_root_still_joins() {
+        let dir = crate::test_support::tmp_dir();
+        let name = dir.file_name().unwrap().to_str().unwrap().to_string();
+        std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+        std::os::unix::fs::symlink(
+            format!("../../../../{name}/.agents/skills/devy/SKILL.md"),
+            dir.join(SKILL_PATH),
+        )
+        .unwrap();
+        let report = apply(&dir, &all());
+        assert_eq!(
+            report.skills,
+            [
+                (SKILL_PATH, Outcome::SameAs(SHARED_SKILL_PATH)),
+                (SHARED_SKILL_PATH, Outcome::Wrote),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_link_loop_is_not_reported_as_missing() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+        std::fs::create_dir_all(dir.join(".agents/skills/devy")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../.agents/skills/devy/SKILL.md",
+            dir.join(SKILL_PATH),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../../../.claude/skills/devy/SKILL.md",
+            dir.join(SHARED_SKILL_PATH),
+        )
+        .unwrap();
+        let report = apply(&dir, &all());
+        for path in [SKILL_PATH, SHARED_SKILL_PATH] {
+            let Outcome::Failed(msg) = outcome_of(&report.skills, path) else {
+                panic!("{report:?}");
+            };
+            assert!(!msg.contains("does not exist"), "{msg}");
+            assert!(msg.contains("Failed to resolve"), "{msg}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_link_to_the_unselected_skill_hints_at_all() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../.agents/skills/devy/SKILL.md",
+            dir.join(SKILL_PATH),
+        )
+        .unwrap();
+        // No marker: only the Claude skill is selected.
+        let report = apply(&dir, &Options::default());
+        assert_eq!(
+            report.skills,
+            [(
+                SKILL_PATH,
+                Outcome::Failed(format!(
+                    "{SKILL_PATH} links to {SHARED_SKILL_PATH}, which does not exist \
+                     (run devy agent-setup --all to create it)"
+                ))
+            )]
+        );
+        // init's warning suggests --all instead of a plain retry.
+        let problems = report.problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].fix, "run devy agent-setup --all to create it");
+        assert!(!dir.join(".agents").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_skill_link_to_nothing_selected_fails_cleanly() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+        std::os::unix::fs::symlink("../other/SKILL.md", dir.join(SKILL_PATH)).unwrap();
+        let report = apply(&dir, &Options::default());
+        assert_eq!(
+            skill_outcome(&report),
+            Outcome::Failed(format!(
+                "{SKILL_PATH} links to .claude/skills/other/SKILL.md, which does not exist"
+            ))
+        );
+        assert!(!dir.join(".claude/skills/other").exists());
+
+        // Outside the project or a wrong name still fails as before.
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".claude/skills/devy")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/SKILL.md", dir.join(SKILL_PATH)).unwrap();
+        let Outcome::Failed(msg) = skill_outcome(&apply(&dir, &Options::default())) else {
+            panic!()
+        };
+        assert!(msg.contains("links outside the project"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_skill_linked_to_the_claude_skill_is_the_same_file() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".agents/skills/devy")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../.claude/skills/devy/SKILL.md",
+            dir.join(SHARED_SKILL_PATH),
+        )
+        .unwrap();
+        for run in 0..2 {
+            let report = apply(&dir, &all());
+            assert_eq!(
+                skill_outcome(&report),
+                if run == 0 {
+                    Outcome::Wrote
+                } else {
+                    Outcome::UpToDate
+                }
+            );
+            assert_eq!(
+                outcome_of(&report.skills, SHARED_SKILL_PATH),
+                Outcome::SameAs(SKILL_PATH)
+            );
+            assert!(report.problems().is_empty(), "{:?}", report.problems());
+            assert_eq!(read(&dir, SKILL_PATH), skill());
+            assert_eq!(read(&dir, SHARED_SKILL_PATH), skill());
+        }
     }
 
     #[cfg(unix)]
@@ -670,7 +1600,7 @@ mod tests {
         let dir = crate::test_support::tmp_dir();
         let outside = crate::test_support::tmp_dir();
         std::os::unix::fs::symlink(&*outside, dir.join(".claude")).unwrap();
-        let err = format!("{:#}", apply(&dir, Options::default()).unwrap_err());
+        let err = format!("{:#}", run_in(&dir, &Options::default()).unwrap_err());
         assert!(err.contains("it is a symbolic link"), "{err}");
         assert!(!outside.join("skills").exists());
     }
@@ -682,7 +1612,7 @@ mod tests {
         let outside = crate::test_support::tmp_dir();
         std::fs::write(outside.join("notes.md"), "mine\n").unwrap();
         std::os::unix::fs::symlink(outside.join("notes.md"), dir.join(AGENTS_MD)).unwrap();
-        let err = format!("{:#}", apply(&dir, Options::default()).unwrap_err());
+        let err = format!("{:#}", run_in(&dir, &Options::default()).unwrap_err());
         assert!(err.contains("links outside the project"), "{err}");
         assert_eq!(read(&outside, "notes.md"), "mine\n");
 
@@ -690,7 +1620,7 @@ mod tests {
         std::fs::create_dir(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git/config"), "[core]\n").unwrap();
         std::os::unix::fs::symlink(".git/config", dir.join(AGENTS_MD)).unwrap();
-        assert!(apply(&dir, Options::default()).is_err());
+        assert!(run_in(&dir, &Options::default()).is_err());
         assert_eq!(read(&dir, ".git/config"), "[core]\n");
     }
 
@@ -705,17 +1635,17 @@ mod tests {
             .is_ok_and(|s| s.success());
         if made {
             // Returns promptly instead of blocking on the FIFO.
-            assert!(apply(&dir, Options::default()).is_err());
+            assert!(run_in(&dir, &Options::default()).is_err());
             std::fs::remove_file(&fifo).unwrap();
         }
         // A link through the project to a device is refused, never read.
         std::fs::create_dir(dir.join("dev")).unwrap();
         std::os::unix::fs::symlink("/dev/zero", dir.join("dev/zero")).unwrap();
         std::os::unix::fs::symlink("dev/zero", dir.join(AGENTS_MD)).unwrap();
-        assert!(apply(&dir, Options::default()).is_err());
+        assert!(run_in(&dir, &Options::default()).is_err());
         std::fs::remove_file(dir.join(AGENTS_MD)).unwrap();
         std::fs::write(dir.join(AGENTS_MD), "x".repeat(MAX_READ_BYTES as usize + 1)).unwrap();
-        let err = apply(&dir, Options::default()).unwrap_err();
+        let err = run_in(&dir, &Options::default()).unwrap_err();
         assert!(format!("{err:#}").contains("larger than"), "{err:#}");
     }
 
@@ -729,5 +1659,525 @@ mod tests {
             warnings[0].ends_with("fix the markers, then run devy agent-setup"),
             "{warnings:?}"
         );
+    }
+
+    // ── multiple targets ─────────────────────────────────────────────────────
+
+    #[test]
+    fn all_writes_both_skills_with_identical_content() {
+        let dir = crate::test_support::tmp_dir();
+        let report = apply(&dir, &all());
+        assert_eq!(
+            report.skills,
+            [
+                (SKILL_PATH, Outcome::Wrote),
+                (SHARED_SKILL_PATH, Outcome::Wrote)
+            ]
+        );
+        assert_eq!(read(&dir, SKILL_PATH), skill());
+        assert_eq!(read(&dir, SHARED_SKILL_PATH), skill());
+        let again = apply(&dir, &all());
+        assert_eq!(
+            outcome_of(&again.skills, SHARED_SKILL_PATH),
+            Outcome::UpToDate
+        );
+    }
+
+    #[test]
+    fn default_without_markers_writes_no_shared_skill() {
+        let dir = crate::test_support::tmp_dir();
+        let report = apply(&dir, &Options::default());
+        assert_eq!(report.skills, [(SKILL_PATH, Outcome::Wrote)]);
+        assert!(!dir.join(".agents").exists());
+    }
+
+    #[test]
+    fn explicit_shared_agent_writes_no_claude_skill() {
+        let dir = crate::test_support::tmp_dir();
+        let opts = Options {
+            selection: Selection::from_flags(&[AgentName::Codex], false),
+            ..Default::default()
+        };
+        let report = apply(&dir, &opts);
+        assert_eq!(report.skills, [(SHARED_SKILL_PATH, Outcome::Wrote)]);
+        assert!(!dir.join(".claude").exists());
+    }
+
+    #[test]
+    fn refused_shared_skill_still_writes_the_claude_skill() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".agents/skills/devy")).unwrap();
+        std::fs::write(dir.join(SHARED_SKILL_PATH), "mine\n").unwrap();
+
+        let report = apply(&dir, &all());
+        assert_eq!(skill_outcome(&report), Outcome::Wrote);
+        assert_eq!(
+            outcome_of(&report.skills, SHARED_SKILL_PATH),
+            Outcome::NotOurs
+        );
+        assert_eq!(read(&dir, SKILL_PATH), skill());
+        assert_eq!(read(&dir, SHARED_SKILL_PATH), "mine\n");
+        let problems = report.problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(
+            problems[0].message,
+            ".agents/skills/devy/SKILL.md was not written by devy. Use --force to overwrite."
+        );
+
+        let err = run_in(&dir, &all()).unwrap_err();
+        assert!(err.to_string().starts_with(SHARED_SKILL_PATH), "{err}");
+
+        // --force applies to every skill file.
+        std::fs::write(dir.join(SKILL_PATH), "mine too\n").unwrap();
+        run_in(
+            &dir,
+            &Options {
+                force: true,
+                ..all()
+            },
+        )
+        .unwrap();
+        assert_eq!(read(&dir, SKILL_PATH), skill());
+        assert_eq!(read(&dir, SHARED_SKILL_PATH), skill());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_shared_dir_is_skipped_not_written_through() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".claude/skills")).unwrap();
+        std::fs::create_dir(dir.join(".agents")).unwrap();
+        std::os::unix::fs::symlink("../.claude/skills", dir.join(".agents/skills")).unwrap();
+
+        let report = apply(&dir, &all());
+        assert_eq!(skill_outcome(&report), Outcome::Wrote);
+        assert_eq!(
+            outcome_of(&report.skills, SHARED_SKILL_PATH),
+            Outcome::SkippedSymlink {
+                dir: ".agents/skills".into()
+            }
+        );
+        assert!(report.problems().is_empty());
+        assert!(
+            std::fs::symlink_metadata(dir.join(".agents/skills"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        run_in(&dir, &all()).unwrap();
+        // Detected (`.agents` is a marker) as well as requested.
+        run_in(&dir, &Options::default()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_agents_dir_pointing_outside_is_skipped() {
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        std::os::unix::fs::symlink(&*outside, dir.join(".agents")).unwrap();
+        let report = apply(&dir, &all());
+        assert_eq!(
+            outcome_of(&report.skills, SHARED_SKILL_PATH),
+            Outcome::SkippedSymlink {
+                dir: ".agents".into()
+            }
+        );
+        assert!(!outside.join("skills").exists());
+
+        // The Claude target still refuses a symlinked `.claude`, alongside the skip.
+        let dir = crate::test_support::tmp_dir();
+        std::os::unix::fs::symlink(&*outside, dir.join(".agents")).unwrap();
+        std::os::unix::fs::symlink(&*outside, dir.join(".claude")).unwrap();
+        let err = format!("{:#}", run_in(&dir, &all()).unwrap_err());
+        assert!(err.contains("it is a symbolic link"), "{err}");
+        assert!(!outside.join("skills").exists());
+    }
+
+    #[test]
+    fn first_symlinked_dir_ignores_missing_and_real_dirs() {
+        let dir = crate::test_support::tmp_dir();
+        assert_eq!(first_symlinked_dir(&dir, SHARED_SKILL_PATH), None);
+        std::fs::create_dir_all(dir.join(".agents/skills/devy")).unwrap();
+        assert_eq!(first_symlinked_dir(&dir, SHARED_SKILL_PATH), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_skill_dir_itself_is_named() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".agents/skills")).unwrap();
+        std::fs::create_dir(dir.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink("../../elsewhere", dir.join(".agents/skills/devy")).unwrap();
+        assert_eq!(
+            first_symlinked_dir(&dir, SHARED_SKILL_PATH).as_deref(),
+            Some(".agents/skills/devy")
+        );
+        apply(&dir, &all());
+        assert!(!dir.join("elsewhere/SKILL.md").exists());
+    }
+
+    // ── GEMINI.md ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn existing_gemini_md_gains_the_block() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join(GEMINI_MD), "# Gemini\n").unwrap();
+        let report = apply(&dir, &Options::default());
+        assert_eq!(block_outcome(&report, GEMINI_MD), Outcome::Updated);
+        assert_eq!(
+            read(&dir, GEMINI_MD),
+            format!("# Gemini\n\n{}\n", agents_block())
+        );
+        // GEMINI.md is a marker, so the shared skill was written too.
+        assert_eq!(read(&dir, SHARED_SKILL_PATH), skill());
+        let again = apply(&dir, &Options::default());
+        assert_eq!(block_outcome(&again, GEMINI_MD), Outcome::UpToDate);
+    }
+
+    #[test]
+    fn gemini_md_is_never_created() {
+        let dir = crate::test_support::tmp_dir();
+        let report = apply(
+            &dir,
+            &Options {
+                agents_md: true,
+                ..all()
+            },
+        );
+        assert_eq!(block_outcome(&report, GEMINI_MD), Outcome::Absent);
+        assert_eq!(block_outcome(&report, AGENTS_MD), Outcome::Wrote);
+        assert!(!dir.join(GEMINI_MD).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemini_md_linked_to_agents_md_gets_one_block() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join(AGENTS_MD), "# Agents\n").unwrap();
+        std::os::unix::fs::symlink(AGENTS_MD, dir.join(GEMINI_MD)).unwrap();
+        let report = apply(&dir, &Options::default());
+        assert_eq!(block_outcome(&report, AGENTS_MD), Outcome::Updated);
+        assert_eq!(
+            block_outcome(&report, GEMINI_MD),
+            Outcome::SameAs(AGENTS_MD)
+        );
+        let agents = read(&dir, AGENTS_MD);
+        assert_eq!(agents.matches(BEGIN).count(), 1, "{agents}");
+        assert_eq!(agents, format!("# Agents\n\n{}\n", agents_block()));
+
+        // The same when AGENTS.md is the link, and when --agents-md creates its target.
+        let dir = crate::test_support::tmp_dir();
+        std::os::unix::fs::symlink(GEMINI_MD, dir.join(AGENTS_MD)).unwrap();
+        std::fs::write(dir.join(GEMINI_MD), "# Gemini\n").unwrap();
+        apply(&dir, &Options::default());
+        assert_eq!(read(&dir, GEMINI_MD).matches(BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn regular_file_named_like_a_directory_marker_is_not_detected() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join(".agents"), "").unwrap();
+        std::fs::write(dir.join(".cursor"), "").unwrap();
+        assert!(!detect(&dir));
+        let report = apply(&dir, &Options::default());
+        assert_eq!(report.skills, [(SKILL_PATH, Outcome::Wrote)]);
+
+        // Asked for explicitly, the shared skill fails on its own; Claude's is written.
+        let report = apply(&dir, &all());
+        assert_eq!(skill_outcome(&report), Outcome::UpToDate);
+        assert!(matches!(
+            outcome_of(&report.skills, SHARED_SKILL_PATH),
+            Outcome::Failed(_)
+        ));
+        assert_eq!(report.problems().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_gemini_md_counts_as_absent() {
+        let dir = crate::test_support::tmp_dir();
+        std::os::unix::fs::symlink(AGENTS_MD, dir.join(GEMINI_MD)).unwrap();
+        let report = apply(&dir, &Options::default());
+        // GEMINI.md is still a marker, so both skills are written.
+        assert_eq!(
+            report.skills,
+            [
+                (SKILL_PATH, Outcome::Wrote),
+                (SHARED_SKILL_PATH, Outcome::Wrote)
+            ]
+        );
+        assert_eq!(block_outcome(&report, GEMINI_MD), Outcome::Absent);
+        assert!(report.problems().is_empty(), "{:?}", report.problems());
+        assert!(!dir.join(AGENTS_MD).exists());
+
+        // With --agents-md, AGENTS.md is created and GEMINI.md, now resolving, is the same file.
+        let report = apply(
+            &dir,
+            &Options {
+                agents_md: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(block_outcome(&report, AGENTS_MD), Outcome::Wrote);
+        assert_eq!(
+            block_outcome(&report, GEMINI_MD),
+            Outcome::SameAs(AGENTS_MD)
+        );
+        assert_eq!(read(&dir, AGENTS_MD).matches(BEGIN).count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn any_dangling_gemini_md_is_absent_but_a_dangling_agents_md_fails() {
+        let outside = crate::test_support::tmp_dir();
+        for link in [
+            outside.join("missing.md"),
+            PathBuf::from("/nonexistent/x.md"),
+            PathBuf::from("docs/GEMINI.md"),
+        ] {
+            let dir = crate::test_support::tmp_dir();
+            std::os::unix::fs::symlink(&link, dir.join(GEMINI_MD)).unwrap();
+            let report = apply(&dir, &Options::default());
+            assert_eq!(skill_outcome(&report), Outcome::Wrote, "{link:?}");
+            assert_eq!(
+                block_outcome(&report, GEMINI_MD),
+                Outcome::Absent,
+                "{link:?}"
+            );
+            assert!(report.problems().is_empty(), "{link:?}");
+            run_in(&dir, &Options::default()).unwrap();
+        }
+        assert!(!outside.join("missing.md").exists());
+
+        // A dangling AGENTS.md keeps failing, as before, but no longer aborts the run.
+        let dir = crate::test_support::tmp_dir();
+        std::os::unix::fs::symlink("missing.md", dir.join(AGENTS_MD)).unwrap();
+        let report = apply(&dir, &Options::default());
+        assert_eq!(skill_outcome(&report), Outcome::Wrote);
+        assert!(matches!(
+            block_outcome(&report, AGENTS_MD),
+            Outcome::Failed(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_file_line_names_the_later_file_either_way() {
+        // AGENTS.md -> GEMINI.md: the later name is still GEMINI.md.
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join(GEMINI_MD), "# Gemini\n").unwrap();
+        std::os::unix::fs::symlink(GEMINI_MD, dir.join(AGENTS_MD)).unwrap();
+        let report = apply(&dir, &Options::default());
+        assert_eq!(block_outcome(&report, AGENTS_MD), Outcome::Updated);
+        assert_eq!(
+            block_outcome(&report, GEMINI_MD),
+            Outcome::SameAs(AGENTS_MD)
+        );
+        assert_eq!(read(&dir, GEMINI_MD).matches(BEGIN).count(), 1);
+        assert!(
+            std::fs::symlink_metadata(dir.join(AGENTS_MD))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_file_linking_to_a_skill_file_is_refused_and_stable() {
+        for (name, skill_path) in [
+            (GEMINI_MD, SHARED_SKILL_PATH),
+            (GEMINI_MD, SKILL_PATH),
+            (AGENTS_MD, SHARED_SKILL_PATH),
+            (AGENTS_MD, SKILL_PATH),
+        ] {
+            let dir = crate::test_support::tmp_dir();
+            std::os::unix::fs::symlink(skill_path, dir.join(name)).unwrap();
+            for run in 0..2 {
+                let report = apply(&dir, &all());
+                assert_eq!(
+                    outcome_of(&report.skills, skill_path),
+                    if run == 0 {
+                        Outcome::Wrote
+                    } else {
+                        Outcome::UpToDate
+                    },
+                    "{name} -> {skill_path}, run {run}"
+                );
+                assert_eq!(
+                    block_outcome(&report, name),
+                    Outcome::Failed(format!("{name} links to {skill_path}, a devy skill file")),
+                    "{name} -> {skill_path}, run {run}"
+                );
+                assert_eq!(read(&dir, skill_path), skill());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_skill_linking_outside_still_reports_the_claude_skill() {
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        std::fs::write(outside.join("SKILL.md"), "mine\n").unwrap();
+        std::fs::create_dir_all(dir.join(".agents/skills/devy")).unwrap();
+        std::os::unix::fs::symlink(outside.join("SKILL.md"), dir.join(SHARED_SKILL_PATH)).unwrap();
+        let report = apply(&dir, &Options::default());
+        assert_eq!(skill_outcome(&report), Outcome::Wrote);
+        let Outcome::Failed(msg) = outcome_of(&report.skills, SHARED_SKILL_PATH) else {
+            panic!("{report:?}");
+        };
+        assert!(
+            msg.contains("links outside the project or into .git"),
+            "{msg}"
+        );
+        assert_eq!(read(&outside, "SKILL.md"), "mine\n");
+        assert!(run_in(&dir, &Options::default()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_as_is_reported_even_when_the_first_file_has_a_problem() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join(AGENTS_MD), format!("{BEGIN}\n")).unwrap();
+        std::os::unix::fs::symlink(AGENTS_MD, dir.join(GEMINI_MD)).unwrap();
+        let report = apply(&dir, &Options::default());
+        assert_eq!(
+            block_outcome(&report, AGENTS_MD),
+            Outcome::UnbalancedMarkers
+        );
+        assert_eq!(
+            block_outcome(&report, GEMINI_MD),
+            Outcome::SameAs(AGENTS_MD)
+        );
+        assert_eq!(report.problems().len(), 1);
+    }
+
+    #[test]
+    fn problems_are_reported_in_processing_order() {
+        let dir = crate::test_support::tmp_dir();
+        for path in [SKILL_PATH, SHARED_SKILL_PATH] {
+            std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(path), "mine\n").unwrap();
+        }
+        let mut result = None;
+        let warnings = output::with_warn_messages(|| result = Some(run_in(&dir, &all())));
+        assert_eq!(
+            warnings,
+            [".claude/skills/devy/SKILL.md was not written by devy. Use --force to overwrite."]
+        );
+        assert_eq!(
+            result.unwrap().unwrap_err().to_string(),
+            ".agents/skills/devy/SKILL.md was not written by devy. Use --force to overwrite."
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_skill_is_never_read_through_a_symlinked_dir() {
+        let dir = crate::test_support::tmp_dir();
+        let outside = crate::test_support::tmp_dir();
+        // An identical skill outside would once have been reported "up to date".
+        std::fs::create_dir_all(outside.join("skills/devy")).unwrap();
+        std::fs::write(outside.join("skills/devy/SKILL.md"), skill()).unwrap();
+        std::os::unix::fs::symlink(&*outside, dir.join(".claude")).unwrap();
+        let report = apply(&dir, &Options::default());
+        let Outcome::Failed(msg) = skill_outcome(&report) else {
+            panic!("{report:?}");
+        };
+        assert!(msg.contains("it is a symbolic link"), "{msg}");
+
+        // The same for a link further down.
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(dir.join(".claude/skills")).unwrap();
+        std::os::unix::fs::symlink(outside.join("skills/devy"), dir.join(".claude/skills/devy"))
+            .unwrap();
+        assert!(matches!(
+            skill_outcome(&apply(&dir, &Options::default())),
+            Outcome::Failed(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn block_file_linking_to_a_non_markdown_file_is_refused() {
+        for (name, target) in [(GEMINI_MD, "devy.yml"), (AGENTS_MD, "notes.txt")] {
+            let dir = crate::test_support::tmp_dir();
+            std::fs::write(dir.join(target), "name: x\n").unwrap();
+            std::os::unix::fs::symlink(target, dir.join(name)).unwrap();
+            let report = apply(&dir, &all());
+            assert_eq!(
+                report.skills,
+                [
+                    (SKILL_PATH, Outcome::Wrote),
+                    (SHARED_SKILL_PATH, Outcome::Wrote)
+                ]
+            );
+            assert_eq!(
+                block_outcome(&report, name),
+                Outcome::Failed(format!(
+                    "{name} links to {target}, which is not a Markdown file"
+                ))
+            );
+            assert_eq!(read(&dir, target), "name: x\n");
+            assert_eq!(report.problems().len(), 1);
+        }
+        // Case-insensitive, and a nested Markdown target is fine.
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/Guide.MD"), "# G\n").unwrap();
+        std::os::unix::fs::symlink("docs/Guide.MD", dir.join(AGENTS_MD)).unwrap();
+        let report = apply(&dir, &Options::default());
+        assert_eq!(block_outcome(&report, AGENTS_MD), Outcome::Updated);
+    }
+
+    #[test]
+    fn init_reports_written_files_then_warns_per_problem() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join(AGENTS_MD), format!("{BEGIN}\n")).unwrap();
+        std::fs::write(dir.join(GEMINI_MD), format!("{END}\n")).unwrap();
+        let warnings = output::with_warn_messages(|| run_for_init(&dir));
+        assert_eq!(read(&dir, SKILL_PATH), skill());
+        assert_eq!(read(&dir, SHARED_SKILL_PATH), skill());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("AGENTS.md has a"), "{warnings:?}");
+        assert!(warnings[1].contains("GEMINI.md has a"), "{warnings:?}");
+    }
+
+    #[test]
+    fn crlf_gemini_md_keeps_crlf() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join(GEMINI_MD), "# Gemini\r\nUse tabs.\r\n").unwrap();
+        apply(&dir, &Options::default());
+        let gemini = read(&dir, GEMINI_MD);
+        assert!(
+            gemini.starts_with("# Gemini\r\nUse tabs.\r\n\r\n"),
+            "{gemini:?}"
+        );
+        assert_eq!(gemini.matches('\n').count(), gemini.matches("\r\n").count());
+        assert!(gemini.contains(BEGIN) && gemini.ends_with(&format!("{END}\r\n")));
+    }
+
+    #[test]
+    fn unbalanced_gemini_md_names_the_file() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::write(dir.join(GEMINI_MD), format!("{END}\n")).unwrap();
+        let err = run_in(&dir, &Options::default()).unwrap_err();
+        assert!(err.to_string().starts_with("GEMINI.md has a "), "{err}");
+    }
+
+    #[test]
+    fn skipped_symlink_is_printed_but_absent_is_not() {
+        // Exercised for its output in tests/cli.rs; here only that it is not a problem.
+        let report = Report {
+            skills: vec![(
+                SHARED_SKILL_PATH,
+                Outcome::SkippedSymlink {
+                    dir: ".agents".into(),
+                },
+            )],
+            blocks: vec![(GEMINI_MD, Outcome::Absent)],
+        };
+        assert!(report.problems().is_empty());
     }
 }

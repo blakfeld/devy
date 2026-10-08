@@ -1,9 +1,57 @@
-# agent-setup Specification
+## ADDED Requirements
 
-## Purpose
-Installs guidance that teaches coding agents (Claude Code and other AGENTS.md readers) how to work in a devy project: a generated skill file and an optional managed block in `AGENTS.md`, written by `devy agent-setup` and by `devy init`.
+### Requirement: Agent targets
+`devy agent-setup` SHALL support two skill targets:
+- **Claude**: `.claude/skills/devy/SKILL.md`, read by Claude Code.
+- **Shared**: `.agents/skills/devy/SKILL.md`, the cross-tool directory read by Codex, Gemini CLI, Cursor, GitHub Copilot, Windsurf/Devin, OpenCode and Amp.
 
-## Requirements
+`--agent <name>` SHALL select targets explicitly and SHALL be repeatable. The accepted names are `claude`, `codex`, `gemini`, `cursor`, `copilot`, `windsurf`, `opencode` and `amp`. `claude` selects the Claude target, and every other name selects the shared target. Naming several agents that map to the same target SHALL write that target once. Any other name SHALL be a usage error that exits 2 and lists the accepted names. `--all` SHALL select both targets. `--agent` and `--all` SHALL conflict, and combining them SHALL be a usage error that exits 2.
+
+When neither `--agent` nor `--all` is given, devy SHALL select:
+- the Claude target, always
+- the shared target, when at least one of these exists at the project root: `.agents/`, `.codex/`, `.gemini/`, `GEMINI.md`, `.cursor/`, `.cursorrules`, `.github/copilot-instructions.md`, `.github/instructions/`, `.github/skills/`, `.windsurf/`, `.windsurfrules`, `.devin/`, `.opencode/`, `opencode.json`, `.amp/`, `AGENTS.md`
+
+Detection SHALL only check whether these paths exist and SHALL NOT read their contents or follow them outside the project.
+
+Target selection SHALL NOT affect the `AGENTS.md` and `GEMINI.md` blocks, which follow their own rules.
+
+#### Scenario: Claude only by default
+- **WHEN** a project has none of the detection markers and the user runs `devy agent-setup`
+- **THEN** `.claude/skills/devy/SKILL.md` is written and `.agents/` is not created
+
+#### Scenario: Detected agent gets the shared skill
+- **WHEN** a project has a `.cursor/` directory and the user runs `devy agent-setup`
+- **THEN** both `.claude/skills/devy/SKILL.md` and `.agents/skills/devy/SKILL.md` are written with identical content
+- **AND** stdout contains `✓ wrote .agents/skills/devy/SKILL.md`
+
+#### Scenario: AGENTS.md triggers the shared skill
+- **WHEN** a project has `AGENTS.md` and the user runs `devy agent-setup`
+- **THEN** `.agents/skills/devy/SKILL.md` is written and `AGENTS.md` gains the devy block
+
+#### Scenario: Explicit agent only
+- **WHEN** the user runs `devy agent-setup --agent codex` in a project without `.claude/`
+- **THEN** `.agents/skills/devy/SKILL.md` is written and `.claude/` is not created
+
+#### Scenario: Repeated agents sharing a target
+- **WHEN** the user runs `devy agent-setup --agent cursor --agent gemini`
+- **THEN** `.agents/skills/devy/SKILL.md` is written once and reported on one line
+
+#### Scenario: All targets
+- **WHEN** the user runs `devy agent-setup --all` in a project with no detection markers
+- **THEN** both skill files are written
+
+#### Scenario: Unknown agent name
+- **WHEN** the user runs `devy agent-setup --agent emacs`
+- **THEN** the process exits 2, stderr lists the accepted names, and nothing is written
+
+### Requirement: Symlinked shared skill directory
+When `.agents`, `.agents/skills` or `.agents/skills/devy` under the project root is a symlink, `devy agent-setup` SHALL NOT write the shared skill through it. It SHALL print `○ skipped .agents/skills/devy/SKILL.md: <dir> is a symlink`, where `<dir>` is the first symlinked directory, continue with the other files, and SHALL NOT treat the skip as a failure. This applies whether the shared target was detected or requested explicitly.
+
+#### Scenario: Shared skills linked to Claude skills
+- **WHEN** `.agents/skills` is a symlink to `.claude/skills` and the user runs `devy agent-setup --all`
+- **THEN** `.claude/skills/devy/SKILL.md` is written, stdout reports that the shared skill was skipped because `.agents/skills` is a symlink, and the process exits 0
+
+## MODIFIED Requirements
 
 ### Requirement: Agent skill file
 `devy agent-setup` SHALL write the devy skill to each selected skill target (see *Agent targets*) under the project root, creating directories as needed. It SHALL print `✓ wrote <path>` for each file it creates, where `<path>` is the target's path relative to the project root. Every target SHALL receive byte-identical content. The skill SHALL begin with YAML frontmatter containing exactly `name: devy` and a `description`, of at most 1024 characters, saying it applies in projects with a `devy.yml`. The body SHALL:
@@ -147,54 +195,3 @@ If agent setup cannot complete, `devy init` SHALL still succeed and exit 0, beca
 #### Scenario: Show context writes nothing
 - **WHEN** the user runs `devy init --show-context`
 - **THEN** no agent files are written
-
-### Requirement: Agent targets
-`devy agent-setup` SHALL support two skill targets:
-- **Claude**: `.claude/skills/devy/SKILL.md`, read by Claude Code.
-- **Shared**: `.agents/skills/devy/SKILL.md`, the cross-tool directory read by Codex, Gemini CLI, Cursor, GitHub Copilot, Windsurf/Devin, OpenCode and Amp.
-
-`--agent <name>` SHALL select targets explicitly and SHALL be repeatable. The accepted names are `claude`, `codex`, `gemini`, `cursor`, `copilot`, `windsurf`, `opencode` and `amp`. `claude` selects the Claude target, and every other name selects the shared target. Naming several agents that map to the same target SHALL write that target once. Any other name SHALL be a usage error that exits 2 and lists the accepted names. `--all` SHALL select both targets. `--agent` and `--all` SHALL conflict, and combining them SHALL be a usage error that exits 2.
-
-When neither `--agent` nor `--all` is given, devy SHALL select:
-- the Claude target, always
-- the shared target, when at least one of these exists at the project root: `.agents/`, `.codex/`, `.gemini/`, `GEMINI.md`, `.cursor/`, `.cursorrules`, `.github/copilot-instructions.md`, `.github/instructions/`, `.github/skills/`, `.windsurf/`, `.windsurfrules`, `.devin/`, `.opencode/`, `opencode.json`, `.amp/`, `AGENTS.md`
-
-Detection SHALL only check whether these paths exist and SHALL NOT read their contents or follow them outside the project.
-
-Target selection SHALL NOT affect the `AGENTS.md` and `GEMINI.md` blocks, which follow their own rules.
-
-#### Scenario: Claude only by default
-- **WHEN** a project has none of the detection markers and the user runs `devy agent-setup`
-- **THEN** `.claude/skills/devy/SKILL.md` is written and `.agents/` is not created
-
-#### Scenario: Detected agent gets the shared skill
-- **WHEN** a project has a `.cursor/` directory and the user runs `devy agent-setup`
-- **THEN** both `.claude/skills/devy/SKILL.md` and `.agents/skills/devy/SKILL.md` are written with identical content
-- **AND** stdout contains `✓ wrote .agents/skills/devy/SKILL.md`
-
-#### Scenario: AGENTS.md triggers the shared skill
-- **WHEN** a project has `AGENTS.md` and the user runs `devy agent-setup`
-- **THEN** `.agents/skills/devy/SKILL.md` is written and `AGENTS.md` gains the devy block
-
-#### Scenario: Explicit agent only
-- **WHEN** the user runs `devy agent-setup --agent codex` in a project without `.claude/`
-- **THEN** `.agents/skills/devy/SKILL.md` is written and `.claude/` is not created
-
-#### Scenario: Repeated agents sharing a target
-- **WHEN** the user runs `devy agent-setup --agent cursor --agent gemini`
-- **THEN** `.agents/skills/devy/SKILL.md` is written once and reported on one line
-
-#### Scenario: All targets
-- **WHEN** the user runs `devy agent-setup --all` in a project with no detection markers
-- **THEN** both skill files are written
-
-#### Scenario: Unknown agent name
-- **WHEN** the user runs `devy agent-setup --agent emacs`
-- **THEN** the process exits 2, stderr lists the accepted names, and nothing is written
-
-### Requirement: Symlinked shared skill directory
-When `.agents`, `.agents/skills` or `.agents/skills/devy` under the project root is a symlink, `devy agent-setup` SHALL NOT write the shared skill through it. It SHALL print `○ skipped .agents/skills/devy/SKILL.md: <dir> is a symlink`, where `<dir>` is the first symlinked directory, continue with the other files, and SHALL NOT treat the skip as a failure. This applies whether the shared target was detected or requested explicitly.
-
-#### Scenario: Shared skills linked to Claude skills
-- **WHEN** `.agents/skills` is a symlink to `.claude/skills` and the user runs `devy agent-setup --all`
-- **THEN** `.claude/skills/devy/SKILL.md` is written, stdout reports that the shared skill was skipped because `.agents/skills` is a symlink, and the process exits 0

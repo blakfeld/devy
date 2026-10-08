@@ -570,7 +570,9 @@ _{bin}() {
       _arguments \
         '--force[Overwrite a skill {bin} did not write]' \
         '--agents-md[Create AGENTS.md if missing]' \
-        '--print[Print the skill without writing]'
+        '--print[Print the skill without writing]' \
+        '(--all)*--agent[Write the skill only for this agent]:agent:(claude codex gemini cursor copilot windsurf opencode amp)' \
+        '(--agent)--all[Write the skill for every supported agent]'
       ;;
     prune)
       _arguments \
@@ -1195,7 +1197,11 @@ _{bin}_completions() {
       done <<< "$(compgen "$kind" -- "$cur")"
       ;;
     agent-setup)
-      _{bin}_complete_words "$cur" --force --agents-md --print
+      if [ "${COMP_WORDS[COMP_CWORD-1]}" = "--agent" ]; then
+        _{bin}_complete_words "$cur" claude codex gemini cursor copilot windsurf opencode amp
+      else
+        _{bin}_complete_words "$cur" --force --agents-md --print --agent --all
+      fi
       ;;
     prune)
       _{bin}_complete_words "$cur" --yes --volumes
@@ -1499,6 +1505,8 @@ complete -c {bin} -n "__fish_seen_subcommand_from exec" -a "(__{bin}_complete_ex
 complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l force -d "Overwrite a skill {bin} did not write"
 complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l agents-md -d "Create AGENTS.md if missing"
 complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l print -d "Print the skill without writing"
+complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l agent -x -a "claude codex gemini cursor copilot windsurf opencode amp" -d "Write the skill only for this agent"
+complete -c {bin} -n "__fish_seen_subcommand_from agent-setup" -l all -d "Write the skill for every supported agent"
 complete -c {bin} -n "__fish_seen_subcommand_from prune" -l yes -d "Remove them without asking"
 complete -c {bin} -n "__fish_seen_subcommand_from prune" -l volumes -d "Also remove the data volumes of removed containers"
 "#;
@@ -1982,6 +1990,8 @@ mod tests {
             "    agent-setup)\n      _arguments \\\n        '--force[",
             "'--agents-md[",
             "'--print[",
+            "'(--all)*--agent[Write the skill only for this agent]:agent:(claude codex gemini cursor copilot windsurf opencode amp)'",
+            "'(--agent)--all[",
         ] {
             assert!(zsh.contains(needle), "zsh missing {needle:?}");
         }
@@ -1990,7 +2000,7 @@ mod tests {
             "    status|services|check)\n      _devy_complete_words \"$cur\" --json\n",
             "done <<< \"$(compgen \"$kind\" -- \"$cur\")\"",
             "[[ $(type -t compopt) == builtin ]] && compopt -o filenames 2>/dev/null",
-            "    agent-setup)\n      _devy_complete_words \"$cur\" --force --agents-md --print\n",
+            "    agent-setup)\n      if [ \"${COMP_WORDS[COMP_CWORD-1]}\" = \"--agent\" ]; then\n        _devy_complete_words \"$cur\" claude codex gemini cursor copilot windsurf opencode amp\n      else\n        _devy_complete_words \"$cur\" --force --agents-md --print --agent --all\n      fi\n",
         ] {
             assert!(bash.contains(needle), "bash missing {needle:?}");
         }
@@ -2002,6 +2012,8 @@ mod tests {
             "-n \"__fish_seen_subcommand_from agent-setup\" -l force ",
             "-n \"__fish_seen_subcommand_from agent-setup\" -l agents-md ",
             "-n \"__fish_seen_subcommand_from agent-setup\" -l print ",
+            "-n \"__fish_seen_subcommand_from agent-setup\" -l agent -x -a \"claude codex gemini cursor copilot windsurf opencode amp\" ",
+            "-n \"__fish_seen_subcommand_from agent-setup\" -l all ",
             "hook pr export exec agent-setup prune\nend",
         ] {
             assert!(fish.contains(needle), "fish missing {needle:?}");
