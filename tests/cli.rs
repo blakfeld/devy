@@ -2205,6 +2205,285 @@ fn agent_setup_print_conflicts_with_force() {
     );
 }
 
+const SHARED_SKILL: &str = ".agents/skills/devy/SKILL.md";
+
+#[test]
+fn agent_setup_without_markers_writes_claude_skill_only() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["agent-setup"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(proj.file(SKILL).exists());
+    assert!(!proj.file(".agents").exists());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(".agents"));
+}
+
+#[test]
+fn agent_setup_detected_agent_gets_the_shared_skill() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    std::fs::create_dir(proj.file(".cursor")).unwrap();
+    let out = proj.run(&["agent-setup"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let claude = std::fs::read_to_string(proj.file(SKILL)).unwrap();
+    let shared = std::fs::read_to_string(proj.file(SHARED_SKILL)).unwrap();
+    assert_eq!(claude, shared);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("✓ wrote .claude/skills/devy/SKILL.md"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("✓ wrote .agents/skills/devy/SKILL.md"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn agent_setup_agents_md_triggers_the_shared_skill() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    proj.write("AGENTS.md", "# Agents\n");
+    let out = proj.run(&["agent-setup"]);
+    assert!(out.status.success());
+    assert!(proj.file(SHARED_SKILL).exists());
+    assert!(
+        std::fs::read_to_string(proj.file("AGENTS.md"))
+            .unwrap()
+            .contains("<!-- devy:begin -->")
+    );
+}
+
+#[test]
+fn agent_setup_explicit_agent_writes_only_its_target() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["agent-setup", "--agent", "codex"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(proj.file(SHARED_SKILL).exists());
+    assert!(!proj.file(".claude").exists());
+
+    // Two agents sharing a target: one write, one line.
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["agent-setup", "--agent", "cursor", "--agent", "gemini"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.matches(SHARED_SKILL).count(), 1, "{stdout}");
+    assert!(!proj.file(".claude").exists());
+}
+
+#[test]
+fn agent_setup_all_writes_both_skills() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["agent-setup", "--all"]);
+    assert!(out.status.success());
+    assert!(proj.file(SKILL).exists());
+    assert!(proj.file(SHARED_SKILL).exists());
+}
+
+#[test]
+fn agent_setup_unknown_agent_is_a_usage_error() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["agent-setup", "--agent", "emacs"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for name in [
+        "claude", "codex", "gemini", "cursor", "copilot", "windsurf", "opencode", "amp",
+    ] {
+        assert!(stderr.contains(name), "{stderr}");
+    }
+    assert!(!proj.file(".claude").exists());
+    assert!(!proj.file(".agents").exists());
+
+    for args in [
+        &["agent-setup", "--agent", "codex", "--all"][..],
+        &["agent-setup", "--print", "--agent", "codex"][..],
+    ] {
+        assert_eq!(proj.run(args).status.code(), Some(2), "{args:?}");
+    }
+    assert!(!proj.file(".claude").exists());
+    assert!(!proj.file(".agents").exists());
+}
+
+#[test]
+fn agent_setup_refused_shared_skill_still_writes_claude_skill() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    std::fs::create_dir_all(proj.file(".agents/skills/devy")).unwrap();
+    proj.write(SHARED_SKILL, "mine\n");
+    let out = proj.run(&["agent-setup", "--all"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(proj.file(SKILL).exists());
+    assert_eq!(
+        std::fs::read_to_string(proj.file(SHARED_SKILL)).unwrap(),
+        "mine\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(SHARED_SKILL), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_setup_skips_symlinked_shared_skills_dir() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    std::fs::create_dir_all(proj.file(".claude/skills")).unwrap();
+    std::fs::create_dir(proj.file(".agents")).unwrap();
+    std::os::unix::fs::symlink("../.claude/skills", proj.file(".agents/skills")).unwrap();
+    let out = proj.run(&["agent-setup", "--all"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(proj.file(SKILL).exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("○ skipped .agents/skills/devy/SKILL.md: .agents/skills is a symlink"),
+        "{stdout}"
+    );
+    assert!(
+        std::fs::symlink_metadata(proj.file(".agents/skills"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn agent_setup_without_markers_prints_exactly_the_claude_line() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    let out = proj.run(&["agent-setup"]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "  ✓ wrote .claude/skills/devy/SKILL.md\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    let again = proj.run(&["agent-setup"]);
+    assert_eq!(
+        String::from_utf8_lossy(&again.stdout),
+        "  ○ .claude/skills/devy/SKILL.md is up to date\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_setup_dangling_gemini_md_still_writes_both_skills() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    std::os::unix::fs::symlink("AGENTS.md", proj.file("GEMINI.md")).unwrap();
+    let out = proj.run(&["agent-setup"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("✓ wrote .claude/skills/devy/SKILL.md"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("✓ wrote .agents/skills/devy/SKILL.md"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("GEMINI.md"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_setup_refuses_gemini_md_linked_to_a_non_markdown_file() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    std::os::unix::fs::symlink("devy.yml", proj.file("GEMINI.md")).unwrap();
+    let out = proj.run(&["agent-setup"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read_to_string(proj.file("devy.yml")).unwrap(),
+        "dependencies: []\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("GEMINI.md links to devy.yml, which is not a Markdown file"),
+        "{stderr}"
+    );
+    assert!(proj.file(SKILL).exists());
+    assert!(proj.file(SHARED_SKILL).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_setup_claude_skill_linked_to_shared_skill_is_written_once() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    std::fs::create_dir_all(proj.file(".claude/skills/devy")).unwrap();
+    std::os::unix::fs::symlink("../../../.agents/skills/devy/SKILL.md", proj.file(SKILL)).unwrap();
+    let out = proj.run(&["agent-setup", "--all"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "○ .claude/skills/devy/SKILL.md is the same file as .agents/skills/devy/SKILL.md"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("✓ wrote .agents/skills/devy/SKILL.md"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_setup_force_never_replaces_a_linked_non_skill_file() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    std::fs::create_dir_all(proj.file(".claude/skills/devy")).unwrap();
+    std::os::unix::fs::symlink("../../../devy.yml", proj.file(SKILL)).unwrap();
+    let out = proj.run(&["agent-setup", "--force"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read_to_string(proj.file("devy.yml")).unwrap(),
+        "dependencies: []\n"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            ".claude/skills/devy/SKILL.md links to devy.yml, which is not a SKILL.md file"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn agent_setup_updates_existing_gemini_md() {
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    proj.write("GEMINI.md", "# Gemini\n\nUse tabs.\n");
+    let out = proj.run(&["agent-setup"]);
+    assert!(out.status.success());
+    let gemini = std::fs::read_to_string(proj.file("GEMINI.md")).unwrap();
+    assert!(
+        gemini.starts_with("# Gemini\n\nUse tabs.\n\n<!-- devy:begin -->"),
+        "{gemini}"
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("✓ updated GEMINI.md"));
+
+    let proj = TempProject::with_yaml("dependencies: []\n");
+    assert!(
+        proj.run(&["agent-setup", "--agents-md", "--all"])
+            .status
+            .success()
+    );
+    assert!(!proj.file("GEMINI.md").exists());
+}
+
 #[test]
 fn init_detect_installs_agent_skill() {
     let proj = TempProject::new();

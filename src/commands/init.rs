@@ -520,6 +520,7 @@ mod tests {
             agent_setup::skill()
         );
         assert!(!dir.join("AGENTS.md").exists());
+        assert!(!dir.join(".agents").exists());
     }
 
     #[test]
@@ -570,6 +571,42 @@ mod tests {
             warnings
                 .iter()
                 .any(|w| w.contains("devy agent-setup --force")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn init_detects_another_agent_and_warns_by_path() {
+        let (_tmp, path) = tmp_config();
+        let dir = path.parent().unwrap();
+        std::fs::create_dir(dir.join(".gemini")).unwrap();
+        run_plain(Mode::Detect, false, &path, must_not_look_up_claude).unwrap();
+        for skill in [SKILL, agent_setup::SHARED_SKILL_PATH] {
+            assert_eq!(
+                std::fs::read_to_string(dir.join(skill)).unwrap(),
+                agent_setup::skill(),
+                "{skill}"
+            );
+        }
+
+        // A hand-written shared skill: init still succeeds, and the warning names it.
+        let shared = dir.join(agent_setup::SHARED_SKILL_PATH);
+        std::fs::write(&shared, "mine\n").unwrap();
+        let mut result = None;
+        let warnings = crate::output::with_warn_messages(|| {
+            result = Some(run_plain(
+                Mode::Detect,
+                true,
+                &path,
+                must_not_look_up_claude,
+            ));
+        });
+        result.unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), "mine\n");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(".agents/skills/devy/SKILL.md was not written by devy")
+                && warnings[0].contains("devy agent-setup --force"),
             "{warnings:?}"
         );
     }

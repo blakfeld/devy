@@ -49,7 +49,7 @@ It MUST complete:
 - `--follow`, `--lines`, `--explain`, and `--show-context` after `logs`, and service names taken from `devy _services`, with errors suppressed
 - `--show-context` after `ask`
 - `--json` after `status`, `services` and `check`
-- `--force`, `--agents-md` and `--print` after `agent-setup`
+- `--force`, `--agents-md`, `--print`, `--agent` and `--all` after `agent-setup`, and `claude codex gemini cursor copilot windsurf opencode amp` after `agent-setup --agent`
 - command names from the shell's own command completion after `exec`
 - `--yes` and `--volumes` after `prune`
 
@@ -91,7 +91,11 @@ It MUST complete:
 
 #### Scenario: Agent setup flags
 - **WHEN** the user tab-completes `devy agent-setup --<TAB>`
-- **THEN** the candidates are `--force`, `--agents-md` and `--print`
+- **THEN** the candidates are `--force`, `--agents-md`, `--print`, `--agent` and `--all`
+
+#### Scenario: Agent setup agent names
+- **WHEN** the user tab-completes `devy agent-setup --agent <TAB>`
+- **THEN** the candidates are `claude`, `codex`, `gemini`, `cursor`, `copilot`, `windsurf`, `opencode` and `amp`
 
 #### Scenario: Allow flags
 - **WHEN** the user tab-completes `devy <TAB>` or `devy allow --<TAB>`
