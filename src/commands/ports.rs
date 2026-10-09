@@ -334,20 +334,28 @@ pub(crate) fn resolve_and_check(
 }
 
 /// Warning for an explicit, non-default port that the backend cannot make the service
-/// listen on. `None` when the port is applicable, default, or not explicit.
+/// listen on. `None` when the port is applicable, written to the service's config
+/// instead (see `Module::explicit_port_via_config`), default, or not explicit.
 pub(crate) fn unapplied_port_warning(dep: &Dependency, pm: &dyn PackageManager) -> Option<String> {
     let module = modules::get(&dep.name);
     let key = module.port_key()?;
     let raw = dep.extra.get(key)?.as_u64()?;
     let port = u16::try_from(raw).ok()?;
-    if Some(port) == module.default_port() || port_applicable(dep, pm) {
+    if Some(port) == module.default_port()
+        || port_applicable(dep, pm)
+        || module.explicit_port_via_config(pm)
+    {
         return None;
     }
-    Some(format!(
+    let mut msg = format!(
         "devy cannot make {} listen on port {port} with {} — configure the service to listen on {port} manually",
         dep.name,
         pm.name()
-    ))
+    );
+    if let Some(hint) = module.unapplied_port_hint(pm) {
+        msg.push_str(&format!(" ({hint})"));
+    }
+    Some(msg)
 }
 
 /// The port `devy up` records for `dep`: its resolved port when the module has a port
@@ -615,6 +623,40 @@ mod tests {
         assert_eq!(port_of(&deps[0]), Some(6379));
     }
 
+    /// Scenarios "Database without a port on brew" and "Database with a previously
+    /// assigned port on apt": brew and apt run one machine-wide server.
+    #[test]
+    fn brew_and_apt_databases_get_default_port_not_random() {
+        let backends = [
+            MockPackageManager {
+                name: "brew",
+                config_dir: Some("/opt/homebrew/etc".into()),
+                ..Default::default()
+            },
+            MockPackageManager {
+                name: "apt",
+                config_dir: Some("/etc/postgresql/16/main/conf.d".into()),
+                ..Default::default()
+            },
+        ];
+        for pm in &backends {
+            for (name, default) in [("postgresql", 5432), ("mysql", 3306), ("mariadb", 3306)] {
+                let lock = lock_with(&[(name, 51000)]);
+                for source in [PortSource::Lock(None), PortSource::Lock(Some(&lock))] {
+                    let mut deps = vec![Dependency::simple(name)];
+                    let r = resolve_ports(&mut deps, source, pm, PortMode::Assign).unwrap();
+                    assert_eq!(
+                        r[0],
+                        Some(ResolvedPort::Default(default)),
+                        "{name} under {}",
+                        pm.name
+                    );
+                    assert_eq!(port_of(&deps[0]), Some(default.into()));
+                }
+            }
+        }
+    }
+
     #[test]
     fn resolve_read_only_leaves_unlocked_ports_unassigned() {
         let mut deps = vec![Dependency::simple("redis")];
@@ -756,6 +798,74 @@ mod tests {
         assert!(unapplied_port_warning(&dep_with_port("redis", 6380), &pm("nix")).is_none());
         assert!(unapplied_port_warning(&dep_with_port("redis", 6379), &pm("brew")).is_none());
         assert!(unapplied_port_warning(&Dependency::simple("redis"), &pm("brew")).is_none());
+    }
+
+    /// Scenarios "Explicit database port on apt", "Postgres on brew" and "Explicit port
+    /// not applicable".
+    #[test]
+    fn database_ports_written_to_config_are_not_warned_about() {
+        for db in ["postgresql", "mysql", "mariadb"] {
+            assert!(
+                unapplied_port_warning(&dep_with_port(db, 3307), &pm("apt")).is_none(),
+                "{db}"
+            );
+        }
+        for db in ["mysql", "mariadb"] {
+            assert!(unapplied_port_warning(&dep_with_port(db, 3307), &pm("brew")).is_none());
+        }
+        let msg = unapplied_port_warning(&dep_with_port("postgresql", 5433), &pm("brew"))
+            .expect("brew can't apply a postgresql port");
+        assert!(
+            msg.starts_with("devy cannot make postgresql listen on port 5433 with brew")
+                && msg.contains("postgresql.conf"),
+            "{msg}"
+        );
+        assert_eq!(
+            unapplied_port_warning(&dep_with_port("redis", 6380), &pm("brew")).unwrap(),
+            "devy cannot make redis listen on port 6380 with brew — configure the service to listen on 6380 manually"
+        );
+    }
+
+    /// Nothing is recorded for brew/apt databases (scenario "Database with a previously
+    /// assigned port on apt"), and their env names the default port (scenario "Database
+    /// without a port on brew").
+    #[test]
+    fn brew_and_apt_databases_record_nothing_and_export_the_default_port() {
+        let config: crate::config::DevyConfig = serde_norway::from_str(
+            "dependencies:\n  - postgresql\n  - mysql\n  - mariadb:\n      port: 3307\n",
+        )
+        .unwrap();
+        for name in ["brew", "apt"] {
+            let pm = pm(name);
+            for (db, url) in [
+                ("postgresql", "postgres://localhost:5432/postgres"),
+                ("mysql", "mysql://root@127.0.0.1:3306/"),
+            ] {
+                let cfg: crate::config::DevyConfig =
+                    serde_norway::from_str(&format!("dependencies:\n  - {db}\n")).unwrap();
+                let mut deps = cfg.normalized_dependencies().unwrap();
+                resolve_ports(&mut deps, PortSource::Lock(None), &pm, PortMode::Assign).unwrap();
+                let env = crate::project_env::resolve(
+                    &cfg,
+                    &deps,
+                    &pm,
+                    Path::new("/p"),
+                    PortMode::Assign,
+                );
+                assert_eq!(
+                    env.vars.get("DATABASE_URL").map(String::as_str),
+                    Some(url),
+                    "{db} under {name}"
+                );
+            }
+            let mut deps = config.normalized_dependencies().unwrap();
+            let resolved =
+                resolve_ports(&mut deps, PortSource::Lock(None), &pm, PortMode::Assign).unwrap();
+            for dep in &deps {
+                assert_eq!(recordable_port(dep, &pm), None, "{} under {name}", dep.name);
+            }
+            assert!(worktree_ports_for(&deps, &resolved, &pm).ports.is_empty());
+        }
     }
 
     #[test]

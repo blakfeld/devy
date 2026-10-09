@@ -730,17 +730,26 @@ Which ports devy can choose depends on whether the backend can make the service 
 | Backend | Services whose port devy applies |
 |---|---|
 | Nix (macOS, Linux) | Every built-in service. devy launches the process itself, with the port, a `127.0.0.1` bind and a data directory under `.devy/data/<service>/`. |
-| Homebrew, apt | `postgresql`, `mysql` and `mariadb` only, via a devy-managed file in the service's `conf.d` directory. |
-| WinGet | None. |
+| Homebrew, apt, WinGet | None. These backends run one machine-wide instance of each service, so every service, `postgresql`, `mysql` and `mariadb` included, uses its default port unless `devy.yml` sets one. |
 
 Port assignment follows this priority order:
 
 1. **Explicit port in `devy.yml`** — e.g. `port: 3307` — always wins.
 2. **Port saved in `devy.lock`** — when the backend applies the port, it's reused on every later `devy up`, including after `--update`, so the port stays stable across machines and teammates. In a linked git worktree, the port saved in `.devy/worktree.yml` is used instead (see [Working in git worktrees](#working-in-git-worktrees)).
 3. **Random available port** — when the backend applies the port, assigned on the first `devy up` if no port is configured and there's no lock entry.
-4. **The service's default port** — everywhere else. For example, `redis` under Homebrew always uses 6379, so `REDIS_PORT` and `REDIS_URL` point where Redis actually listens.
+4. **The service's default port** — everywhere else. For example, `redis` under Homebrew always uses 6379, and `postgresql` under Homebrew or apt 5432, so `REDIS_PORT`, `REDIS_URL` and `DATABASE_URL` point where the server actually listens.
 
 If you set an explicit, non-default port that the backend can't apply (e.g. `redis` with `port: 6380` under Homebrew), devy still exports that port but warns that you have to configure the service to listen on it yourself.
+
+**Database ports under Homebrew and apt.** An explicit `port` (and `cli_args` for `mysql` and `mariadb`) is written to a config file where the server reads it:
+
+- **apt** (`postgresql`, `mysql`, `mariadb`): devy writes `/etc/postgresql/<version>/main/conf.d/devy.conf` or `/etc/mysql/conf.d/devy.cnf`, starting with `# devy-managed`. devy never writes or removes a `my.cnf` there. devy never uses `sudo` for config files, so as a regular user the write usually fails: `devy up` then carries on and warns, on every run, which file to create and the lines to put in it.
+- **Homebrew** (`mysql`, `mariadb`): devy writes `$(brew --prefix)/etc/my.cnf.d/devy.cnf`. Your `my.cnf` must contain `!includedir $(brew --prefix)/etc/my.cnf.d`; while it doesn't, `devy up` and `devy check` warn on every run. devy creates `my.cnf` with that line only when there is none.
+- **Homebrew** (`postgresql`): devy can't apply the port. It warns that you must set `port` in `postgresql.conf` in the server's data directory (for example `$(brew --prefix)/var/postgresql@<version>`).
+
+These servers read their config only at start, so when devy writes or removes one of these files it tells you to restart the service if it is already running; devy never restarts a machine-wide server itself. When the port goes back to the default, devy removes its apt `devy.conf` or `devy.cnf` (only if it starts with `# devy-managed`), and the unused `$(brew --prefix postgresql)/etc/devy.conf` older versions wrote. When devy rewrites one of its files it keeps the file's owner and group; if it can't (as a regular user replacing a file owned by someone else, such as one an earlier `sudo devy up` left owned by root), it leaves the file unchanged and warns; `sudo chown` the file to yourself or delete it. A `devy.lock` from an older devy may record a random `assigned_port` for one of these databases; devy now uses the default port and drops it from the lock. That port usually never took effect, but on apt, when devy ran as root, it was written to the server's config: devy removes its old `devy.conf` for postgresql itself, while for mysql and mariadb it was written to `/etc/mysql/conf.d/my.cnf`, which you must delete (see below).
+
+Older devy versions wrote apt settings, including the random port, to `/etc/mysql/conf.d/my.cnf`. MySQL and MariaDB read that directory's files in name order, and the last value wins, so a `my.cnf` there overrides devy's `devy.cnf`, and the default port 3306 when devy has nothing to write. devy can't tell an old devy-written `my.cnf` from your own, so it never touches it: while one exists, every `devy up` and `devy check` warns, whatever the port. If an older devy wrote it, delete it (`sudo rm /etc/mysql/conf.d/my.cnf`) and restart the server.
 
 `devy start`, `devy restart`, `devy check` and `devy status` resolve ports the same way using `devy.lock` (or `.devy/worktree.yml` in a linked worktree), but never assign new ports or write either file. devy errors if two services resolve to the same port. Ports that `devy up` hasn't assigned yet are excluded, so `mysql` and `mariadb` under Nix don't conflict, but `elasticsearch` and `opensearch` under Homebrew (both 9200) do.
 

@@ -1,9 +1,7 @@
 use anyhow::{Context, Result};
 use std::borrow::Cow;
-use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::path::Path;
 use std::time::Duration;
 
 use crate::config::Dependency;
@@ -34,12 +32,9 @@ fn local_user() -> String {
         .unwrap_or_else(|| "postgres".to_string())
 }
 
-fn write_config(config_dir: &Path, port: u16) -> Result<()> {
-    fs::create_dir_all(config_dir).context("Failed to create postgresql config dir")?;
-    let conf = format!("# devy-managed\nport = {port}\n");
-    crate::fs_safe::write_atomic(&config_dir.join("devy.conf"), conf.as_bytes(), 0o644)
-        .context("Failed to write postgresql devy.conf")?;
-    Ok(())
+/// devy's `conf.d/devy.conf` for apt's server, which includes that directory.
+fn config_text(port: u16) -> String {
+    format!("{}\nport = {port}\n", super::loopback::DEVY_MARKER)
 }
 
 impl Module for PostgresModule {
@@ -49,8 +44,14 @@ impl Module for PostgresModule {
     fn default_port(&self) -> Option<u16> {
         Some(5432)
     }
-    fn port_applicable(&self, pm: &dyn PackageManager) -> bool {
-        pm.name() == "nix" || pm.service_config_dir("postgresql").is_some()
+
+    fn explicit_port_via_config(&self, pm: &dyn PackageManager) -> bool {
+        pm.name() == "apt"
+    }
+    fn unapplied_port_hint(&self, pm: &dyn PackageManager) -> Option<&'static str> {
+        (pm.name() == "brew").then_some(
+            "set `port` in postgresql.conf in the server's data directory (e.g. `$(brew --prefix)/var/postgresql@<version>`)",
+        )
     }
 
     fn known_extra_keys(&self) -> Option<&'static [&'static str]> {
@@ -87,13 +88,44 @@ impl Module for PostgresModule {
         _project_root: &std::path::Path,
     ) -> Result<()> {
         let p = port(dep)?;
-        if p != 5432 {
-            // Without a config dir (nix passes the port on the command line), there is
-            // nothing to write. An unapplied explicit port is reported by the shared
-            // port resolver.
-            if let Some(config_dir) = pm.service_config_dir("postgresql") {
-                write_config(&config_dir, p)?;
+        // Without a config dir (nix passes the port on the command line), there is
+        // nothing to write. An unapplied explicit port is reported by the shared port
+        // resolver, except under apt, which takes it from devy's config file: there no
+        // `/etc/postgresql/<version>` means the port can't be applied, so say so here.
+        let Some(config_dir) = pm.service_config_dir("postgresql") else {
+            if pm.name() == "apt" && p != 5432 {
+                crate::output::warn(&format!(
+                    "postgresql: port {p} is not applied — devy found no /etc/postgresql/<version> directory; create /etc/postgresql/<version>/main/conf.d/devy.conf with the line `port = {p}`"
+                ));
             }
+            return Ok(());
+        };
+        let file = config_dir.join("devy.conf");
+        // brew's dir is the keg's `etc`, which the formula's server (reading only its data
+        // directory's postgresql.conf) never reads: remove what earlier versions wrote.
+        // Nothing to restart, since the server never read it.
+        if pm.name() == "brew" {
+            super::helpers::remove_owned_config(
+                &file,
+                "postgresql",
+                "an earlier devy wrote it there, but the server never read it",
+            );
+            return Ok(());
+        }
+        if p == 5432 {
+            super::helpers::remove_owned_config(&file, "postgresql", super::helpers::RESTART_NOTE);
+            return Ok(());
+        }
+        let conf = config_text(p);
+        let consequence = format!("port {p} is not applied");
+        if let super::helpers::OwnedWrite::Failed(msg) = super::helpers::write_owned_config(
+            &file,
+            &conf,
+            &super::helpers::exact_config_fix(&conf),
+            "postgresql",
+            &consequence,
+        ) {
+            crate::output::warn(&msg);
         }
         Ok(())
     }
@@ -208,6 +240,7 @@ impl Module for PostgresModule {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::Path;
 
     fn dep_with_port(port: u64) -> Dependency {
         let mut extra = HashMap::new();
@@ -277,11 +310,8 @@ mod tests {
     }
 
     #[test]
-    fn write_config_creates_conf_file() {
-        let dir = crate::test_support::tmp_dir();
-        write_config(&dir, 5433).unwrap();
-        let content = std::fs::read_to_string(dir.join("devy.conf")).unwrap();
-        assert!(content.contains("port = 5433"));
+    fn config_text_is_devy_managed() {
+        assert_eq!(config_text(5433), "# devy-managed\nport = 5433\n");
     }
 
     #[test]
@@ -374,6 +404,148 @@ mod tests {
             .post_setup(&dep, &pm, std::path::Path::new("/tmp"))
             .unwrap();
         assert!(!dir.join("devy.conf").exists());
+    }
+
+    /// Scenario "apt config directory not writable".
+    #[cfg(unix)]
+    #[test]
+    fn apt_postgres_unwritable_conf_dir_warns_instead_of_failing() {
+        let Some(dir) = crate::test_support::read_only_dir(|_| {}) else {
+            return; // root can write anywhere
+        };
+        let pm = crate::package_manager::MockPackageManager {
+            name: "apt",
+            config_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        let mut result = None;
+        let msgs = crate::output::with_warn_messages(|| {
+            result = Some(PostgresModule.post_setup(&dep_with_port(5433), &pm, Path::new("/tmp")));
+        });
+        result.unwrap().unwrap();
+        let file = dir.join("devy.conf").display().to_string();
+        assert!(
+            msgs.iter().any(|m| m.contains(&file)
+                && m.contains("port = 5433")
+                && m.contains("exactly these lines")
+                && m.contains("`# devy-managed`")),
+            "{msgs:?}"
+        );
+    }
+
+    /// An explicit apt port with no `/etc/postgresql/<version>` can't be applied (the
+    /// shared resolver doesn't warn under apt), so post_setup says so; the default port
+    /// and other backends stay quiet.
+    #[test]
+    fn apt_postgres_without_version_dir_warns_that_the_port_is_not_applied() {
+        let no_dir = |name| crate::package_manager::MockPackageManager {
+            name,
+            config_dir: None,
+            ..Default::default()
+        };
+        let mut result = None;
+        let msgs = crate::output::with_warn_messages(|| {
+            result = Some(PostgresModule.post_setup(
+                &dep_with_port(5433),
+                &no_dir("apt"),
+                Path::new("/tmp"),
+            ));
+        });
+        result.unwrap().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("port 5433 is not applied")
+                && m.contains("/etc/postgresql/<version>/main/conf.d/devy.conf")
+                && m.contains("port = 5433")),
+            "{msgs:?}"
+        );
+        for (backend, dep) in [
+            ("apt", Dependency::simple("postgresql")),
+            ("nix", dep_with_port(5433)),
+        ] {
+            let msgs = crate::output::with_warn_messages(|| {
+                PostgresModule
+                    .post_setup(&dep, &no_dir(backend), Path::new("/tmp"))
+                    .unwrap();
+            });
+            assert!(msgs.is_empty(), "{backend}: {msgs:?}");
+        }
+    }
+
+    /// Scenario "Postgres on brew".
+    #[test]
+    fn brew_postgres_writes_no_keg_config() {
+        let keg_etc = crate::test_support::tmp_dir();
+        let pm = crate::package_manager::MockPackageManager {
+            name: "brew",
+            config_dir: Some(keg_etc.to_path_buf()),
+            ..Default::default()
+        };
+        let dep = dep_with_port(5433);
+        PostgresModule
+            .post_setup(&dep, &pm, Path::new("/tmp"))
+            .unwrap();
+        assert!(!keg_etc.join("devy.conf").exists());
+        let msg = crate::commands::ports::unapplied_port_warning(&dep, &pm).expect("must warn");
+        assert!(
+            msg.contains("cannot make postgresql listen on port 5433 with brew")
+                && msg.contains("postgresql.conf in the server's data directory (e.g. `"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn brew_postgres_removes_stale_devy_managed_keg_config() {
+        let keg_etc = crate::test_support::tmp_dir();
+        let pm = crate::package_manager::MockPackageManager {
+            name: "brew",
+            config_dir: Some(keg_etc.to_path_buf()),
+            ..Default::default()
+        };
+        let stale = keg_etc.join("devy.conf");
+        for dep in [dep_with_port(5433), Dependency::simple("postgresql")] {
+            std::fs::write(&stale, config_text(51000)).unwrap();
+            PostgresModule
+                .post_setup(&dep, &pm, Path::new("/tmp"))
+                .unwrap();
+            assert!(!stale.exists());
+        }
+        // A file devy didn't write is left alone.
+        std::fs::write(&stale, "port = 5434\n").unwrap();
+        PostgresModule
+            .post_setup(&Dependency::simple("postgresql"), &pm, Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "port = 5434\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apt_postgres_removal_failure_warns_instead_of_failing() {
+        let Some(dir) = crate::test_support::read_only_dir(|d| {
+            std::fs::write(d.join("devy.conf"), config_text(5433)).unwrap();
+        }) else {
+            return; // root can write anywhere
+        };
+        let pm = crate::package_manager::MockPackageManager {
+            name: "apt",
+            config_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        };
+        let mut result = None;
+        let msgs = crate::output::with_warn_messages(|| {
+            result = Some(PostgresModule.post_setup(
+                &Dependency::simple("postgresql"),
+                &pm,
+                Path::new("/tmp"),
+            ));
+        });
+        result.unwrap().unwrap();
+        assert!(dir.join("devy.conf").exists());
+        let file = dir.join("devy.conf").display().to_string();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("could not remove") && m.contains(&file)),
+            "{msgs:?}"
+        );
     }
 
     #[test]
