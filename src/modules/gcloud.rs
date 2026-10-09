@@ -140,9 +140,13 @@ impl Module for GcloudModule {
         Some("google-cloud-sdk".to_string())
     }
 
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        matches!(pm.name(), "brew" | "winget").then(|| pm_dep(dep, package_name(pm)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         match pm.name() {
-            "brew" | "winget" => pm.is_package_installed(&pm_dep(dep, package_name(pm))),
+            "brew" | "winget" => super::backend_installed(self, pm, dep),
             _ => Ok(gcloud_bin().is_some()),
         }
     }
@@ -150,7 +154,7 @@ impl Module for GcloudModule {
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
         match pm.name() {
             "brew" | "winget" => {
-                pm.install_package(&pm_dep(dep, package_name(pm)))?;
+                super::install_backend(self, pm, dep)?;
             }
             _ => {
                 // Without brew or winget, install Google's pinned, verified archive — the

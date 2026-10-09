@@ -358,6 +358,7 @@ pub(crate) fn up_tracked(
     let ProjectEnv {
         vars: merged_env,
         path_prepends: module_path_prepends,
+        ..
     } = project_env::resolve(
         config,
         &effective_deps,
@@ -1356,10 +1357,13 @@ mod tests {
 
     #[test]
     fn up_impl_skips_env_section_when_no_env_and_no_path_prepends() {
-        // node has no env_vars or path_prepends — env_mgr.setup must not be called.
+        // node has no env_vars or path_prepends, and brew has no `opt/node/bin` yet —
+        // env_mgr.setup must not be called.
         let config = make_config(&["node"], HashMap::new());
         let pm = MockPackageManager {
+            name: "brew",
             installed: true,
+            package_bin_dir: Some(Box::new(|_: &Dependency| None)),
             ..Default::default()
         };
         let env_mgr = MockEnvManager::default();
@@ -1413,6 +1417,41 @@ mod tests {
         assert!(
             env_mgr.setup_called.get(),
             "env_mgr.setup must be called when PM provides path prepends"
+        );
+    }
+
+    #[test]
+    fn up_impl_writes_brew_formula_bin_dirs() {
+        // A brew formula's `opt/<formula>/bin` is content: a brew project with no
+        // environment now writes the file.
+        let config = make_config(&["jq"], HashMap::new());
+        let pm = MockPackageManager {
+            name: "brew",
+            installed: true,
+            package_bin_dir: Some(Box::new(|pkg: &Dependency| {
+                Some(format!("/opt/homebrew/opt/{}/bin", pkg.name).into())
+            })),
+            ..Default::default()
+        };
+        let env_mgr = MockEnvManager::default();
+        let dir = crate::test_support::tmp_dir();
+        let lock = tmp_path();
+        up_impl(
+            &config,
+            &pm,
+            &env_mgr,
+            UpOptions {
+                update: false,
+                bootstrap: false,
+            },
+            &dir,
+            &lock,
+        )
+        .unwrap();
+        assert!(env_mgr.setup_called.get());
+        assert_eq!(
+            *env_mgr.last_path_prepends.borrow(),
+            vec!["/opt/homebrew/opt/jq/bin"]
         );
     }
 

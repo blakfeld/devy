@@ -96,14 +96,9 @@ pub(crate) fn status_report(
         worktree: recorded.worktree().cloned(),
     };
     if report.error.is_none() {
-        report.path_prepends = report
-            .deps
-            .iter()
-            .flat_map(|dep| modules::get(&dep.name).path_prepends(dep, project_root))
-            .collect();
-        report.env_path =
-            project_env::resolve(config, &report.deps, pm, project_root, PortMode::ReadOnly)
-                .path_prepends;
+        let env = project_env::resolve(config, &report.deps, pm, project_root, PortMode::ReadOnly);
+        report.path_prepends = env.compared_path_prepends().to_vec();
+        report.env_path = env.path_prepends;
         report.written_vars = env_mgr.read_vars(project_root);
         report.written_paths = env_mgr.read_path_prepends(project_root);
     }
@@ -551,7 +546,7 @@ mod tests {
                 .iter()
                 .all(|e| e["written"] == false)
         );
-        // The text table keeps showing module entries only.
+        // The text table leaves out the package manager's own entries.
         assert_eq!(report.path_prepends, expected[1..]);
     }
 

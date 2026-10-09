@@ -1864,6 +1864,16 @@ impl PackageManager for NixPackageManager {
         }
         vec![self.profile_bin().to_string_lossy().into_owned()]
     }
+
+    /// The profile `bin`, which holds every package devy installed, once the profile
+    /// links into /nix/store. `path_prepends` already warns about a profile that doesn't.
+    fn package_bin_dir(&self, _pkg: &Dependency) -> Option<PathBuf> {
+        matches!(
+            crate::fs_safe::verified_nix_profile(&self.project_root),
+            Ok(Some(_))
+        )
+        .then(|| self.profile_bin())
+    }
 }
 
 #[cfg(test)]
@@ -2748,6 +2758,25 @@ mod tests {
         // Use Path::ends_with (component-aware) rather than str::ends_with so the
         // check works on Windows where to_string_lossy() produces backslashes.
         assert!(std::path::Path::new(&prepends[0]).ends_with(".devy/nix-profile/bin"));
+    }
+
+    #[test]
+    fn package_bin_dir_is_none_without_a_profile() {
+        let root = crate::test_support::tmp_dir();
+        let pm = NixPackageManager::for_project(&root, "app");
+        assert_eq!(pm.package_bin_dir(&Dependency::simple("jdk21")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_bin_dir_is_none_for_a_profile_outside_the_store() {
+        let root = crate::test_support::tmp_dir();
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("bin")).unwrap();
+        std::fs::create_dir_all(root.join(".devy")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join(".devy/nix-profile")).unwrap();
+        let pm = NixPackageManager::for_project(&root, "app");
+        assert_eq!(pm.package_bin_dir(&Dependency::simple("jdk21")), None);
     }
 
     // ── service launch ────────────────────────────────────────────────────────

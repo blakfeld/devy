@@ -64,6 +64,10 @@ impl Module for NodeModule {
         Some(super::nix_install_attr(self, dep, "nodejs"))
     }
 
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(super::pkg_dep(self, pm, dep, node_pkg(pm)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         super::pkg_installed(self, pm, dep, node_pkg(pm))
     }
@@ -77,7 +81,7 @@ impl Module for NodeModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&super::pkg_dep(self, pm, dep, node_pkg(pm)))
+        super::install_backend(self, pm, dep)
     }
 
     fn setup_steps(&self, dep: &Dependency, project_root: &Path) -> Vec<String> {

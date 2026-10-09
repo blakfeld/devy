@@ -25,12 +25,16 @@ impl Module for CrystalModule {
         Some("crystal".to_string())
     }
 
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(pm_dep(dep, package_name(pm)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
-        pm.is_package_installed(&pm_dep(dep, package_name(pm)))
+        super::backend_installed(self, pm, dep)
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&pm_dep(dep, package_name(pm)))
+        super::install_backend(self, pm, dep)
     }
 
     fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {

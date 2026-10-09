@@ -63,12 +63,15 @@ impl Module for DotnetModule {
         Some(super::nix_install_attr(self, dep, NIX_DEFAULT_SDK))
     }
 
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(pm_dep(dep, &package_name(pm, dep)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         if pm.name() == "nix" {
             return super::pkg_installed(self, pm, dep, NIX_DEFAULT_SDK);
         }
-        let name = package_name(pm, dep);
-        pm.is_package_installed(&pm_dep(dep, &name))
+        super::backend_installed(self, pm, dep)
     }
 
     fn resolved_version(
@@ -80,8 +83,7 @@ impl Module for DotnetModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        let name = package_name(pm, dep);
-        pm.install_package(&pm_dep(dep, &name))
+        super::install_backend(self, pm, dep)
     }
 
     fn setup_steps(&self, _dep: &Dependency, project_root: &Path) -> Vec<String> {

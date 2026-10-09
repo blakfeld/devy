@@ -2,6 +2,8 @@
 mod brew;
 #[cfg(target_os = "macos")]
 pub use brew::Homebrew;
+#[cfg(test)]
+pub(crate) use brew::brew_formula_name;
 
 #[cfg(any(test, target_os = "linux"))]
 mod apt;
@@ -183,6 +185,14 @@ pub trait PackageManager {
         vec![]
     }
 
+    /// The directory holding the executables of `pkg`, the package a module installs
+    /// (the value it passes to `install_package`), when it is installed and the backend
+    /// keeps one per package (brew: `<prefix>/opt/<formula>/bin`). Never runs the
+    /// package manager: `devy exec` computes it on every run.
+    fn package_bin_dir(&self, _pkg: &Dependency) -> Option<PathBuf> {
+        None
+    }
+
     /// Where the logs of service `name` (the backend service name) can be read: its last
     /// `lines` lines and, with `follow`, new output as it is written.
     fn log_source(&self, _name: &str, _lines: u32, _follow: bool) -> Result<LogSource> {
@@ -251,7 +261,7 @@ pub fn detect(
             #[cfg(not(target_os = "macos"))]
             anyhow::bail!("package_manager: brew is only available on macOS");
             #[cfg(target_os = "macos")]
-            return Ok(Box::new(Homebrew));
+            return Ok(Box::new(Homebrew::default()));
         }
         PackageManagerChoice::Apt => {
             #[cfg(not(target_os = "linux"))]
@@ -317,6 +327,8 @@ pub struct MockPackageManager {
     pub legacy_services: Vec<&'static str>,
     /// Tracks every package name passed to `install_package` (in dep.name form).
     pub installed_packages: std::cell::RefCell<Vec<String>>,
+    /// Tracks every dependency passed to `install_package`, in full.
+    pub installed_deps: std::cell::RefCell<Vec<Dependency>>,
     /// The subset of `installed_packages` installed with `allow_unfree` set.
     pub unfree_packages: std::cell::RefCell<Vec<String>>,
     /// The subset of `installed_packages` installed with `allow_insecure` set.
@@ -337,6 +349,9 @@ pub struct MockPackageManager {
     pub log_source_result: Option<LogSource>,
     /// Tracks every `(name, lines, follow)` passed to `log_source`.
     pub log_queries: std::cell::RefCell<Vec<(String, u32, bool)>>,
+    /// Computes `package_bin_dir`; `None` keeps the trait default.
+    #[allow(clippy::type_complexity)]
+    pub package_bin_dir: Option<Box<dyn Fn(&Dependency) -> Option<PathBuf>>>,
 }
 
 #[cfg(test)]
@@ -358,6 +373,7 @@ impl Default for MockPackageManager {
             migrated_services: std::cell::RefCell::new(Vec::new()),
             legacy_services: Vec::new(),
             installed_packages: std::cell::RefCell::new(Vec::new()),
+            installed_deps: std::cell::RefCell::new(Vec::new()),
             unfree_packages: std::cell::RefCell::new(Vec::new()),
             insecure_packages: std::cell::RefCell::new(Vec::new()),
             version: None,
@@ -367,6 +383,7 @@ impl Default for MockPackageManager {
             unavailable: false,
             log_source_result: None,
             log_queries: std::cell::RefCell::new(Vec::new()),
+            package_bin_dir: None,
         }
     }
 }
@@ -391,6 +408,7 @@ impl PackageManager for MockPackageManager {
     }
     fn install_package(&self, dep: &Dependency) -> Result<()> {
         self.installed_packages.borrow_mut().push(dep.name.clone());
+        self.installed_deps.borrow_mut().push(dep.clone());
         if dep.allow_unfree {
             self.unfree_packages.borrow_mut().push(dep.name.clone());
         }
@@ -459,6 +477,9 @@ impl PackageManager for MockPackageManager {
     }
     fn path_prepends(&self, _project_root: &std::path::Path) -> Vec<String> {
         self.path_prepends_result.clone()
+    }
+    fn package_bin_dir(&self, pkg: &Dependency) -> Option<PathBuf> {
+        self.package_bin_dir.as_ref().and_then(|f| f(pkg))
     }
     fn log_source(&self, name: &str, lines: u32, follow: bool) -> Result<LogSource> {
         self.log_queries
@@ -619,6 +640,15 @@ mod tests {
             AvailablePm
                 .path_prepends(std::path::Path::new("/tmp"))
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn default_package_bin_dir_returns_none() {
+        assert!(
+            AvailablePm
+                .package_bin_dir(&Dependency::simple("jq"))
+                .is_none()
         );
     }
 

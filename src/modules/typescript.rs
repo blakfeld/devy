@@ -25,6 +25,10 @@ impl Module for TypeScriptModule {
         Some(&["global_packages"])
     }
 
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(super::pkg_dep(self, pm, dep, node_pkg(pm)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         super::pkg_installed(self, pm, dep, node_pkg(pm))
     }
@@ -38,7 +42,7 @@ impl Module for TypeScriptModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&super::pkg_dep(self, pm, dep, node_pkg(pm)))?;
+        super::install_backend(self, pm, dep)?;
 
         let mut globals = vec!["typescript".to_string()];
         globals.extend(extra_list(dep, "global_packages")?);

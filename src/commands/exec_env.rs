@@ -128,6 +128,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             path_prepends: path_prepends.iter().map(|p| p.to_string()).collect(),
+            backend_path_count: 0,
         }
     }
 

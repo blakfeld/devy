@@ -39,6 +39,10 @@ impl PackageModule {
 }
 
 impl Module for PackageModule {
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(super::pkg_dep(self, pm, dep, self.name_for(pm)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         super::pkg_installed(self, pm, dep, self.name_for(pm))
     }
@@ -52,7 +56,7 @@ impl Module for PackageModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&super::pkg_dep(self, pm, dep, self.name_for(pm)))
+        super::install_backend(self, pm, dep)
     }
 
     fn nix_versioned_attr(&self, version: &str) -> Option<String> {

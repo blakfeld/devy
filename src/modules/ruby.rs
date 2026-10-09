@@ -117,9 +117,13 @@ impl Module for RubyModule {
         Some("ruby".to_string())
     }
 
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        (pm.name() == "winget").then(|| pm_dep(dep, &winget_package_id(dep)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         if pm.name() == "winget" {
-            return pm.is_package_installed(&pm_dep(dep, &winget_package_id(dep)));
+            return super::backend_installed(self, pm, dep);
         }
         let Some(rbenv) = rbenv_program() else {
             return Ok(false);
@@ -138,7 +142,7 @@ impl Module for RubyModule {
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
         if pm.name() == "winget" {
-            return pm.install_package(&pm_dep(dep, &winget_package_id(dep)));
+            return super::install_backend(self, pm, dep);
         }
 
         if rbenv_program().is_none() {
