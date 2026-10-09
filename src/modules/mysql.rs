@@ -92,6 +92,10 @@ impl Module for MysqlModule {
         Some(&["port", "cli_args"])
     }
 
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(super::pkg_dep(self, pm, dep, package_name(pm)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         super::pkg_installed(self, pm, dep, package_name(pm))
     }
@@ -105,7 +109,7 @@ impl Module for MysqlModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&super::pkg_dep(self, pm, dep, package_name(pm)))
+        super::install_backend(self, pm, dep)
     }
 
     fn nix_versioned_attr(&self, version: &str) -> Option<String> {

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{LogSource, PackageManager};
@@ -8,7 +8,11 @@ use crate::installers;
 use crate::output;
 
 #[derive(Default)]
-pub struct Homebrew;
+pub struct Homebrew {
+    /// The prefix `package_bin_dir` looks in, found once (`devy exec` asks per dependency).
+    /// `formula_bin_dir` checks on every call that it is outside the project.
+    prefix: std::sync::OnceLock<Option<PathBuf>>,
+}
 
 /// Parses `brew services info --json` output and returns whether the service is running.
 /// The JSON is an array; the first element has a `"running"` boolean field.
@@ -67,7 +71,7 @@ fn parse_brew_version(line: &str) -> Option<String> {
 ///
 /// A version that came from devy.lock never selects a formula: the lock is untrusted input
 /// and a value like `"16"` must not silently switch the install to `node@16`.
-fn brew_formula_name(dep: &Dependency) -> String {
+pub(crate) fn brew_formula_name(dep: &Dependency) -> String {
     match &dep.version {
         Some(v) if !dep.version_from_lock && is_formula_pin(v) => format!("{}@{}", dep.name, v),
         _ => dep.name.clone(),
@@ -120,6 +124,107 @@ fn is_formula_pin(v: &str) -> bool {
         && parts
             .iter()
             .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Symlinks followed at most when looking for the Homebrew prefix, as the kernel's limit.
+const MAX_BREW_LINK_HOPS: usize = 40;
+
+/// The Homebrew prefix of the `brew` at `brew`. When `brew` is a link, the first prefix
+/// with an `opt` directory along its chain of links, one hop at a time: a `~/bin/brew`
+/// link to `/opt/homebrew/bin/brew`, or to Intel's `/usr/local/bin/brew` (itself a link
+/// into `/usr/local/Homebrew`, which has no `opt`), whatever `~/opt` holds. Otherwise,
+/// when the real path of `brew` sits in a prefix with `opt` that is not the parent of
+/// `brew`'s own `bin`, that prefix; else the parent of `brew`'s `bin`, not canonicalized:
+/// on Apple Silicon both are `/opt/homebrew`, and Intel's `/usr/local/bin/brew` gives
+/// `/usr/local`. Every candidate must pass `trusted_prefix`; with none, there is no
+/// prefix. Whether the prefix is project-local is checked by the caller on every
+/// use.
+fn brew_prefix_for(brew: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    let owner = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(brew).ok().map(|meta| meta.uid())
+    };
+    #[cfg(not(unix))]
+    let owner = None;
+    brew_prefix_with(brew, owner)
+}
+
+/// `brew_prefix_for` with the uid owning the real `brew` executable injected.
+fn brew_prefix_with(brew: &Path, brew_owner: Option<u32>) -> Option<PathBuf> {
+    let trusted = |prefix: &Path| trusted_prefix(prefix, brew_owner);
+    let prefix_of = |brew: &Path| Some(brew.parent()?.parent()?.to_path_buf());
+    let direct = prefix_of(brew)?;
+    let mut hop = brew.to_path_buf();
+    for _ in 0..MAX_BREW_LINK_HOPS {
+        let Ok(target) = std::fs::read_link(&hop) else {
+            break;
+        };
+        hop = hop.parent()?.join(target);
+        if let Some(prefix) = prefix_of(&hop).filter(|p| trusted(p)) {
+            // A relative link leaves `..` in the path; PATH and JAVA_HOME get none.
+            return prefix.canonicalize().ok();
+        }
+    }
+    let real = brew.canonicalize().ok().and_then(|real| prefix_of(&real));
+    match real {
+        Some(real) if trusted(&real) && direct.canonicalize().ok().as_ref() != Some(&real) => {
+            Some(real)
+        }
+        _ => trusted(&direct).then_some(direct),
+    }
+}
+
+/// Whether formulae may be taken from `<prefix>/opt`: the prefix directory and `opt`
+/// (both followed through links) are directories owned by a trusted owner and not
+/// world-writable, and when `opt` is a link, the link itself has a trusted owner. So
+/// another local user can't plant formulae, or a link to swap later, through a shared
+/// directory such as `/tmp`. Trusted owners are the current user, root and the owner of
+/// the real `brew` devy runs (on a shared Mac, the account that installed Homebrew).
+/// Group-writable only for the `wheel` or `admin` group (see
+/// `writable_only_by_trusted`).
+#[cfg(unix)]
+fn trusted_prefix(prefix: &Path, brew_owner: Option<u32>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let owner_ok = |uid: u32| crate::fs_safe::is_user_or_root(uid) || Some(uid) == brew_owner;
+    let dir_ok = |path: &Path| {
+        std::fs::metadata(path).is_ok_and(|meta| {
+            meta.is_dir()
+                && owner_ok(meta.uid())
+                && writable_only_by_trusted(meta.mode(), meta.gid())
+        })
+    };
+    let opt = prefix.join("opt");
+    let link_ok = std::fs::symlink_metadata(&opt)
+        .is_ok_and(|meta| !meta.file_type().is_symlink() || owner_ok(meta.uid()));
+    dir_ok(prefix) && link_ok && dir_ok(&opt)
+}
+
+/// Whether a directory with `mode` and group `gid` can be written only by its owner and
+/// trusted groups: never by everyone, and by its group only when that is `wheel` (0) or,
+/// on macOS, `admin` (80), as Intel Homebrew sets up `/usr/local`. Every macOS account
+/// is in `staff`, so a `staff`-writable directory is open to all local users.
+#[cfg(unix)]
+fn writable_only_by_trusted(mode: u32, gid: u32) -> bool {
+    const TRUSTED_GROUPS: &[u32] = &[0, 80];
+    mode & 0o002 == 0 && (mode & 0o020 == 0 || TRUSTED_GROUPS.contains(&gid))
+}
+
+#[cfg(not(unix))]
+fn trusted_prefix(prefix: &Path, _brew_owner: Option<u32>) -> bool {
+    prefix.join("opt").is_dir()
+}
+
+/// `<prefix>/opt/<formula>/bin` for the formula devy installs for `pkg`, when it is a
+/// directory. A relative or project-local prefix or directory (an `opt` link into the
+/// project), or a name that is not a formula token, gives `None`.
+fn formula_bin_dir(prefix: &Path, pkg: &Dependency) -> Option<PathBuf> {
+    let formula = brew_formula_name(pkg);
+    if !is_formula_name(&formula) || crate::fs_safe::is_project_local(prefix) {
+        return None;
+    }
+    let dir = prefix.join("opt").join(formula).join("bin");
+    (dir.is_dir() && !crate::fs_safe::is_project_local(&dir)).then_some(dir)
 }
 
 /// See `Homebrew::command`.
@@ -321,6 +426,15 @@ impl PackageManager for Homebrew {
         }
         Ok(())
     }
+
+    /// `<prefix>/opt/<formula>/bin`, found on disk without running `brew`, in the prefix
+    /// of the `brew` devy runs (see `brew_prefix_for`).
+    fn package_bin_dir(&self, pkg: &Dependency) -> Option<PathBuf> {
+        let prefix = self
+            .prefix
+            .get_or_init(|| brew_prefix_for(&self.brew_bin()));
+        formula_bin_dir(prefix.as_deref()?, pkg)
+    }
 }
 
 /// Validates that a tap string has the form `org/repo`: exactly one `/`, each part
@@ -377,7 +491,7 @@ mod tests {
         use crate::installers::{self, Interpreter, test_hooks};
         test_hooks::clear();
         test_hooks::serve(&installers::HOMEBREW, b"exit 0\n");
-        let result = Homebrew.bootstrap();
+        let result = Homebrew::default().bootstrap();
         let runs = test_hooks::runs();
         test_hooks::clear();
         result.unwrap();
@@ -393,7 +507,7 @@ mod tests {
         use crate::installers::{self, test_hooks};
         test_hooks::clear();
         test_hooks::serve(&installers::HOMEBREW, b"exit 1\n");
-        let err = Homebrew.bootstrap().unwrap_err();
+        let err = Homebrew::default().bootstrap().unwrap_err();
         test_hooks::clear();
         assert_eq!(err.to_string(), "Homebrew installation failed");
     }
@@ -497,7 +611,7 @@ mod tests {
         // Scenario: Invalid tap -- `tap: "evil; rm -rf /"` fails before anything installs.
         let mut dep = Dependency::simple("mongodb-community");
         dep.tap = Some("evil; rm -rf /".into());
-        assert!(Homebrew.validate_config(&dep).is_err());
+        assert!(Homebrew::default().validate_config(&dep).is_err());
     }
 
     #[test]
@@ -505,7 +619,7 @@ mod tests {
         // Scenario: Valid tap -- `brew tap -- mongodb/brew`, then install the formula.
         let mut dep = Dependency::simple("mongodb-community");
         dep.tap = Some("mongodb/brew".into());
-        assert!(Homebrew.validate_config(&dep).is_ok());
+        assert!(Homebrew::default().validate_config(&dep).is_ok());
         assert_eq!(tap_args("mongodb/brew"), ["tap", "--", "mongodb/brew"]);
         assert_eq!(
             install_args(&brew_formula_name(&dep)),
@@ -518,7 +632,10 @@ mod tests {
         // Scenario: Tap smuggled through the name. Config loading rejects it first; this is
         // the backend's own guard, which bails before any `brew` process is spawned.
         let dep = Dependency::simple("evilorg/tap/formula");
-        let err = Homebrew.install_package(&dep).unwrap_err().to_string();
+        let err = Homebrew::default()
+            .install_package(&dep)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Invalid formula name"), "{err}");
     }
 
@@ -534,7 +651,7 @@ mod tests {
 
     #[test]
     fn brew_bin_returns_non_empty_path() {
-        let b = Homebrew.brew_bin();
+        let b = Homebrew::default().brew_bin();
         assert!(!b.as_os_str().is_empty(), "brew_bin must not be empty");
         assert!(
             b.to_string_lossy().contains("brew"),
@@ -551,7 +668,7 @@ mod tests {
             // brew not on PATH; this behaviour is untestable without PATH manipulation
             return;
         };
-        let result = Homebrew.brew_bin_with(Some("/bogus/homebrew".into()));
+        let result = Homebrew::default().brew_bin_with(Some("/bogus/homebrew".into()));
         assert_eq!(
             result, which_path,
             "brew_bin must return the PATH-resolved brew, not the HOMEBREW_PREFIX path"
@@ -570,7 +687,7 @@ mod tests {
         let project = crate::test_support::tmp_dir();
         crate::fs_safe::set_project_root(&project);
         let prefix = crate::test_support::tmp_dir();
-        let result = Homebrew.brew_bin_with(Some(prefix.to_string_lossy().into_owned()));
+        let result = Homebrew::default().brew_bin_with(Some(prefix.to_string_lossy().into_owned()));
         assert_eq!(result, prefix.join("bin").join("brew"));
     }
 
@@ -589,7 +706,7 @@ mod tests {
             "rel/homebrew".to_string(),
             String::new(),
         ] {
-            let result = Homebrew.brew_bin_with(Some(prefix.clone()));
+            let result = Homebrew::default().brew_bin_with(Some(prefix.clone()));
             assert_ne!(
                 result,
                 PathBuf::from(&prefix).join("bin").join("brew"),
@@ -601,17 +718,295 @@ mod tests {
 
     #[test]
     fn brew_bin_falls_back_to_hardcoded_when_prefix_absent() {
-        let result = Homebrew.brew_bin_with(None);
+        let result = Homebrew::default().brew_bin_with(None);
         let s = result.to_string_lossy();
         assert!(s.contains("homebrew") || s.contains("local"));
         assert!(s.ends_with("/bin/brew"));
+    }
+
+    // ── formula_bin_dir ───────────────────────────────────────────────────────
+
+    #[test]
+    fn formula_bin_dir_returns_an_existing_opt_bin() {
+        let prefix = crate::test_support::tmp_dir();
+        let bin = prefix.join("opt/jq/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        assert_eq!(
+            formula_bin_dir(&prefix, &Dependency::simple("jq")),
+            Some(bin)
+        );
+    }
+
+    #[test]
+    fn formula_bin_dir_is_none_when_the_formula_is_not_installed() {
+        let prefix = crate::test_support::tmp_dir();
+        assert_eq!(formula_bin_dir(&prefix, &Dependency::simple("jq")), None);
+        // A file where the directory would be is not a bin dir either.
+        std::fs::create_dir_all(prefix.join("opt/jq")).unwrap();
+        std::fs::write(prefix.join("opt/jq/bin"), "").unwrap();
+        assert_eq!(formula_bin_dir(&prefix, &Dependency::simple("jq")), None);
+    }
+
+    #[test]
+    fn formula_bin_dir_uses_the_pinned_formula() {
+        let prefix = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(prefix.join("opt/postgresql/bin")).unwrap();
+        let pinned = prefix.join("opt/postgresql@16/bin");
+        std::fs::create_dir_all(&pinned).unwrap();
+        let dep = Dependency {
+            version: Some("16".into()),
+            ..Dependency::simple("postgresql")
+        };
+        assert_eq!(formula_bin_dir(&prefix, &dep), Some(pinned));
+    }
+
+    #[test]
+    fn formula_bin_dir_ignores_a_lock_sourced_version() {
+        let prefix = crate::test_support::tmp_dir();
+        let bin = prefix.join("opt/node/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(prefix.join("opt/node@16/bin")).unwrap();
+        let dep = Dependency {
+            version: Some("16".into()),
+            version_from_lock: true,
+            ..Dependency::simple("node")
+        };
+        assert_eq!(formula_bin_dir(&prefix, &dep), Some(bin));
+    }
+
+    #[test]
+    fn formula_bin_dir_refuses_a_project_local_prefix() {
+        let project = crate::test_support::tmp_dir();
+        crate::fs_safe::set_project_root(&project);
+        let prefix = project.join("homebrew");
+        std::fs::create_dir_all(prefix.join("opt/jq/bin")).unwrap();
+        assert_eq!(formula_bin_dir(&prefix, &Dependency::simple("jq")), None);
+        assert_eq!(
+            formula_bin_dir(Path::new("rel/homebrew"), &Dependency::simple("jq")),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn formula_bin_dir_refuses_an_opt_link_into_the_project() {
+        let project = crate::test_support::tmp_dir();
+        crate::fs_safe::set_project_root(&project);
+        std::fs::create_dir_all(project.join("evil/bin")).unwrap();
+        let prefix = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(prefix.join("opt")).unwrap();
+        std::os::unix::fs::symlink(project.join("evil"), prefix.join("opt/jq")).unwrap();
+        assert_eq!(formula_bin_dir(&prefix, &Dependency::simple("jq")), None);
+    }
+
+    #[test]
+    fn formula_bin_dir_refuses_a_prefix_above_the_project() {
+        // The prefix is an ancestor of the project, not inside it, but the bin dir is.
+        let prefix = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(prefix.join("opt/jq/bin")).unwrap();
+        crate::fs_safe::set_project_root(&prefix.join("opt/jq"));
+        assert_eq!(formula_bin_dir(&prefix, &Dependency::simple("jq")), None);
+    }
+
+    /// A Homebrew prefix at `prefix` with `opt` and a `bin/brew` file.
+    #[cfg(unix)]
+    fn fake_prefix(prefix: &Path) {
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join("opt")).unwrap();
+        std::fs::write(prefix.join("bin/brew"), "").unwrap();
+        set_mode(prefix, 0o755);
+        set_mode(&prefix.join("opt"), 0o755);
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn brew_prefix_apple_silicon_layout() {
+        let tmp = crate::test_support::tmp_dir();
+        let prefix = tmp.join("opt/homebrew");
+        fake_prefix(&prefix);
+        assert_eq!(brew_prefix_for(&prefix.join("bin/brew")), Some(prefix));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn brew_prefix_intel_layout_keeps_usr_local() {
+        // `/usr/local/bin/brew` → `../Homebrew/bin/brew`; `opt` is in `/usr/local`.
+        let tmp = crate::test_support::tmp_dir();
+        let local = tmp.join("usr/local");
+        std::fs::create_dir_all(local.join("Homebrew/bin")).unwrap();
+        std::fs::write(local.join("Homebrew/bin/brew"), "").unwrap();
+        std::fs::create_dir_all(local.join("bin")).unwrap();
+        std::fs::create_dir_all(local.join("opt")).unwrap();
+        set_mode(&local, 0o755);
+        set_mode(&local.join("opt"), 0o755);
+        std::os::unix::fs::symlink("../Homebrew/bin/brew", local.join("bin/brew")).unwrap();
+        assert_eq!(brew_prefix_for(&local.join("bin/brew")), Some(local));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn brew_prefix_follows_a_brew_link_to_intel_usr_local() {
+        // `~/bin/brew` → `/usr/local/bin/brew` → `../Homebrew/bin/brew`: the real path's
+        // prefix has no `opt`, but the first hop's does.
+        let tmp = crate::test_support::tmp_dir();
+        let local = tmp.join("usr/local");
+        std::fs::create_dir_all(local.join("Homebrew/bin")).unwrap();
+        std::fs::write(local.join("Homebrew/bin/brew"), "").unwrap();
+        std::fs::create_dir_all(local.join("bin")).unwrap();
+        std::fs::create_dir_all(local.join("opt")).unwrap();
+        set_mode(&local, 0o755);
+        set_mode(&local.join("opt"), 0o755);
+        std::os::unix::fs::symlink("../Homebrew/bin/brew", local.join("bin/brew")).unwrap();
+        let home = tmp.join("home");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::create_dir_all(home.join("opt")).unwrap();
+        std::os::unix::fs::symlink(local.join("bin/brew"), home.join("bin/brew")).unwrap();
+        assert_eq!(
+            brew_prefix_for(&home.join("bin/brew")),
+            Some(local.canonicalize().unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn brew_prefix_follows_a_brew_link_outside_its_prefix() {
+        // `~/bin/brew` → `/opt/homebrew/bin/brew`, with or without an unrelated `~/opt`.
+        let tmp = crate::test_support::tmp_dir();
+        let prefix = tmp.join("homebrew");
+        fake_prefix(&prefix);
+        let home = tmp.join("home");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::os::unix::fs::symlink(prefix.join("bin/brew"), home.join("bin/brew")).unwrap();
+        let expected = Some(prefix.canonicalize().unwrap());
+        assert_eq!(brew_prefix_for(&home.join("bin/brew")), expected);
+        std::fs::create_dir_all(home.join("opt")).unwrap();
+        assert_eq!(brew_prefix_for(&home.join("bin/brew")), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn brew_prefix_skips_a_world_writable_opt() {
+        use std::os::unix::fs::PermissionsExt;
+        // `~/bin/brew` → `<tmp>/bin/brew` → the real prefix, where `<tmp>` is sticky and
+        // world-writable like /tmp: another user could plant `<tmp>/opt/<formula>`.
+        let tmp = crate::test_support::tmp_dir();
+        let prefix = tmp.join("homebrew");
+        fake_prefix(&prefix);
+        let shared = tmp.join("shared");
+        std::fs::create_dir_all(shared.join("bin")).unwrap();
+        std::fs::create_dir_all(shared.join("opt")).unwrap();
+        std::fs::set_permissions(shared.join("opt"), std::fs::Permissions::from_mode(0o1777))
+            .unwrap();
+        std::os::unix::fs::symlink(prefix.join("bin/brew"), shared.join("bin/brew")).unwrap();
+        let home = tmp.join("home");
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::os::unix::fs::symlink(shared.join("bin/brew"), home.join("bin/brew")).unwrap();
+        assert_eq!(
+            brew_prefix_for(&home.join("bin/brew")),
+            Some(prefix.canonicalize().unwrap())
+        );
+
+        // With the real prefix's `opt` world-writable too, nothing qualifies.
+        std::fs::set_permissions(prefix.join("opt"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        assert_eq!(brew_prefix_for(&home.join("bin/brew")), None);
+        assert_eq!(brew_prefix_for(&prefix.join("bin/brew")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_write_is_trusted_only_for_wheel_and_admin() {
+        assert!(writable_only_by_trusted(0o755, 20));
+        assert!(writable_only_by_trusted(0o775, 0));
+        assert!(writable_only_by_trusted(0o775, 80));
+        assert!(!writable_only_by_trusted(0o775, 20));
+        assert!(!writable_only_by_trusted(0o757, 0));
+        assert!(!writable_only_by_trusted(0o1777, 80));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn brew_prefix_refuses_an_opt_writable_by_an_ordinary_group() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = crate::test_support::tmp_dir();
+        let prefix = tmp.join("homebrew");
+        fake_prefix(&prefix);
+        let gid = std::fs::metadata(prefix.join("opt")).unwrap().gid();
+        if [0, 80].contains(&gid) {
+            return; // The temp dir's group is trusted here; nothing to refuse.
+        }
+        set_mode(&prefix.join("opt"), 0o775);
+        assert_eq!(brew_prefix_for(&prefix.join("bin/brew")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn brew_prefix_refuses_an_opt_link_in_a_world_writable_prefix() {
+        // `/tmp/opt` → a trusted `opt`: whoever can write `/tmp` can swap the link later.
+        let tmp = crate::test_support::tmp_dir();
+        let trusted = tmp.join("homebrew");
+        fake_prefix(&trusted);
+        let shared = tmp.join("shared");
+        std::fs::create_dir_all(shared.join("bin")).unwrap();
+        std::fs::write(shared.join("bin/brew"), "").unwrap();
+        std::os::unix::fs::symlink(trusted.join("opt"), shared.join("opt")).unwrap();
+        set_mode(&shared, 0o1777);
+        assert_eq!(brew_prefix_for(&shared.join("bin/brew")), None);
+        set_mode(&shared, 0o755);
+        assert_eq!(brew_prefix_for(&shared.join("bin/brew")), Some(shared));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn brew_prefix_trusts_only_the_user_root_or_the_brew_owner() {
+        let tmp = crate::test_support::tmp_dir();
+        let prefix = tmp.join("homebrew");
+        fake_prefix(&prefix);
+        let brew = prefix.join("bin/brew");
+        let me = crate::fs_safe::current_uid();
+        if me == 0 {
+            return; // Root is always trusted, so nothing can be presented as untrusted.
+        }
+        // Present the prefix as another account's (the faked current user is not `me`).
+        let other = me + 1;
+        crate::fs_safe::with_fake_owner(other, || {
+            assert_eq!(brew_prefix_with(&brew, Some(other)), None);
+            assert_eq!(brew_prefix_with(&brew, None), None);
+            // On a shared Mac, the account owning `brew` also owns the prefix.
+            assert_eq!(brew_prefix_with(&brew, Some(me)), Some(prefix.clone()));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_bin_dir_checks_the_cached_prefix_on_every_call() {
+        let tmp = crate::test_support::tmp_dir();
+        let prefix = tmp.join("homebrew");
+        fake_prefix(&prefix);
+        std::fs::create_dir_all(prefix.join("opt/jq/bin")).unwrap();
+        let brew = Homebrew::default();
+        brew.prefix
+            .set(brew_prefix_for(&prefix.join("bin/brew")))
+            .unwrap();
+        let jq = Dependency::simple("jq");
+        crate::fs_safe::set_project_root(&tmp.join("elsewhere"));
+        assert_eq!(brew.package_bin_dir(&jq), Some(prefix.join("opt/jq/bin")));
+        // The same cached prefix, now inside the project root.
+        crate::fs_safe::set_project_root(&tmp);
+        assert_eq!(brew.package_bin_dir(&jq), None);
     }
 
     // ── name ──────────────────────────────────────────────────────────────────
 
     #[test]
     fn brew_name_is_brew() {
-        assert_eq!(Homebrew.name(), "brew");
+        assert_eq!(Homebrew::default().name(), "brew");
     }
 
     // ── parse_brew_service_info_json ─────────────────────────────────────────
@@ -667,7 +1062,7 @@ mod tests {
         // Homebrew is not installed in CI; ensure_available(false) must return an error
         // mentioning --bootstrap rather than running the installer.
         // If Homebrew happens to be installed in the test environment, skip the assertion.
-        let pm = Homebrew;
+        let pm = Homebrew::default();
         if pm.is_available() {
             return;
         }
@@ -796,7 +1191,7 @@ mod tests {
         ] {
             assert!(!is_formula_name(bad), "{bad} must be rejected");
         }
-        let err = Homebrew
+        let err = Homebrew::default()
             .install_package(&Dependency::simple("evil.rb"))
             .unwrap_err()
             .to_string();

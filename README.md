@@ -756,7 +756,7 @@ Values set under `environment:` in `devy.yml` take precedence over the auto-inje
 | `rust`, `rustup` | Installs via rustup (all platforms); supports `toolchain`, `targets`, `components` |
 | `python`, `python3` | |
 | `go`, `golang` | |
-| `java`, `openjdk` | |
+| `java`, `openjdk` | Sets `JAVA_HOME` and puts `$JAVA_HOME/bin` on PATH. Under Homebrew and Nix this is the JDK devy installed for the requested `version`: the home of `$(brew --prefix)/opt/<formula>/bin/java` (`openjdk`, or `openjdk@<version>` for a pin), given through `opt/<formula>` so it survives upgrades (for example `/opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home`), or of `.devy/nix-profile/bin/java` in `/nix/store`, given through the profile when it has it. When that JDK isn't installed yet (before the first `devy up`), devy sets neither, and never falls back to another JDK on the machine. Under apt it is `/usr/lib/jvm/default-java` or the `java` on PATH; under WinGet, an existing `JAVA_HOME` |
 | `kotlin` | |
 | `elixir` | |
 | `erlang` | |
@@ -797,7 +797,7 @@ Each module knows the correct package name for each package manager — you alwa
 
 **Search servers under Nix:** `elasticsearch` and `opensearch` write into their config directory, which in the Nix store is read-only. On first start devy copies the package's `config/` to `.devy/data/<service>/config/`, makes it writable, and points the server at it (`ES_PATH_CONF` / `OPENSEARCH_PATH_CONF`). In that copy, the relative GC-log, error-file and heap-dump paths in `jvm.options` are rewritten to point under `.devy/data/<service>/`, because the package's start script runs from the read-only store. Later starts reuse it, so edits such as JVM heap in `jvm.options` persist. To reseed it, for example after a major-version upgrade, stop the service, delete `.devy/data/<service>/config/` and start it again. Elasticsearch runs with `ES_HOME` set to its package directory and machine learning disabled (`xpack.ml.enabled=false`), and OpenSearch with its security plugin disabled, so it serves plain HTTP.
 
-**macOS (Homebrew):** Set `package_manager: brew` in `devy.yml`. Service management uses `brew services`.
+**macOS (Homebrew):** Set `package_manager: brew` in `devy.yml`. Service management uses `brew services`. For each dependency installed through Homebrew, devy puts `$(brew --prefix)/opt/<formula>/bin` on the project PATH when it exists, after the entries modules add (such as a Python virtualenv's `bin`), so keg-only and versioned formulae that Homebrew doesn't link (`node@22`, `postgresql@16`, `mysql@8.4`, `openjdk`) are found, and a pinned formula wins over a different linked version. A brew project therefore writes `.shadowenv.d/500_devy.lisp` even with no `environment`. These `opt/<formula>/bin` entries, and `JAVA_HOME` under Homebrew, are only derived when the Homebrew prefix and its `opt` directory (and `opt` itself, if it is a link) are owned by you, root, or the owner of the `brew` devy runs, are not world-writable, and are group-writable only for the `wheel` or `admin` group.
 
 **Ubuntu/Debian (apt):** Set `package_manager: apt` in `devy.yml`. Install operations use `sudo apt-get`. Version pinning with the `version:` field uses apt's exact-version syntax (`pkg=version`) — for most languages, omit the version field and rely on `devy.lock` to pin the installed version across machines.
 

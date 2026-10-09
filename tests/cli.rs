@@ -2714,6 +2714,71 @@ fn json_check_passes_with_empty_project() {
     assert_eq!(doc["issues"], serde_json::json!([]));
 }
 
+/// The brew backend exists only on macOS.
+#[cfg(target_os = "macos")]
+#[test]
+fn check_expects_the_brew_jdk_on_path() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let proj = TempProject::with_yaml("package_manager: brew\ndependencies:\n  - java\n");
+    // A fake Homebrew prefix outside the project: a stub `brew` that reports nothing
+    // installed, and a keg-only openjdk laid out as Homebrew installs it.
+    let prefix = proj.fake_bin();
+    std::fs::create_dir_all(prefix.join("bin")).unwrap();
+    std::fs::write(prefix.join("bin/brew"), "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(
+        prefix.join("bin/brew"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let keg = prefix.join("Cellar/openjdk/21.0.5");
+    let home = keg.join("libexec/openjdk.jdk/Contents/Home");
+    std::fs::create_dir_all(home.join("bin")).unwrap();
+    std::fs::write(home.join("bin/java"), "").unwrap();
+    std::fs::create_dir_all(keg.join("bin")).unwrap();
+    symlink(
+        "../libexec/openjdk.jdk/Contents/Home/bin/java",
+        keg.join("bin/java"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(prefix.join("opt")).unwrap();
+    symlink("../Cellar/openjdk/21.0.5", prefix.join("opt/openjdk")).unwrap();
+    // devy only trusts a prefix and `opt` that aren't world-writable.
+    for dir in [prefix.clone(), prefix.join("opt")] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let path =
+        std::env::join_paths([prefix.join("bin"), "/usr/bin".into(), "/bin".into()]).unwrap();
+    let out = proj
+        .cmd()
+        .args(["check", "--json"])
+        .env("PATH", path)
+        .env("HOMEBREW_PREFIX", &prefix)
+        .output()
+        .unwrap();
+    let doc = json_doc(&out);
+    let issues: Vec<&str> = doc["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i.as_str().unwrap())
+        .collect();
+    let missing =
+        |entry: String| format!("PATH entry {entry} is missing from the environment file");
+    let opt_bin = prefix.join("opt/openjdk/bin").display().to_string();
+    // JAVA_HOME is reached through `opt/openjdk`, which survives upgrades.
+    let home_bin = prefix
+        .join("opt/openjdk/libexec/openjdk.jdk/Contents/Home/bin")
+        .display()
+        .to_string();
+    assert!(home.join("bin/java").is_file());
+    let opt_at = issues.iter().position(|i| *i == missing(opt_bin.clone()));
+    let home_at = issues.iter().position(|i| *i == missing(home_bin.clone()));
+    assert!(opt_at.is_some() && home_at.is_some(), "{issues:#?}");
+    // Module entries ($JAVA_HOME/bin) come before the formula's bin dir.
+    assert!(home_at < opt_at, "{issues:#?}");
+}
+
 #[test]
 fn json_without_config_prints_nothing_to_stdout() {
     let proj = TempProject::new();

@@ -309,11 +309,16 @@ fn collect_into(
         }
     }
 
-    // Collect PATH prepends from all modules.
-    let path_prepends: Vec<String> = deps
+    // The PATH entries `devy up` writes, without the package manager's own entries,
+    // computed from the dependencies with their lock pins applied, as `up` does.
+    let env_deps: Vec<Dependency> = resolved_deps
         .iter()
-        .flat_map(|dep| modules::get(&dep.name).path_prepends(dep, project_root))
+        .map(|dep| super::up::apply_lock_from_source(dep, recorded.lock(), pm))
         .collect();
+    let path_prepends =
+        crate::project_env::resolve(config, &env_deps, pm, project_root, PortMode::ReadOnly)
+            .compared_path_prepends()
+            .to_vec();
 
     if !config.environment.is_empty() || !path_prepends.is_empty() {
         let written_paths = if path_prepends.is_empty() {
@@ -906,6 +911,81 @@ mod tests {
             &MockEnvManager::default(),
             &dir,
         )
+    }
+
+    #[test]
+    fn check_matches_the_brew_formula_bin_dirs_up_writes() {
+        let tmp = crate::test_support::tmp_dir();
+        let bin = tmp.join("opt/jq/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bin = bin.to_string_lossy().into_owned();
+        let pm = MockPackageManager {
+            name: "brew",
+            installed: true,
+            package_bin_dir: Some(Box::new(move |pkg: &Dependency| {
+                let dir = tmp.join("opt").join(&pkg.name).join("bin");
+                dir.is_dir().then_some(dir)
+            })),
+            ..Default::default()
+        };
+        let config = make_config(&["jq"], HashMap::new());
+        let dir = crate::test_support::tmp_dir();
+        let check = |env_mgr: &MockEnvManager| {
+            collect_findings(
+                &config,
+                &pm,
+                ContainerRuntime::system(config.container_cli),
+                env_mgr,
+                &dir,
+            )
+            .issues()
+        };
+
+        // Before `devy up`, the entry is reported missing.
+        let env_mgr = MockEnvManager::default();
+        assert_eq!(
+            check(&env_mgr),
+            vec![format!(
+                "PATH entry {bin} is missing from the environment file"
+            )]
+        );
+
+        let lock = crate::test_support::tmp_path(".lock");
+        crate::commands::up::up_impl(
+            &config,
+            &pm,
+            &env_mgr,
+            crate::commands::up::UpOptions {
+                update: false,
+                bootstrap: false,
+            },
+            &dir,
+            &lock,
+        )
+        .unwrap();
+        assert_eq!(*env_mgr.last_path_prepends.borrow(), vec![bin]);
+        let issues = check(&env_mgr);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn check_ignores_the_nix_profile_before_the_first_up() {
+        // Under nix the profile bin is the backend's entry and every package's bin dir;
+        // neither is compared, so a project passes before `devy up`.
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            path_prepends_result: vec!["/p/.devy/nix-profile/bin".into()],
+            package_bin_dir: Some(Box::new(|_: &Dependency| {
+                Some("/p/.devy/nix-profile/bin".into())
+            })),
+            ..Default::default()
+        };
+        for deps in [&[][..], &["jq"][..]] {
+            let findings = collect(&make_config(deps, HashMap::new()), &pm);
+            assert!(findings.issues().is_empty(), "{:?}", findings.issues());
+            assert!(findings.env.is_none(), "{:?}", findings.env);
+        }
     }
 
     // ── check --json ─────────────────────────────────────────────────────────

@@ -971,7 +971,6 @@ pub fn which_outside_project(name: &str) -> Option<PathBuf> {
 
 /// Whether `path` is relative or inside the project root (see `which_outside_project`):
 /// a place devy must not take an executable from.
-#[cfg(any(test, target_os = "macos"))]
 pub fn is_project_local(path: &Path) -> bool {
     if !path.is_absolute() {
         return true;

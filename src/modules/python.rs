@@ -110,6 +110,10 @@ impl Module for PythonModule {
         Some(super::nix_install_attr(self, dep, "python3"))
     }
 
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(super::pkg_dep(self, pm, dep, pkg_name(pm)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
         super::pkg_installed(self, pm, dep, pkg_name(pm))
     }
@@ -123,7 +127,7 @@ impl Module for PythonModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&super::pkg_dep(self, pm, dep, pkg_name(pm)))
+        super::install_backend(self, pm, dep)
     }
 
     fn env_vars(

@@ -429,7 +429,9 @@ pub(crate) fn pkg_installed(
     dep: &Dependency,
     name: &str,
 ) -> Result<bool> {
-    let target = pkg_dep(module, pm, dep, name);
+    let target = module
+        .backend_package(pm, dep)
+        .unwrap_or_else(|| pkg_dep(module, pm, dep, name));
     if pm.is_package_installed(&target)? {
         return Ok(true);
     }
@@ -440,6 +442,38 @@ pub(crate) fn pkg_installed(
             .is_some_and(|attr| attr == target.name));
     }
     Ok(false)
+}
+
+/// Whether `module`'s backend package for `dep` is installed.
+pub(crate) fn backend_installed(
+    module: &dyn Module,
+    pm: &dyn PackageManager,
+    dep: &Dependency,
+) -> Result<bool> {
+    pm.is_package_installed(&backend_package_of(module, pm, dep)?)
+}
+
+/// Installs `module`'s backend package for `dep`.
+pub(crate) fn install_backend(
+    module: &dyn Module,
+    pm: &dyn PackageManager,
+    dep: &Dependency,
+) -> Result<()> {
+    pm.install_package(&backend_package_of(module, pm, dep)?)
+}
+
+fn backend_package_of(
+    module: &dyn Module,
+    pm: &dyn PackageManager,
+    dep: &Dependency,
+) -> Result<Dependency> {
+    module.backend_package(pm, dep).with_context(|| {
+        format!(
+            "{} is not installed through {} — this is a bug in devy",
+            dep.name,
+            pm.name()
+        )
+    })
 }
 
 /// Resolved version for `pkg_dep`, recorded in devy.lock. Under nix this is the version of
@@ -559,6 +593,14 @@ pub trait Module: Sync {
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool>;
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()>;
+
+    /// The package `install` passes to `pm.install_package` for `dep`, or `None` when
+    /// the dependency is not installed through the package manager (rustup, the deno and
+    /// bun installers, rbenv). `install` and `is_installed` go through it, so the
+    /// package found on disk (`PackageManager::package_bin_dir`) is the one installed.
+    fn backend_package(&self, _pm: &dyn PackageManager, _dep: &Dependency) -> Option<Dependency> {
+        None
+    }
 
     /// The name used when managing this service via the package manager (start/stop/status).
     /// Override when the PM service name differs from the dependency name in devy.yml.
@@ -759,6 +801,17 @@ pub trait Module: Sync {
     /// Emitted as shadowenv `env/prepend-to-pathlist` directives so they compose
     /// correctly with the user's existing PATH.
     fn path_prepends(&self, _dep: &Dependency, _project_root: &std::path::Path) -> Vec<String> {
+        vec![]
+    }
+
+    /// PATH entries that depend on the backend that installed the dependency, added
+    /// after `path_prepends` (Java's `$JAVA_HOME/bin` for the JDK brew or nix installed).
+    fn backend_path_prepends(
+        &self,
+        _dep: &Dependency,
+        _pm: &dyn PackageManager,
+        _project_root: &std::path::Path,
+    ) -> Vec<String> {
         vec![]
     }
 
@@ -2292,6 +2345,32 @@ mod tests {
             allow_unfree: false,
             allow_insecure: false,
             ..Dependency::simple(name)
+        }
+    }
+
+    #[test]
+    fn backend_package_is_what_install_installs() {
+        use crate::package_manager::{MockPackageManager, brew_formula_name};
+        for (name, version, formula) in [
+            ("node", "22", "node@22"),
+            ("postgres", "16", "postgresql@16"),
+            ("mysql", "8.4", "mysql@8.4"),
+            ("java", "17", "openjdk@17"),
+        ] {
+            let pm = MockPackageManager {
+                name: "brew",
+                ..Default::default()
+            };
+            let dep = versioned(name, version, false);
+            let module = get(name);
+            module.install(&pm, &dep).unwrap();
+            let installed = pm.installed_deps.borrow();
+            let [installed] = installed.as_slice() else {
+                panic!("{name}: {installed:?}");
+            };
+            let pkg = module.backend_package(&pm, &dep).unwrap();
+            assert_eq!(format!("{pkg:?}"), format!("{installed:?}"), "{name}");
+            assert_eq!(brew_formula_name(&pkg), formula, "{name}");
         }
     }
 
