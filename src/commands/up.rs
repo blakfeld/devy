@@ -3108,7 +3108,7 @@ mod tests {
     fn docker_postgres_skips_package_manager_conf_d() {
         let conf_dir = crate::test_support::tmp_dir();
         let pm = MockPackageManager {
-            name: "brew",
+            name: "apt",
             config_dir: Some(conf_dir.join("postgresql")),
             ..Default::default()
         };
@@ -3131,7 +3131,7 @@ mod tests {
             !conf_dir.join("postgresql").exists(),
             "no conf.d write for a docker-managed postgres"
         );
-        // The same dependency on the package manager does write it.
+        // The same dependency on the package manager (apt, which reads conf.d) does write it.
         let package = Dependency {
             docker: false,
             ..dep

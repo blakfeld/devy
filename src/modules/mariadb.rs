@@ -38,8 +38,13 @@ impl Module for MariadbModule {
     fn default_port(&self) -> Option<u16> {
         Some(3306)
     }
-    fn port_applicable(&self, pm: &dyn PackageManager) -> bool {
-        pm.name() == "nix" || pm.service_config_dir("mariadb").is_some()
+
+    fn explicit_port_via_config(&self, pm: &dyn PackageManager) -> bool {
+        matches!(pm.name(), "brew" | "apt")
+    }
+
+    fn backend_config_warnings(&self, dep: &Dependency, pm: &dyn PackageManager) -> Vec<String> {
+        super::helpers::mysql_family_backend_config_warnings("mariadb", dep, pm)
     }
 
     fn known_extra_keys(&self) -> Option<&'static [&'static str]> {
@@ -321,7 +326,7 @@ mod tests {
         MariadbModule
             .post_setup(&dep, &pm, std::path::Path::new("/tmp"))
             .unwrap();
-        let content = std::fs::read_to_string(dir.join("my.cnf")).unwrap();
+        let content = std::fs::read_to_string(dir.join("devy.cnf")).unwrap();
         assert!(content.contains("innodb-buffer-pool-size"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -338,7 +343,7 @@ mod tests {
         MariadbModule
             .post_setup(&dep, &pm, std::path::Path::new("/tmp"))
             .unwrap();
-        assert!(!dir.join("my.cnf").exists());
+        assert!(!dir.join("devy.cnf").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

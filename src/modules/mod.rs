@@ -536,9 +536,24 @@ pub trait Module: Sync {
     /// resolution falls back to `default_port` so exported env vars stay truthful.
     ///
     /// The default is true for every service under nix, where devy launches the process
-    /// itself. Database modules override it to also accept a service config dir.
+    /// itself. brew, apt and winget run one machine-wide instance of each service, so a
+    /// per-project port never applies there (see [`Module::explicit_port_via_config`]).
     fn port_applicable(&self, pm: &dyn PackageManager) -> bool {
         self.is_service() && pm.name() == "nix"
+    }
+
+    /// Whether `pm` applies an explicit port from devy.yml by writing it into the
+    /// service's config file, although the port is not [`Module::port_applicable`]. Then
+    /// no "cannot make … listen" warning is shown for it. The database modules override it
+    /// for the backends whose config directory the server reads.
+    fn explicit_port_via_config(&self, _pm: &dyn PackageManager) -> bool {
+        false
+    }
+
+    /// Extra advice appended to the warning for an explicit port `pm` cannot apply (e.g.
+    /// where to set it by hand).
+    fn unapplied_port_hint(&self, _pm: &dyn PackageManager) -> Option<&'static str> {
+        None
     }
 
     /// The install source recorded in devy.lock (e.g. "homebrew", "rustup").
@@ -805,6 +820,13 @@ pub trait Module: Sync {
     /// Called by `devy check` before any installation to surface issues early.
     /// Warnings are printed but do not count as blocking issues.
     fn config_warnings(&self, _dep: &Dependency) -> Vec<String> {
+        vec![]
+    }
+
+    /// Warnings about how `pm` applies the dependency's configuration (e.g. a Homebrew
+    /// `my.cnf` that doesn't include devy's settings). Called by `devy check`; must only
+    /// read, never write.
+    fn backend_config_warnings(&self, _dep: &Dependency, _pm: &dyn PackageManager) -> Vec<String> {
         vec![]
     }
 
@@ -2590,14 +2612,13 @@ mod tests {
         assert!(!get("redis").port_applicable(&apt));
         assert!(!get("redis").port_applicable(&winget));
 
-        assert!(get("postgresql").port_applicable(&nix));
-        assert!(get("postgresql").port_applicable(&brew));
-        assert!(get("postgresql").port_applicable(&apt));
-        assert!(!get("postgresql").port_applicable(&apt_no_pg));
-        assert!(!get("postgresql").port_applicable(&winget));
-
-        assert!(get("mysql").port_applicable(&brew));
-        assert!(get("mariadb").port_applicable(&apt));
+        // brew and apt run one machine-wide database server: no per-project port.
+        for db in ["postgresql", "mysql", "mariadb"] {
+            assert!(get(db).port_applicable(&nix), "{db}");
+            for pm in [&brew, &apt, &apt_no_pg, &winget] {
+                assert!(!get(db).port_applicable(pm), "{db} under {}", pm.name);
+            }
+        }
         assert!(
             !get("node").port_applicable(&nix),
             "non-services never apply ports"
@@ -3768,8 +3789,8 @@ mod tests {
 
     fn write_and_read(port: u16, cli_args: Option<&str>) -> String {
         let dir = crate::test_support::tmp_dir();
-        write_mysql_config("apt", &dir, port, cli_args).unwrap();
-        std::fs::read_to_string(dir.join("my.cnf")).unwrap()
+        write_mysql_config("apt", "mysql", &dir, port, cli_args);
+        std::fs::read_to_string(dir.join("devy.cnf")).unwrap()
         // dir is dropped here, cleaning up automatically
     }
 
@@ -3847,7 +3868,7 @@ mod tests {
             let (content, warns) = write_and_read_with_warnings(3306, Some(token));
             assert_eq!(
                 content,
-                "[mysqld]\nport = 3306\n\
+                "# devy-managed\n[mysqld]\nport = 3306\n\
                  bind-address = 127.0.0.1\nloose-mysqlx-bind-address = 127.0.0.1\n",
                 "{token}"
             );
@@ -3936,7 +3957,7 @@ mod tests {
         let original = "[mysqld]\nbind-address = 127.0.0.1\n";
         std::fs::write(dir.join("my.cnf"), original).unwrap();
         let msgs = crate::output::with_warn_messages(|| {
-            write_mysql_config("brew", &dir, 3307, Some("--max-connections=9")).unwrap();
+            write_mysql_config("brew", "mysql", &dir, 3307, Some("--max-connections=9"));
         });
         assert_eq!(
             std::fs::read_to_string(dir.join("my.cnf")).unwrap(),
@@ -3950,8 +3971,33 @@ mod tests {
              bind-address = 127.0.0.1\nloose-mysqlx-bind-address = 127.0.0.1\n"
         );
         assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(
+            msgs[0].starts_with("mysql: "),
+            "names the service: {msgs:?}"
+        );
         assert!(msgs[0].contains("!includedir"), "{msgs:?}");
         assert!(msgs[0].contains("left it unchanged"), "{msgs:?}");
+    }
+
+    /// An unreadable `my.cnf` (here a directory) is warned about only while devy's
+    /// settings need the include; at the defaults `up` stays quiet.
+    #[test]
+    fn write_mysql_config_brew_unreadable_my_cnf_warns_only_when_customized() {
+        let dir = crate::test_support::tmp_dir();
+        std::fs::create_dir(dir.join("my.cnf")).unwrap();
+        let msgs = crate::output::with_warn_messages(|| {
+            write_mysql_config("brew", "mariadb", &dir, 3306, None);
+        });
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let msgs = crate::output::with_warn_messages(|| {
+            write_mysql_config("brew", "mariadb", &dir, 3307, None);
+        });
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(
+            msgs[0].starts_with("mariadb: could not read") && msgs[0].contains("!includedir"),
+            "{msgs:?}"
+        );
+        assert!(dir.join("my.cnf").is_dir(), "left unchanged");
     }
 
     #[test]
@@ -3961,7 +4007,7 @@ mod tests {
         let original = format!("[mysqld]\n\n!includedir {}/\n", include.display());
         std::fs::write(dir.join("my.cnf"), &original).unwrap();
         let warns = crate::output::with_warn_capture(|| {
-            write_mysql_config("brew", &dir, 3307, None).unwrap();
+            write_mysql_config("brew", "mysql", &dir, 3307, None);
         });
         assert_eq!(warns, 0);
         assert_eq!(
@@ -3975,7 +4021,7 @@ mod tests {
     fn write_mysql_config_brew_creates_missing_my_cnf_with_include() {
         let dir = crate::test_support::tmp_dir();
         let warns = crate::output::with_warn_capture(|| {
-            write_mysql_config("brew", &dir, 3307, None).unwrap();
+            write_mysql_config("brew", "mysql", &dir, 3307, None);
         });
         assert_eq!(warns, 0);
         assert_eq!(
@@ -3988,11 +4034,11 @@ mod tests {
     fn write_mysql_config_binds_loopback_after_user_args() {
         for pm in ["apt", "brew"] {
             let dir = crate::test_support::tmp_dir();
-            write_mysql_config(pm, &dir, 3307, Some("--max-connections=9")).unwrap();
+            write_mysql_config(pm, "mysql", &dir, 3307, Some("--max-connections=9"));
             let path = if pm == "brew" {
                 dir.join("my.cnf.d").join("devy.cnf")
             } else {
-                dir.join("my.cnf")
+                dir.join("devy.cnf")
             };
             let text = std::fs::read_to_string(path).unwrap();
             let user = text.find("max-connections").unwrap();
@@ -4006,17 +4052,17 @@ mod tests {
     }
 
     #[test]
-    fn write_mysql_config_brew_warns_only_when_settings_change() {
+    fn write_mysql_config_brew_warns_on_every_run_while_customized() {
         let dir = crate::test_support::tmp_dir();
         std::fs::write(dir.join("my.cnf"), "[mysqld]\n").unwrap();
         let count = |port| {
             crate::output::with_warn_capture(|| {
-                write_mysql_config("brew", &dir, port, None).unwrap();
+                write_mysql_config("brew", "mysql", &dir, port, None);
             })
         };
         assert_eq!(count(3307), 1);
-        assert_eq!(count(3307), 0, "unchanged settings: no repeat warning");
-        assert_eq!(count(3308), 1);
+        assert_eq!(count(3307), 1, "the port is still not applied");
+        assert_eq!(count(3306), 0, "nothing to apply at the defaults");
     }
 
     #[test]
@@ -4046,7 +4092,7 @@ mod tests {
         let stock = "[mysqld]\nbind-address = 127.0.0.1\n";
         std::fs::write(dir.join("my.cnf"), stock).unwrap();
         let warns = crate::output::with_warn_capture(|| {
-            write_mysql_config("brew", &dir, 3306, None).unwrap();
+            write_mysql_config("brew", "mysql", &dir, 3306, None);
         });
         assert_eq!(warns, 0);
         assert_eq!(std::fs::read_to_string(dir.join("my.cnf")).unwrap(), stock);
@@ -4055,9 +4101,9 @@ mod tests {
     #[test]
     fn write_mysql_config_brew_recreates_missing_my_cnf_even_when_unchanged() {
         let dir = crate::test_support::tmp_dir();
-        write_mysql_config("brew", &dir, 3307, None).unwrap();
+        write_mysql_config("brew", "mysql", &dir, 3307, None);
         std::fs::remove_file(dir.join("my.cnf")).unwrap();
-        write_mysql_config("brew", &dir, 3307, None).unwrap();
+        write_mysql_config("brew", "mysql", &dir, 3307, None);
         assert!(
             std::fs::read_to_string(dir.join("my.cnf"))
                 .unwrap()

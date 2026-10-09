@@ -110,25 +110,281 @@ pub(super) const MYSQL_ALLOWED_ARGS: &[&str] = &[
     "skip-name-resolve",
 ];
 
+/// What a rewrite of a config file keeps from the file it replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeptAttrs {
+    /// Permission bits for the new file.
+    mode: u32,
+    /// The replaced file's (uid, gid), given to the new file (Unix only).
+    owner: Option<(u32, u32)>,
+}
+
+/// What rewriting the regular file at `path` keeps: its own mode with
+/// setuid/setgid/sticky and group/world write dropped (`& 0o755`), so a rewrite never
+/// widens a `0600` file that holds secrets, and its owner and group, so root rewriting a
+/// `root:mysql 0640` file doesn't leave it `root:root`. With no such file (or on
+/// Windows): `0o644` and no owner, so a new file is created as the caller.
+fn existing_attrs(path: &std::path::Path) -> KeptAttrs {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Ok(meta) = std::fs::symlink_metadata(path)
+            && meta.is_file()
+        {
+            return KeptAttrs {
+                mode: meta.permissions().mode() & 0o755,
+                owner: Some((meta.uid(), meta.gid())),
+            };
+        }
+    }
+    let _ = path;
+    KeptAttrs {
+        mode: 0o644,
+        owner: None,
+    }
+}
+
+/// What [`write_owned_config`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum OwnedWrite {
+    Changed,
+    Unchanged,
+    /// The write failed; holds the warning to show.
+    Failed(String),
+}
+
+/// The note shown when devy writes or removes a service config: brew and apt servers
+/// read their config only at start.
+pub(super) const RESTART_NOTE: &str = "restart the service if it is already running";
+
+/// The fix named when devy can't write its database config `content`: only a file
+/// holding exactly these lines stops the warning. The `# devy-managed` first line is
+/// explained, since it lets a later `up` at the default port delete the file.
+pub(super) fn exact_config_fix(content: &str) -> String {
+    format!(
+        "create or replace it with exactly these lines. The first line, `{}`, lets devy delete the file when the port returns to the default; drop that line if you put other settings in the file (devy then keeps warning, since the file is no longer exactly its own):\n{content}",
+        super::loopback::DEVY_MARKER
+    )
+}
+
+/// Writes `content` to `path` when it differs, creating the parent directory. A rewrite
+/// keeps an existing file's mode minus setuid/setgid/sticky and group/world write
+/// (`& 0o755`) and, on Unix, its owner and group; a new file gets `0o644` and the
+/// caller's ids. When the owner or group can't be kept (a non-root user can't hand a
+/// file to someone else), nothing is replaced and the write fails. On a change it tells
+/// the user to restart the service. A failure is returned as a warning naming `path`,
+/// what it means (`consequence`) and `fix` — what to do, naming only devy's lines — never
+/// the existing file, which may be the user's own config with credentials in it.
+pub(super) fn write_owned_config(
+    path: &std::path::Path,
+    content: &str,
+    fix: &str,
+    what: &str,
+    consequence: &str,
+) -> OwnedWrite {
+    write_owned_config_keeping(path, content, fix, what, consequence, existing_attrs)
+}
+
+/// [`write_owned_config`] with the lookup of what a rewrite keeps injected, so tests
+/// can stand in a replaced file owned by someone else.
+fn write_owned_config_keeping(
+    path: &std::path::Path,
+    content: &str,
+    fix: &str,
+    what: &str,
+    consequence: &str,
+    kept: impl FnOnce(&std::path::Path) -> KeptAttrs,
+) -> OwnedWrite {
+    // Capped and non-blocking. A symlink (a dotfile manager's, say) is compared through,
+    // but only when it resolves to a regular file: identical content is left alone, and
+    // anything else counts as changed, so `write_atomic` replaces it or refuses the link.
+    let cap = content.len() as u64 + 1;
+    if crate::fs_safe::read_regular_capped_following_links(path, cap)
+        .is_ok_and(|old| old == content.as_bytes())
+    {
+        return OwnedWrite::Unchanged;
+    }
+    let KeptAttrs { mode, owner } = kept(path);
+    let result = path
+        .parent()
+        .map_or(Ok(()), |dir| {
+            std::fs::create_dir_all(dir).map_err(anyhow::Error::from)
+        })
+        .and_then(|()| {
+            crate::fs_safe::write_atomic_with_owner(path, content.as_bytes(), mode, owner)
+        });
+    match result {
+        Ok(()) => {
+            crate::output::info(&format!(
+                "{what}: wrote {} — {RESTART_NOTE}",
+                path.display()
+            ));
+            OwnedWrite::Changed
+        }
+        Err(e) => match e.downcast_ref::<crate::fs_safe::OwnerNotKept>() {
+            // Typically a non-root rewrite of a file another user owns (one an earlier
+            // `sudo devy up` left root-owned, say): ownership never changes silently.
+            Some(not_kept) => OwnedWrite::Failed(format!(
+                "{what}: could not write {path}: devy can't give the new file its owner and group ({uid}:{gid}) ({err}), so it left {path} unchanged and {consequence} — `sudo chown` it to yourself or delete it so devy can rewrite it, or {fix}",
+                path = path.display(),
+                uid = not_kept.uid,
+                gid = not_kept.gid,
+                err = not_kept.source,
+            )),
+            None => OwnedWrite::Failed(format!(
+                "{what}: could not write {} ({e:#}), so {consequence} — {fix}",
+                path.display()
+            )),
+        },
+    }
+}
+
+/// Removes the regular file at `path` when devy wrote it (its first line is
+/// `# devy-managed`), telling the user `note` (usually [`RESTART_NOTE`]); any other file
+/// is left alone. Returns whether the file was removed. A failed removal is a warning.
+pub(super) fn remove_owned_config(path: &std::path::Path, what: &str, note: &str) -> bool {
+    // Only a small regular file (not a symlink or FIFO) whose first line is exactly the
+    // marker; devy's database configs are a few lines.
+    let owned = crate::fs_safe::read_regular_capped(path, 4096).is_ok_and(|bytes| {
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .next()
+            .map(|l| l.trim_end_matches('\r'))
+            == Some(super::loopback::DEVY_MARKER)
+    });
+    if !owned {
+        return false;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            crate::output::info(&format!("{what}: removed {} — {note}", path.display()));
+            true
+        }
+        Err(e) => {
+            crate::output::warn(&format!(
+                "{what}: could not remove {} ({e}) — delete it, or the service keeps devy's old settings",
+                path.display()
+            ));
+            false
+        }
+    }
+}
+
 /// Name of the devy-owned option file written into Homebrew's `my.cnf.d`.
 const BREW_MYSQL_INCLUDE_FILE: &str = "devy.cnf";
 
-/// Writes MySQL-compatible settings (MySQL and MariaDB share the config format).
+/// Name of the devy-managed option file written into apt's `/etc/mysql/conf.d`. A file
+/// of devy's own, so devy never replaces (or removes) a `my.cnf` someone else put there.
+const CONF_D_MYSQL_FILE: &str = "devy.cnf";
+
+/// The warning while a `my.cnf` exists in apt's `conf.d` (`config_dir`), whatever devy's
+/// settings. Both MySQL and MariaDB read `!includedir` files in `strcmp` order and let
+/// the last value win, so `my.cnf` is read after devy's `devy.cnf` and any `port` in it
+/// overrides devy's, or the default 3306 when devy has nothing to write. Older devy
+/// versions wrote that file with a random port (without the `# devy-managed` marker), so
+/// devy can't tell it from the user's and only warns. Only its existence is checked: the
+/// file is never read or shown, since it may hold credentials.
+fn legacy_conf_d_my_cnf_warning(config_dir: &std::path::Path) -> Option<String> {
+    let legacy = config_dir.join("my.cnf");
+    std::fs::symlink_metadata(&legacy).ok()?;
+    Some(format!(
+        "{} is read after {}, so settings in it (such as `port`) override devy's settings and the default port 3306 — if an older devy wrote it, delete it (`sudo rm {}`) and restart the service",
+        legacy.display(),
+        config_dir.join(CONF_D_MYSQL_FILE).display(),
+        legacy.display()
+    ))
+}
+
+/// Writes MySQL-compatible settings (MySQL and MariaDB share the config format) for
+/// `service` (named in messages).
 ///
 /// Under brew, `config_dir` is the global `$(brew --prefix)/etc` (which mysqld and mariadbd
-/// read; the keg's own `etc` is ignored), whose `my.cnf` belongs to the user: devy writes `my.cnf.d/devy.cnf` instead, and warns (without editing) when an
-/// existing `my.cnf` doesn't `!includedir` that directory. With no `my.cnf` at all, devy
-/// creates one containing only the include. Elsewhere (apt's `conf.d`, which the server
-/// already includes) it writes `my.cnf` into `config_dir`.
+/// read; the keg's own `etc` is ignored), whose `my.cnf` belongs to the user: devy writes
+/// `my.cnf.d/devy.cnf` instead, and on every run warns (without editing) while an existing
+/// `my.cnf` doesn't `!includedir` that directory and devy's settings differ from the
+/// defaults. With no `my.cnf` at all, devy creates one containing only the include.
+/// Elsewhere (apt's `conf.d`, which the server already includes) it writes a devy-managed
+/// `devy.cnf` into `config_dir`, never touching a `my.cnf` there (which an older devy, or
+/// the user, wrote; [`mysql_family_post_setup`] warns that it overrides `devy.cnf`). A
+/// write or read devy can't make (`/etc` without root, an
+/// unwritable brew prefix, an unreadable `my.cnf`) is a warning naming the lines to put
+/// in place, never an error.
 pub(super) fn write_mysql_config(
     pm_name: &str,
+    service: &str,
     config_dir: &std::path::Path,
     port: u16,
     cli_args: Option<&str>,
-) -> anyhow::Result<()> {
-    let mut ini = format!("[mysqld]\nport = {}\n", port);
+) {
+    // Sanitized once: skipped tokens are warned about here.
     let args = sanitized_mysql_args(cli_args);
     let customized = port != 3306 || !args.is_empty();
+    let ini = mysql_ini(port, &args);
+
+    if pm_name != "brew" {
+        // The marker lets a later `up` at the defaults remove the file.
+        let ini = format!("{}\n{ini}", super::loopback::DEVY_MARKER);
+        let target = config_dir.join(CONF_D_MYSQL_FILE);
+        let consequence = format!("port {port} and devy's cli_args settings are not applied");
+        if let OwnedWrite::Failed(msg) = write_owned_config(
+            &target,
+            &ini,
+            &exact_config_fix(&ini),
+            service,
+            &consequence,
+        ) {
+            crate::output::warn(&msg);
+        }
+        return;
+    }
+
+    let include_dir = config_dir.join("my.cnf.d");
+    let target = include_dir.join(BREW_MYSQL_INCLUDE_FILE);
+    let consequence =
+        format!("port {port} and devy's cli_args and loopback settings are not applied");
+    let fix = format!("create or replace it with exactly these lines:\n{ini}");
+    if let OwnedWrite::Failed(msg) = write_owned_config(&target, &ini, &fix, service, &consequence)
+    {
+        crate::output::warn(&msg);
+    }
+
+    let main_cnf = config_dir.join("my.cnf");
+    let include_line = format!("!includedir {}", include_dir.display());
+    match crate::fs_safe::read_regular_capped_following_links(&main_cnf, MY_CNF_CAP) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            if let Some(warning) = missing_include_warning(config_dir, &text, port, customized) {
+                crate::output::warn(&format!("{service}: {warning}"));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let include = format!("{include_line}\n");
+            if let Err(e) = crate::fs_safe::write_atomic(&main_cnf, include.as_bytes(), 0o644) {
+                crate::output::warn(&format!(
+                    "{service}: could not create {} ({e:#}), so devy's settings in {} are not applied — create it with the line `{include_line}`",
+                    main_cnf.display(),
+                    target.display()
+                ));
+            }
+        }
+        // At the defaults the user's my.cnf already describes the server, as in
+        // `missing_include_warning`.
+        Err(e) if customized => crate::output::warn(&format!(
+            "{service}: could not read {} ({e}) — devy left it unchanged; make sure it has the line `{include_line}` so devy's settings in {} take effect",
+            main_cnf.display(),
+            target.display()
+        )),
+        Err(_) => {}
+    }
+}
+
+/// Largest Homebrew `my.cnf` devy reads to look for its `!includedir` line.
+const MY_CNF_CAP: u64 = 1024 * 1024;
+
+/// devy's `[mysqld]` settings for `port` and `args` (from [`sanitized_mysql_args`]),
+/// ending with the loopback binds.
+fn mysql_ini(port: u16, args: &[(String, String)]) -> String {
+    let mut ini = format!("[mysqld]\nport = {}\n", port);
     for (key, val) in args {
         ini.push_str(&format!("{} = {}\n", key, val));
     }
@@ -136,60 +392,91 @@ pub(super) fn write_mysql_config(
     // (and MySQL's X Protocol listener) off other interfaces. `loose-` makes MariaDB,
     // which has no X Protocol, ignore the second option instead of refusing to start.
     ini.push_str("bind-address = 127.0.0.1\nloose-mysqlx-bind-address = 127.0.0.1\n");
+    ini
+}
 
-    if pm_name != "brew" {
-        std::fs::create_dir_all(config_dir)
-            .with_context(|| format!("Failed to create config dir {}", config_dir.display()))?;
-        crate::fs_safe::write_atomic(&config_dir.join("my.cnf"), ini.as_bytes(), 0o644)
-            .context("Failed to write my.cnf")?;
-        return Ok(());
-    }
-
+/// The warning for a Homebrew `my.cnf` (whose content is `text`) in `config_dir` that
+/// doesn't include `my.cnf.d` while devy's settings are `customized`. At defaults a
+/// user's my.cnf (Homebrew's stock MySQL one binds loopback) already describes the
+/// server, so only devy's own settings need the include.
+fn missing_include_warning(
+    config_dir: &std::path::Path,
+    text: &str,
+    port: u16,
+    customized: bool,
+) -> Option<String> {
     let include_dir = config_dir.join("my.cnf.d");
-    std::fs::create_dir_all(&include_dir)
-        .with_context(|| format!("Failed to create config dir {}", include_dir.display()))?;
-    let target = include_dir.join(BREW_MYSQL_INCLUDE_FILE);
-    // Unchanged settings were already written (and any warning shown) by an earlier
-    // `up`, so don't repeat the `!includedir` warning on every run.
-    let changed = std::fs::read_to_string(&target).map_or(true, |old| old != ini);
-    if changed {
-        crate::fs_safe::write_atomic(&target, ini.as_bytes(), 0o644)
-            .with_context(|| format!("Failed to write {}", target.display()))?;
+    if !customized || includes_dir(text, &include_dir) {
+        return None;
     }
+    Some(format!(
+        "{} does not include {} — devy left it unchanged; add `!includedir {}` to it so port {port} and devy's cli_args settings take effect",
+        config_dir.join("my.cnf").display(),
+        include_dir.display(),
+        include_dir.display()
+    ))
+}
 
-    let main_cnf = config_dir.join("my.cnf");
-    match std::fs::read_to_string(&main_cnf) {
-        Ok(text) => {
-            // At defaults a user's my.cnf (Homebrew's stock MySQL one binds loopback)
-            // already describes the server; only devy's own settings need the include.
-            if changed && customized && !includes_dir(&text, &include_dir) {
-                crate::output::warn(&format!(
-                    "{} does not include {} — devy left it unchanged; add `!includedir {}` \
-                     to it so devy's port and cli_args settings take effect",
-                    main_cnf.display(),
-                    include_dir.display(),
-                    include_dir.display()
-                ));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let include = format!("!includedir {}\n", include_dir.display());
-            crate::fs_safe::write_atomic(&main_cnf, include.as_bytes(), 0o644)
-                .with_context(|| format!("Failed to write {}", main_cnf.display()))?;
-        }
-        Err(e) => {
-            return Err(e).with_context(|| format!("Failed to read {}", main_cnf.display()));
-        }
+/// [`missing_include_warning`] for `devy check`: reads the `my.cnf` in `config_dir` and
+/// writes nothing. `None` when there is no readable my.cnf (`up` creates one with the
+/// include): the read is capped, never blocks, and follows a symlink only to a regular
+/// file.
+pub(super) fn brew_mysql_include_warning(
+    config_dir: &std::path::Path,
+    port: u16,
+    cli_args: Option<&str>,
+) -> Option<String> {
+    let customized = port != 3306
+        || cli_args.is_some_and(|a| a.split_whitespace().any(|t| allowed_mysql_arg(t).is_some()));
+    let bytes =
+        crate::fs_safe::read_regular_capped_following_links(&config_dir.join("my.cnf"), MY_CNF_CAP)
+            .ok()?;
+    missing_include_warning(
+        config_dir,
+        &String::from_utf8_lossy(&bytes),
+        port,
+        customized,
+    )
+}
+
+/// `Module::backend_config_warnings` for MySQL and MariaDB, outside docker and read-only:
+/// under brew, the warning for a `my.cnf` that doesn't include devy's `my.cnf.d`; under
+/// apt, the warning for a `conf.d/my.cnf` that overrides devy's settings and the default
+/// port (existence only, as in [`mysql_family_post_setup`]).
+pub(super) fn mysql_family_backend_config_warnings(
+    service: &str,
+    dep: &Dependency,
+    pm: &dyn PackageManager,
+) -> Vec<String> {
+    let Some(config_dir) = (!dep.docker && matches!(pm.name(), "brew" | "apt"))
+        .then(|| pm.service_config_dir(service))
+        .flatten()
+    else {
+        return vec![];
+    };
+    if pm.name() == "apt" {
+        return legacy_conf_d_my_cnf_warning(&config_dir)
+            .into_iter()
+            .collect();
     }
-    Ok(())
+    let port = super::extra_port(dep, "port", 3306).unwrap_or(3306);
+    let cli_args = dep.extra.get("cli_args").and_then(|v| v.as_str());
+    brew_mysql_include_warning(&config_dir, port, cli_args)
+        .into_iter()
+        .collect()
 }
 
 /// MySQL/MariaDB `post_setup` for backends with a config dir. Under brew devy always
 /// writes `my.cnf.d/devy.cnf`, even at defaults: it carries the loopback bind, which
 /// nothing else sets once the stock my.cnf is gone (and brew MariaDB's never did).
 /// Elsewhere settings are written only when the port or `cli_args` differ from the
-/// defaults. Under nix the port and cli_args go on the command line instead; an
-/// unapplied explicit port is reported by the shared port resolver.
+/// defaults, and at the defaults devy's own `devy.cnf` is removed. Under nix the port and
+/// cli_args go on the command line instead; an unapplied explicit port is reported by
+/// the shared port resolver. Under brew, which takes the port from devy's config file
+/// (so the resolver doesn't warn), a missing config dir with non-default settings is
+/// warned about here; apt always has one (`/etc/mysql/conf.d`). Under apt every run also
+/// warns while a `conf.d/my.cnf` exists, whether devy wrote or removed settings: an older
+/// devy left a random port there, which overrides `devy.cnf` and the default port alike.
 pub(super) fn mysql_family_post_setup(
     pm: &dyn PackageManager,
     service: &str,
@@ -198,10 +485,26 @@ pub(super) fn mysql_family_post_setup(
 ) -> Result<()> {
     let customized = port != 3306 || cli_args.is_some();
     match pm.service_config_dir(service) {
-        Some(config_dir) if customized || pm.name() == "brew" => {
-            write_mysql_config(pm.name(), &config_dir, port, cli_args)
+        Some(config_dir) => {
+            if customized || pm.name() == "brew" {
+                write_mysql_config(pm.name(), service, &config_dir, port, cli_args);
+            } else {
+                remove_owned_config(&config_dir.join(CONF_D_MYSQL_FILE), service, RESTART_NOTE);
+            }
+            if pm.name() == "apt"
+                && let Some(warning) = legacy_conf_d_my_cnf_warning(&config_dir)
+            {
+                crate::output::warn(&format!("{service}: {warning}"));
+            }
+            Ok(())
         }
-        Some(_) => Ok(()),
+        None if customized && pm.name() == "brew" => {
+            crate::output::warn(&format!(
+                "{service}: port {port} and devy's cli_args settings are not applied — devy found no {service} config directory for brew; put these lines in $(brew --prefix)/etc/my.cnf.d/devy.cnf:\n{}",
+                mysql_ini(port, &sanitized_mysql_args(cli_args))
+            ));
+            Ok(())
+        }
         None if pm.name() != "nix" && cli_args.is_some() => {
             crate::output::warn(&format!(
                 "cli_args ignored: {} does not support service config dirs",
@@ -655,6 +958,644 @@ pub(crate) fn gradle_steps(project_root: &std::path::Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mock_pm(
+        name: &'static str,
+        dir: &std::path::Path,
+    ) -> crate::package_manager::MockPackageManager {
+        crate::package_manager::MockPackageManager {
+            name,
+            config_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
+    /// Scenario "Unwritable file warned on every run".
+    #[cfg(unix)]
+    #[test]
+    fn apt_mysql_unwritable_conf_dir_warns_instead_of_failing() {
+        let Some(dir) = crate::test_support::read_only_dir(|_| {}) else {
+            return; // root can write anywhere
+        };
+        let pm = mock_pm("apt", &dir);
+        let file = dir.join("devy.cnf").display().to_string();
+        for _ in 0..2 {
+            let mut result = None;
+            let msgs = crate::output::with_warn_messages(|| {
+                result = Some(mysql_family_post_setup(&pm, "mysql", 3307, None));
+            });
+            result.unwrap().unwrap();
+            assert!(
+                msgs.iter()
+                    .any(|m| m.contains(&file) && m.contains("port = 3307")),
+                "{msgs:?}"
+            );
+            // Only a file holding exactly devy's lines silences it, so the warning says
+            // so (not "add"), and explains the marker line.
+            assert!(
+                msgs.iter().any(|m| m.contains("exactly these lines")
+                    && m.contains("`# devy-managed`")
+                    && m.contains("drop that line")
+                    && m.contains("\n# devy-managed\n[mysqld]\nport = 3307\n")
+                    && !m.contains("add:")),
+                "{msgs:?}"
+            );
+        }
+    }
+
+    /// Scenario "Restart needed": writing and removing an apt database config both report
+    /// a change (which is when the restart note is shown); an unchanged file doesn't.
+    #[test]
+    fn apt_db_config_write_and_removal_report_a_change() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("devy.cnf");
+        let content = format!(
+            "{}\n{}",
+            super::super::loopback::DEVY_MARKER,
+            mysql_ini(3307, &[])
+        );
+        let write = || write_owned_config(&path, &content, "x", "mysql", "x");
+        assert_eq!(write(), OwnedWrite::Changed);
+        assert_eq!(write(), OwnedWrite::Unchanged);
+        assert!(remove_owned_config(&path, "mysql", RESTART_NOTE));
+        assert!(!path.exists());
+        assert!(!remove_owned_config(&path, "mysql", RESTART_NOTE));
+        // Through the module path too: the file is written, then removed at the default.
+        let pm = mock_pm("apt", &dir);
+        mysql_family_post_setup(&pm, "mysql", 3307, None).unwrap();
+        assert!(path.is_file());
+        mysql_family_post_setup(&pm, "mysql", 3306, None).unwrap();
+        assert!(!path.exists());
+    }
+
+    /// A symlink to a regular file that already holds devy's content (a dotfile manager's
+    /// link) is left alone; other content is refused rather than written through.
+    #[cfg(unix)]
+    #[test]
+    fn write_owned_config_compares_through_a_symlink_without_writing_through_it() {
+        let dir = crate::test_support::tmp_dir();
+        let elsewhere = crate::test_support::tmp_dir();
+        let target = elsewhere.join("my.cnf");
+        let link = dir.join("my.cnf");
+        std::fs::write(&target, "a\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            write_owned_config(&link, "a\n", "a", "mysql", "x"),
+            OwnedWrite::Unchanged
+        );
+        let OwnedWrite::Failed(msg) = write_owned_config(&link, "b\n", "b", "mysql", "x") else {
+            panic!("writing through the symlink must be refused");
+        };
+        assert!(msg.contains("refusing to write"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\n");
+        // A link to a FIFO is never read (nor blocked on): it counts as changed.
+        let fifo = elsewhere.join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let fifo_link = dir.join("fifo.cnf");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+        assert!(matches!(
+            write_owned_config(&fifo_link, "a\n", "a", "mysql", "x"),
+            OwnedWrite::Failed(_)
+        ));
+    }
+
+    /// An unwritable brew prefix (no `my.cnf`, and none can be created) never fails `up`:
+    /// it warns, naming the `!includedir` line to add.
+    #[cfg(unix)]
+    #[test]
+    fn brew_unwritable_prefix_warns_instead_of_failing() {
+        let Some(prefix) = crate::test_support::read_only_dir(|_| {}) else {
+            return; // root can write anywhere
+        };
+        let pm = mock_pm("brew", &prefix);
+        let mut result = None;
+        let msgs = crate::output::with_warn_messages(|| {
+            result = Some(mysql_family_post_setup(&pm, "mysql", 3307, None));
+        });
+        result.unwrap().unwrap();
+        let include = format!("!includedir {}", prefix.join("my.cnf.d").display());
+        let my_cnf = prefix.join("my.cnf").display().to_string();
+        assert!(
+            msgs.iter().any(|m| m.contains("could not create")
+                && m.contains(&my_cnf)
+                && m.contains(&include)),
+            "{msgs:?}"
+        );
+    }
+
+    /// A `my.cnf` that is a FIFO (or a link to one) is neither read nor blocked on: `up`
+    /// warns and skips it, and `devy check` reports nothing for it.
+    #[cfg(unix)]
+    #[test]
+    fn brew_fifo_my_cnf_does_not_hang() {
+        let prefix = crate::test_support::tmp_dir();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(prefix.join("my.cnf"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let pm = mock_pm("brew", &prefix);
+        let mut result = None;
+        let msgs = crate::output::with_warn_messages(|| {
+            result = Some(mysql_family_post_setup(&pm, "mysql", 3307, None));
+        });
+        result.unwrap().unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("could not read") && m.contains("!includedir")),
+            "{msgs:?}"
+        );
+        assert_eq!(brew_mysql_include_warning(&prefix, 3307, None), None);
+    }
+
+    /// A symlinked `my.cnf` (dotfile managers link it) is read through to its regular
+    /// target, so its include is found.
+    #[cfg(unix)]
+    #[test]
+    fn brew_symlinked_my_cnf_is_read_through() {
+        let prefix = crate::test_support::tmp_dir();
+        let elsewhere = crate::test_support::tmp_dir();
+        let target = elsewhere.join("my.cnf");
+        std::fs::write(&target, "[mysqld]\n").unwrap();
+        std::os::unix::fs::symlink(&target, prefix.join("my.cnf")).unwrap();
+        assert!(brew_mysql_include_warning(&prefix, 3307, None).is_some());
+        std::fs::write(
+            &target,
+            format!("!includedir {}\n", prefix.join("my.cnf.d").display()),
+        )
+        .unwrap();
+        assert_eq!(brew_mysql_include_warning(&prefix, 3307, None), None);
+    }
+
+    /// Without a config dir under brew, non-default settings are reported as not applied,
+    /// naming the file and lines; defaults and nix stay quiet.
+    #[test]
+    fn mysql_family_without_config_dir_warns_on_brew() {
+        let no_dir = |name| crate::package_manager::MockPackageManager {
+            name,
+            config_dir: None,
+            ..Default::default()
+        };
+        let file = "$(brew --prefix)/etc/my.cnf.d/devy.cnf";
+        let pm = no_dir("brew");
+        let msgs = crate::output::with_warn_messages(|| {
+            mysql_family_post_setup(&pm, "mariadb", 3307, None).unwrap();
+        });
+        assert!(
+            msgs.iter().any(|m| m.contains("port 3307")
+                && m.contains("not applied")
+                && m.contains(file)
+                && m.contains("port = 3307")),
+            "{msgs:?}"
+        );
+        let msgs = crate::output::with_warn_messages(|| {
+            mysql_family_post_setup(&pm, "mysql", 3306, Some("--max-connections=50")).unwrap();
+        });
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains(file) && m.contains("max-connections = 50")),
+            "{msgs:?}"
+        );
+        let msgs = crate::output::with_warn_messages(|| {
+            mysql_family_post_setup(&pm, "mysql", 3306, None).unwrap();
+        });
+        assert!(msgs.is_empty(), "{msgs:?}");
+        let msgs = crate::output::with_warn_messages(|| {
+            mysql_family_post_setup(&no_dir("nix"), "mysql", 3307, None).unwrap();
+        });
+        assert!(msgs.is_empty(), "{msgs:?}");
+    }
+
+    #[test]
+    fn mysql_family_backend_config_warnings_cover_brew_and_apt_outside_docker() {
+        let prefix = crate::test_support::tmp_dir();
+        std::fs::write(prefix.join("my.cnf"), "[mysqld]\n").unwrap();
+        let dep = |docker| {
+            let mut extra = std::collections::HashMap::new();
+            extra.insert(
+                "port".into(),
+                crate::config::ExtraValue::Number(3307u64.into()),
+            );
+            let mut dep = Dependency::with_extra("mariadb", extra);
+            dep.docker = docker;
+            dep
+        };
+        for service in ["mysql", "mariadb"] {
+            let warnings = mysql_family_backend_config_warnings(
+                service,
+                &dep(false),
+                &mock_pm("brew", &prefix),
+            );
+            assert_eq!(warnings.len(), 1, "{service}: {warnings:?}");
+            assert!(warnings[0].contains("!includedir"), "{warnings:?}");
+            // The module wires it up.
+            assert_eq!(
+                crate::modules::get(service)
+                    .backend_config_warnings(&dep(false), &mock_pm("brew", &prefix)),
+                warnings
+            );
+            assert!(
+                mysql_family_backend_config_warnings(
+                    service,
+                    &dep(true),
+                    &mock_pm("brew", &prefix)
+                )
+                .is_empty()
+            );
+            for backend in ["nix", "winget"] {
+                assert!(
+                    mysql_family_backend_config_warnings(
+                        service,
+                        &dep(false),
+                        &mock_pm(backend, &prefix)
+                    )
+                    .is_empty(),
+                    "{service} under {backend}"
+                );
+            }
+        }
+    }
+
+    /// Scenario "Legacy my.cnf at the default port", for `devy check`: under apt a
+    /// `conf.d/my.cnf` is reported whatever the port (existence only, never read or
+    /// changed); without one, or for a docker dep, nothing is.
+    #[test]
+    fn mysql_family_backend_config_warnings_report_apt_legacy_my_cnf() {
+        let dir = crate::test_support::tmp_dir();
+        let pm = mock_pm("apt", &dir);
+        let with_port = |port: Option<u64>, docker: bool| {
+            let mut extra = std::collections::HashMap::new();
+            if let Some(p) = port {
+                extra.insert("port".into(), crate::config::ExtraValue::Number(p.into()));
+            }
+            let mut dep = Dependency::with_extra("mysql", extra);
+            dep.docker = docker;
+            dep
+        };
+        for service in ["mysql", "mariadb"] {
+            for port in [None, Some(3307)] {
+                assert!(
+                    mysql_family_backend_config_warnings(service, &with_port(port, false), &pm)
+                        .is_empty(),
+                    "{service} {port:?}: no my.cnf"
+                );
+            }
+        }
+        let foreign = "[client]\npassword = SENTINEL\n[mysqld]\nport = 51000\n";
+        std::fs::write(dir.join("my.cnf"), foreign).unwrap();
+        let my_cnf = dir.join("my.cnf").display().to_string();
+        for service in ["mysql", "mariadb"] {
+            for port in [None, Some(3307)] {
+                let warnings =
+                    mysql_family_backend_config_warnings(service, &with_port(port, false), &pm);
+                assert_eq!(warnings.len(), 1, "{service} {port:?}: {warnings:?}");
+                assert!(
+                    warnings[0].starts_with(&format!("{my_cnf} is read after"))
+                        && warnings[0].contains("the default port 3306")
+                        && warnings[0].contains(&format!("sudo rm {my_cnf}"))
+                        && !warnings[0].contains("SENTINEL"),
+                    "{warnings:?}"
+                );
+                assert_eq!(
+                    crate::modules::get(service)
+                        .backend_config_warnings(&with_port(port, false), &pm),
+                    warnings
+                );
+                assert!(
+                    mysql_family_backend_config_warnings(service, &with_port(port, true), &pm)
+                        .is_empty()
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read(dir.join("my.cnf")).unwrap(),
+            foreign.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read_dir(&*dir).unwrap().count(),
+            1,
+            "nothing written"
+        );
+    }
+
+    /// Scenario "MySQL on apt".
+    #[test]
+    fn apt_mysql_config_is_devy_managed() {
+        let dir = crate::test_support::tmp_dir();
+        let msgs = crate::output::with_warn_messages(|| {
+            mysql_family_post_setup(&mock_pm("apt", &dir), "mysql", 3307, None).unwrap();
+        });
+        let text = std::fs::read_to_string(dir.join("devy.cnf")).unwrap();
+        assert!(
+            text.starts_with("# devy-managed\n[mysqld]\nport = 3307\n"),
+            "{text}"
+        );
+        assert!(!dir.join("my.cnf").exists(), "devy never writes my.cnf");
+        assert!(msgs.is_empty(), "no my.cnf, no override warning: {msgs:?}");
+    }
+
+    /// Scenarios "Foreign file kept" (writing) and "Legacy my.cnf at the default port": a
+    /// `my.cnf` in apt's `conf.d` is left byte-identical, and since it is read after
+    /// `devy.cnf` every run warns (once) that it overrides devy's settings and the default
+    /// port, whether devy writes settings or not, without showing its content.
+    #[test]
+    fn apt_mysql_writes_devy_cnf_beside_a_foreign_my_cnf() {
+        let dir = crate::test_support::tmp_dir();
+        let foreign = "[client]\npassword = SENTINEL\n[mysqld]\nport = 51000\n";
+        std::fs::write(dir.join("my.cnf"), foreign).unwrap();
+        let pm = mock_pm("apt", &dir);
+        for service in ["mysql", "mariadb", "mysql"] {
+            let msgs = crate::output::with_warn_messages(|| {
+                mysql_family_post_setup(&pm, service, 3307, None).unwrap();
+            });
+            assert_eq!(
+                std::fs::read(dir.join("my.cnf")).unwrap(),
+                foreign.as_bytes()
+            );
+            assert!(
+                std::fs::read_to_string(dir.join("devy.cnf"))
+                    .unwrap()
+                    .contains("port = 3307\n")
+            );
+            assert_legacy_my_cnf_warned_once(&dir, service, &msgs);
+        }
+        // At the defaults devy removes its `devy.cnf`, but an older devy's random port in
+        // `my.cnf` still overrides the default 3306 that DATABASE_URL names.
+        for service in ["mysql", "mariadb", "mysql"] {
+            let msgs = crate::output::with_warn_messages(|| {
+                mysql_family_post_setup(&pm, service, 3306, None).unwrap();
+            });
+            assert!(!dir.join("devy.cnf").exists());
+            assert_eq!(
+                std::fs::read(dir.join("my.cnf")).unwrap(),
+                foreign.as_bytes()
+            );
+            assert_legacy_my_cnf_warned_once(&dir, service, &msgs);
+        }
+    }
+
+    /// `msgs` holds exactly one legacy `conf.d/my.cnf` warning for `service`, naming the
+    /// default port and how to delete the file, and never the file's content.
+    fn assert_legacy_my_cnf_warned_once(dir: &std::path::Path, service: &str, msgs: &[String]) {
+        let my_cnf = dir.join("my.cnf").display().to_string();
+        let warned = msgs
+            .iter()
+            .filter(|m| {
+                m.starts_with(&format!("{service}: {my_cnf} is read after"))
+                    && m.contains("override devy's settings and the default port 3306")
+                    && m.contains(&format!("sudo rm {my_cnf}"))
+            })
+            .count();
+        assert_eq!(warned, 1, "{service}: {msgs:?}");
+        assert!(msgs.iter().all(|m| !m.contains("SENTINEL")), "{msgs:?}");
+    }
+
+    /// Without a `conf.d/my.cnf`, apt at the defaults is silent.
+    #[test]
+    fn apt_mysql_defaults_without_my_cnf_are_silent() {
+        let dir = crate::test_support::tmp_dir();
+        let pm = mock_pm("apt", &dir);
+        for service in ["mysql", "mariadb"] {
+            let msgs = crate::output::with_warn_messages(|| {
+                mysql_family_post_setup(&pm, service, 3306, None).unwrap();
+            });
+            assert!(msgs.is_empty(), "{service}: {msgs:?}");
+        }
+        assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 0);
+    }
+
+    /// The warning for an unwritable file names devy's lines, never the existing file's.
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_owned_config_warning_never_shows_the_existing_file() {
+        let Some(dir) = crate::test_support::read_only_dir(|d| {
+            std::fs::write(d.join("my.cnf"), "[client]\npassword = SENTINEL\n").unwrap();
+        }) else {
+            return; // root can write anywhere
+        };
+        let path = dir.join("my.cnf");
+        let OwnedWrite::Failed(msg) = write_owned_config(
+            &path,
+            "[mysqld]\nport = 3307\n",
+            "port = 3307",
+            "mysql",
+            "x",
+        ) else {
+            panic!("the write must fail");
+        };
+        assert!(msg.contains("port = 3307") && msg.contains(&path.display().to_string()));
+        assert!(!msg.contains("SENTINEL"), "{msg}");
+    }
+
+    #[test]
+    fn write_owned_config_writes_only_on_change_and_keeps_the_mode() {
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("sub").join("devy.conf");
+        let write = |c: &str| write_owned_config(&path, c, c, "postgresql", "x");
+        assert_eq!(write("a\n"), OwnedWrite::Changed);
+        assert_eq!(write("a\n"), OwnedWrite::Unchanged);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(write("b\n"), OwnedWrite::Changed);
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// A rewrite keeps the replaced file's owner and group; a new file has none to keep.
+    #[cfg(unix)]
+    #[test]
+    fn write_owned_config_keeps_owner_and_group() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("devy.cnf");
+        assert_eq!(
+            existing_attrs(&path),
+            KeptAttrs {
+                mode: 0o644,
+                owner: None
+            }
+        );
+        std::fs::write(&path, "a\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            existing_attrs(&path).owner,
+            Some((before.uid(), before.gid()))
+        );
+        assert_eq!(
+            write_owned_config(&path, "b\n", "b", "mysql", "x"),
+            OwnedWrite::Changed
+        );
+        let after = std::fs::metadata(&path).unwrap();
+        assert_ne!(after.ino(), before.ino());
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+    }
+
+    /// When the replaced file belongs to someone devy can't hand the new file to (here
+    /// root, stood in through the injected lookup), nothing is replaced: the write fails
+    /// with the usual warning naming only devy's lines. Skipped as root, who may chown.
+    #[cfg(unix)]
+    #[test]
+    fn write_owned_config_fails_without_replacing_when_owner_cant_be_kept() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_support::tmp_dir();
+        let probe = dir.join("probe");
+        std::fs::write(&probe, "").unwrap();
+        if std::os::unix::fs::chown(&probe, Some(0), Some(0)).is_ok() {
+            return; // root
+        }
+        std::fs::remove_file(&probe).unwrap();
+        let path = dir.join("devy.cnf");
+        std::fs::write(&path, "[client]\npassword = SENTINEL\n").unwrap();
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        let root_owned = |_: &std::path::Path| KeptAttrs {
+            mode: 0o640,
+            owner: Some((0, 0)),
+        };
+        let OwnedWrite::Failed(msg) = write_owned_config_keeping(
+            &path,
+            "[mysqld]\nport = 3307\n",
+            "port = 3307",
+            "mysql",
+            "port 3307 is not applied",
+            root_owned,
+        ) else {
+            panic!("the write must fail when the owner can't be kept");
+        };
+        assert!(
+            msg.starts_with(&format!("mysql: could not write {}", path.display()))
+                && msg.contains("its owner and group (0:0)")
+                && msg.contains(&format!(
+                    "left {} unchanged and port 3307 is not applied",
+                    path.display()
+                ))
+                && msg.contains("`sudo chown` it to yourself or delete it")
+                && msg.ends_with("or port = 3307"),
+            "{msg}"
+        );
+        assert!(!msg.contains("SENTINEL"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[client]\npassword = SENTINEL\n"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino);
+        let names: Vec<_> = std::fs::read_dir(&*dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("devy.cnf")]);
+    }
+
+    /// The current user's supplementary groups (`getgroups`), empty on error.
+    #[cfg(unix)]
+    fn supplementary_groups() -> Vec<u32> {
+        // SAFETY: with a size of 0 `getgroups` writes nothing and returns the count.
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let Ok(len) = usize::try_from(n) else {
+            return Vec::new();
+        };
+        let mut groups = vec![0 as libc::gid_t; len];
+        // SAFETY: `groups` is a live buffer of exactly `n` gids.
+        let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+        let Ok(len) = usize::try_from(n) else {
+            return Vec::new();
+        };
+        groups.truncate(len);
+        groups
+    }
+
+    /// A rewrite keeps a group other than the user's primary one when the user is a
+    /// member of it (no privilege needed). Skipped when the user has only one group.
+    #[cfg(unix)]
+    #[test]
+    fn write_owned_config_keeps_another_group_of_the_user() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_support::tmp_dir();
+        let path = dir.join("devy.cnf");
+        std::fs::write(&path, "a\n").unwrap();
+        let created_gid = std::fs::metadata(&path).unwrap().gid();
+        // A group the user can hand the file to: changing to it must succeed unprivileged.
+        let Some(other) = supplementary_groups()
+            .into_iter()
+            .find(|&g| g != created_gid && std::os::unix::fs::chown(&path, None, Some(g)).is_ok())
+        else {
+            return; // only one group
+        };
+        let before = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.gid(), other);
+        assert_eq!(
+            write_owned_config(&path, "b\n", "b", "mysql", "x"),
+            OwnedWrite::Changed
+        );
+        let after = std::fs::metadata(&path).unwrap();
+        assert_ne!(after.ino(), before.ino(), "replaced, not written in place");
+        assert_eq!((after.uid(), after.gid()), (before.uid(), other));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b\n");
+    }
+
+    #[test]
+    fn brew_mysql_include_warning_repeats() {
+        let prefix = crate::test_support::tmp_dir();
+        std::fs::write(prefix.join("my.cnf"), "[mysqld]\nuser = me\n").unwrap();
+        let pm = mock_pm("brew", &prefix);
+        for run in 0..2 {
+            let msgs = crate::output::with_warn_messages(|| {
+                mysql_family_post_setup(&pm, "mysql", 3307, None).unwrap();
+            });
+            assert!(
+                msgs.iter()
+                    .any(|m| m.contains("!includedir") && m.contains("3307")),
+                "run {run}: {msgs:?}"
+            );
+            assert!(msgs.iter().all(|m| !m.contains("user = me")), "{msgs:?}");
+        }
+    }
+
+    /// Scenarios "Port returns to the default" and "Foreign file kept".
+    #[test]
+    fn default_port_removes_devy_managed_db_config() {
+        let dir = crate::test_support::tmp_dir();
+        let pm = mock_pm("apt", &dir);
+        let root = std::path::Path::new("/tmp");
+        for (name, file) in [
+            ("postgresql", "devy.conf"),
+            ("mysql", "devy.cnf"),
+            ("mariadb", "devy.cnf"),
+        ] {
+            let path = dir.join(file);
+            std::fs::write(&path, "# devy-managed\nport = 51000\n").unwrap();
+            crate::modules::get(name)
+                .post_setup(&Dependency::simple(name), &pm, root)
+                .unwrap();
+            assert!(!path.exists(), "{name}: devy's {file} must be removed");
+        }
+        // A `devy.cnf` without the marker, and any `my.cnf` (devy never writes it any
+        // more, even one that starts with the marker), are left alone.
+        let foreign = "[mysqld]\nport = 3310\n";
+        let marked = "# devy-managed\n[mysqld]\nport = 3311\n";
+        std::fs::write(dir.join("devy.cnf"), foreign).unwrap();
+        std::fs::write(dir.join("my.cnf"), marked).unwrap();
+        for name in ["mysql", "mariadb"] {
+            crate::modules::get(name)
+                .post_setup(&Dependency::simple(name), &pm, root)
+                .unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("devy.cnf")).unwrap(),
+            foreign
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("my.cnf")).unwrap(), marked);
+    }
 
     #[test]
     fn persisted_port_records_and_reuses_a_port() {

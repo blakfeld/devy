@@ -285,6 +285,7 @@ fn collect_into(
                 .config_warnings(dep)
                 .into_iter()
                 .chain(ports::unapplied_port_warning(dep, pm))
+                .chain(module.backend_config_warnings(dep, pm))
                 .chain(modules::nix_version_warning(dep, pm))
                 .chain(service_runner::docker_warnings(dep));
             for warning in warnings {
@@ -605,6 +606,85 @@ mod tests {
         assert!(
             warn_count > 0,
             "check_impl must emit config_warnings for minio with credentials"
+        );
+    }
+
+    /// Scenario "brew my.cnf without the include", for `devy check`.
+    #[test]
+    fn check_impl_reports_brew_my_cnf_without_include_and_writes_nothing() {
+        let prefix = crate::test_support::tmp_dir();
+        let project = crate::test_support::tmp_dir();
+        let my_cnf = "[mysqld]\nbind-address = 127.0.0.1\n";
+        std::fs::write(prefix.join("my.cnf"), my_cnf).unwrap();
+        let config: DevyConfig =
+            yaml::from_str("dependencies:\n  - mysql:\n      port: 3307\n").unwrap();
+        let pm = MockPackageManager {
+            name: "brew",
+            installed: true,
+            config_dir: Some(prefix.to_path_buf()),
+            ..Default::default()
+        };
+        let msgs = crate::output::with_warn_messages(|| {
+            let _ = check_impl(&config, &pm, &MockEnvManager::default(), &project);
+        });
+        assert!(
+            msgs.iter().any(|m| m.starts_with("mysql: ")
+                && m.contains("!includedir")
+                && m.contains("3307")),
+            "{msgs:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("my.cnf")).unwrap(),
+            my_cnf
+        );
+        assert_eq!(
+            std::fs::read_dir(&*prefix).unwrap().count(),
+            1,
+            "check wrote a file"
+        );
+    }
+
+    /// Scenario "Legacy my.cnf at the default port", for `devy check`: an apt
+    /// `conf.d/my.cnf` is reported for `mysql` without a port, and nothing is written.
+    #[test]
+    fn check_impl_reports_apt_legacy_my_cnf_at_the_default_port() {
+        let conf_d = crate::test_support::tmp_dir();
+        let project = crate::test_support::tmp_dir();
+        let config: DevyConfig = yaml::from_str("dependencies:\n  - mysql\n").unwrap();
+        let pm = MockPackageManager {
+            name: "apt",
+            installed: true,
+            config_dir: Some(conf_d.to_path_buf()),
+            ..Default::default()
+        };
+        let run = || {
+            crate::output::with_warn_messages(|| {
+                let _ = check_impl(&config, &pm, &MockEnvManager::default(), &project);
+            })
+        };
+        let legacy = |msgs: &[String]| {
+            msgs.iter()
+                .filter(|m| m.starts_with("mysql: ") && m.contains("my.cnf is read after"))
+                .count()
+        };
+        let msgs = run();
+        assert_eq!(legacy(&msgs), 0, "{msgs:?}");
+        let my_cnf = "[mysqld]\nport = 51000\n";
+        std::fs::write(conf_d.join("my.cnf"), my_cnf).unwrap();
+        let msgs = run();
+        assert_eq!(legacy(&msgs), 1, "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("the default port 3306")),
+            "{msgs:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(conf_d.join("my.cnf")).unwrap(),
+            my_cnf
+        );
+        assert_eq!(
+            std::fs::read_dir(&*conf_d).unwrap().count(),
+            1,
+            "check wrote a file"
         );
     }
 

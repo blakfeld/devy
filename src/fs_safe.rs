@@ -100,12 +100,76 @@ fn set_mode(file: &File, mode: u32) -> std::io::Result<()> {
     }
 }
 
+/// Gives `file` the owner `uid` and group `gid`, changing only the ids that differ (so a
+/// rewrite of a file already owned by the caller needs no privilege). A no-op on
+/// Windows.
+fn set_owner(file: &File, uid: u32, gid: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        let uid = (meta.uid() != uid).then_some(uid);
+        let gid = (meta.gid() != gid).then_some(gid);
+        if uid.is_none() && gid.is_none() {
+            return Ok(());
+        }
+        std::os::unix::fs::fchown(file, uid, gid)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, uid, gid);
+        Ok(())
+    }
+}
+
 /// Writes `bytes` to `path` without ever writing through a symlink: the destination is
 /// checked, the content goes to a new temporary file in the same directory (created
 /// exclusively and with `O_NOFOLLOW`), which is synced, given `mode` (Unix only) and
 /// renamed over `path`. A symlink at `path` fails with
 /// `refusing to write <path>: it is a symbolic link` and its target is left untouched.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    write_atomic_with_owner(path, bytes, mode, None)
+}
+
+/// The error from [`write_atomic_with_owner`] when the new file can't be given the
+/// owner and group it was asked to keep. Nothing was renamed, so `path` is unchanged.
+#[derive(Debug)]
+pub struct OwnerNotKept {
+    pub path: PathBuf,
+    pub uid: u32,
+    pub gid: u32,
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for OwnerNotKept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed to keep the owner and group ({}:{}) of {} ({}), so it was left unchanged",
+            self.uid,
+            self.gid,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+// `source` is already in the message, so it isn't chained again.
+impl std::error::Error for OwnerNotKept {}
+
+/// [`write_atomic`] that, on Unix, also gives the new file `owner` (uid, gid), normally
+/// those of the file it replaces, so a rewrite (by root, say) never changes who owns
+/// it. The temporary file is chowned (only the ids that differ) before `mode` is set,
+/// since a chown can clear setuid/setgid bits. A chown that fails (a non-root user
+/// can't give a file to another owner, or to a group they're not in) fails the write
+/// with [`OwnerNotKept`] before the rename, so `path` is left as it was. Ignored on
+/// Windows.
+pub fn write_atomic_with_owner(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    owner: Option<(u32, u32)>,
+) -> Result<()> {
     refuse_symlink(path)?;
     let name = path
         .file_name()
@@ -118,6 +182,14 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let result = (|| -> Result<()> {
         let err = || format!("Failed to write {}", tmp.display());
         file.write_all(bytes).with_context(err)?;
+        if let Some((uid, gid)) = owner {
+            set_owner(&file, uid, gid).map_err(|source| OwnerNotKept {
+                path: path.to_path_buf(),
+                uid,
+                gid,
+                source,
+            })?;
+        }
         set_mode(&file, mode).with_context(err)?;
         file.sync_all().with_context(err)?;
         drop(file);
@@ -192,6 +264,57 @@ pub fn read_regular_capped_following_placeholders(
     cap: u64,
 ) -> std::io::Result<Vec<u8>> {
     read_capped(open_regular_following_placeholders(path)?, path, cap)
+}
+
+/// Reads `path`, following a symlink at it, when what it resolves to is a regular file
+/// of at most `cap` bytes. For files devy only reads and that a dotfile manager may
+/// link, such as Homebrew's `my.cnf`. On Unix, what the path resolves to is checked
+/// before the open, so a FIFO or device is refused without being opened; the open
+/// itself never blocks on a FIFO swapped in afterwards (`O_NONBLOCK`, which regular
+/// files ignore) or adopts a tty as the controlling terminal (`O_NOCTTY`), and the
+/// opened file must be the regular file checked. On Windows there is no path-based
+/// pre-check, since that open would carry no security QOS; the only open asks for
+/// `SECURITY_IDENTIFICATION`, so a path that resolves to a named pipe can't
+/// impersonate devy, and the type is checked on the handle (a directory can't be
+/// opened there and is `PermissionDenied`). Something that isn't a regular file,
+/// changed between the check and the open, or is larger than `cap` is `InvalidData`;
+/// any other error (a missing file's `NotFound`, `PermissionDenied`) keeps its kind.
+pub fn read_regular_capped_following_links(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    let invalid = |what: &str| {
+        std::io::Error::new(ErrorKind::InvalidData, format!("{} {what}", path.display()))
+    };
+    #[cfg(unix)]
+    let checked = {
+        let checked = fs::metadata(path)?;
+        if !checked.file_type().is_file() {
+            return Err(invalid("is not a regular file"));
+        }
+        checked
+    };
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // `SecurityIdentification << 16`; std adds `SECURITY_SQOS_PRESENT`.
+        const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
+        options.security_qos_flags(SECURITY_IDENTIFICATION);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !opened.file_type().is_file() {
+        return Err(invalid("is not a regular file"));
+    }
+    #[cfg(unix)]
+    if !same_inode(&checked, &opened) {
+        return Err(invalid("changed while it was being read"));
+    }
+    read_capped(file, path, cap)
 }
 
 /// Reads at most `cap` bytes of `file` (opened from `path`), refusing a longer file
@@ -1136,6 +1259,59 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
+    /// Rewriting with the replaced file's own owner and group needs no chown and keeps
+    /// them.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_with_owner_keeps_matching_ids() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tmp_dir();
+        let path = dir.join("devy.cnf");
+        fs::write(&path, "old").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let owner = Some((before.uid(), before.gid()));
+        write_atomic_with_owner(&path, b"new", 0o640, owner).unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_ne!(after.ino(), before.ino(), "replaced, not written in place");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    /// A chown devy isn't allowed to make fails the write before the rename: the file
+    /// keeps its content and inode, and no temporary file is left. Skipped as root, who
+    /// may chown.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_with_owner_leaves_the_file_when_chown_fails() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tmp_dir();
+        let path = dir.join("devy.cnf");
+        fs::write(&path, "old").unwrap();
+        let probe = dir.join("probe");
+        fs::write(&probe, "").unwrap();
+        if std::os::unix::fs::chown(&probe, Some(0), Some(0)).is_ok() {
+            return; // root
+        }
+        fs::remove_file(&probe).unwrap();
+        let ino = fs::metadata(&path).unwrap().ino();
+        let err = write_atomic_with_owner(&path, b"new", 0o644, Some((0, 0))).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Failed to keep the owner and group (0:0)")
+                && format!("{err:#}").ends_with("so it was left unchanged"),
+            "{err:#}"
+        );
+        let not_kept = err.downcast_ref::<OwnerNotKept>().expect("typed error");
+        assert_eq!((not_kept.uid, not_kept.gid), (0, 0));
+        assert_eq!(not_kept.path, path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(fs::metadata(&path).unwrap().ino(), ino);
+        let names: Vec<_> = fs::read_dir(&*dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [OsString::from("devy.cnf")]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn write_atomic_refuses_symlinked_destination() {
@@ -1452,6 +1628,75 @@ mod tests {
         assert!(err.to_string().contains("is not a regular file"), "{err}");
         let missing = read_regular_capped_following_placeholders(&dir.join("missing"), 64);
         assert_eq!(missing.unwrap_err().kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn read_following_links_reads_regular_files_only() {
+        let dir = tmp_dir();
+        let real = dir.join("my.cnf");
+        fs::write(&real, "[mysqld]\n").unwrap();
+        assert_eq!(
+            read_regular_capped_following_links(&real, 64).unwrap(),
+            b"[mysqld]\n"
+        );
+        let err = read_regular_capped_following_links(&real, 3).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("larger than 3 bytes"), "{err}");
+        // A directory is refused: on Unix before it is opened, on Windows by the open
+        // itself, which can't open a directory.
+        let err = read_regular_capped_following_links(&dir, 64).unwrap_err();
+        #[cfg(unix)]
+        {
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
+            assert!(err.to_string().contains("is not a regular file"), "{err}");
+        }
+        #[cfg(windows)]
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        let missing = read_regular_capped_following_links(&dir.join("missing"), 64);
+        assert_eq!(missing.unwrap_err().kind(), ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_following_links_follows_a_link_to_a_regular_file_only() {
+        let dir = tmp_dir();
+        let real = dir.join("real");
+        fs::write(&real, "x\n").unwrap();
+        symlink(&real, &dir.join("link"));
+        assert_eq!(
+            read_regular_capped_following_links(&dir.join("link"), 64).unwrap(),
+            b"x\n"
+        );
+        let fifo = dir.join("fifo");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        symlink(&fifo, &dir.join("fifo-link"));
+        // Both return at once instead of blocking on the open.
+        for path in [&fifo, &dir.join("fifo-link")] {
+            let err = read_regular_capped_following_links(path, 64).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
+            assert!(err.to_string().contains("is not a regular file"), "{err}");
+        }
+    }
+
+    /// A link to a character device is refused from the pre-open check, so the device is
+    /// never opened.
+    #[cfg(unix)]
+    #[test]
+    fn read_following_links_refuses_a_link_to_a_device() {
+        let dir = tmp_dir();
+        let link = dir.join("null-link");
+        symlink(Path::new("/dev/null"), &link);
+        for path in [Path::new("/dev/null"), link.as_path()] {
+            let err = read_regular_capped_following_links(path, 64).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidData, "{}", path.display());
+            assert!(err.to_string().contains("is not a regular file"), "{err}");
+        }
     }
 
     #[cfg(unix)]
