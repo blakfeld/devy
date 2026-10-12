@@ -84,12 +84,21 @@ impl Module for MysqlModule {
     fn default_port(&self) -> Option<u16> {
         Some(3306)
     }
-    fn port_applicable(&self, pm: &dyn PackageManager) -> bool {
-        pm.name() == "nix" || pm.service_config_dir("mysql").is_some()
+
+    fn explicit_port_via_config(&self, pm: &dyn PackageManager) -> bool {
+        matches!(pm.name(), "brew" | "apt")
+    }
+
+    fn backend_config_warnings(&self, dep: &Dependency, pm: &dyn PackageManager) -> Vec<String> {
+        super::helpers::mysql_family_backend_config_warnings("mysql", dep, pm)
     }
 
     fn known_extra_keys(&self) -> Option<&'static [&'static str]> {
         Some(&["port", "cli_args"])
+    }
+
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(super::pkg_dep(self, pm, dep, package_name(pm)))
     }
 
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
@@ -105,7 +114,7 @@ impl Module for MysqlModule {
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&super::pkg_dep(self, pm, dep, package_name(pm)))
+        super::install_backend(self, pm, dep)
     }
 
     fn nix_versioned_attr(&self, version: &str) -> Option<String> {
@@ -383,7 +392,7 @@ mod tests {
         MysqlModule
             .post_setup(&dep, &pm, std::path::Path::new("/tmp"))
             .unwrap();
-        let content = std::fs::read_to_string(dir.join("my.cnf")).unwrap();
+        let content = std::fs::read_to_string(dir.join("devy.cnf")).unwrap();
         assert!(content.contains("port = 3307"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -405,7 +414,7 @@ mod tests {
         MysqlModule
             .post_setup(&dep, &pm, std::path::Path::new("/tmp"))
             .unwrap();
-        let content = std::fs::read_to_string(dir.join("my.cnf")).unwrap();
+        let content = std::fs::read_to_string(dir.join("devy.cnf")).unwrap();
         assert!(content.contains("innodb-buffer-pool-size"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -422,7 +431,7 @@ mod tests {
         MysqlModule
             .post_setup(&dep, &pm, std::path::Path::new("/tmp"))
             .unwrap();
-        assert!(!dir.join("my.cnf").exists());
+        assert!(!dir.join("devy.cnf").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

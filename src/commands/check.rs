@@ -285,6 +285,7 @@ fn collect_into(
                 .config_warnings(dep)
                 .into_iter()
                 .chain(ports::unapplied_port_warning(dep, pm))
+                .chain(module.backend_config_warnings(dep, pm))
                 .chain(modules::nix_version_warning(dep, pm))
                 .chain(service_runner::docker_warnings(dep));
             for warning in warnings {
@@ -309,11 +310,16 @@ fn collect_into(
         }
     }
 
-    // Collect PATH prepends from all modules.
-    let path_prepends: Vec<String> = deps
+    // The PATH entries `devy up` writes, without the package manager's own entries,
+    // computed from the dependencies with their lock pins applied, as `up` does.
+    let env_deps: Vec<Dependency> = resolved_deps
         .iter()
-        .flat_map(|dep| modules::get(&dep.name).path_prepends(dep, project_root))
+        .map(|dep| super::up::apply_lock_from_source(dep, recorded.lock(), pm))
         .collect();
+    let path_prepends =
+        crate::project_env::resolve(config, &env_deps, pm, project_root, PortMode::ReadOnly)
+            .compared_path_prepends()
+            .to_vec();
 
     if !config.environment.is_empty() || !path_prepends.is_empty() {
         let written_paths = if path_prepends.is_empty() {
@@ -605,6 +611,85 @@ mod tests {
         assert!(
             warn_count > 0,
             "check_impl must emit config_warnings for minio with credentials"
+        );
+    }
+
+    /// Scenario "brew my.cnf without the include", for `devy check`.
+    #[test]
+    fn check_impl_reports_brew_my_cnf_without_include_and_writes_nothing() {
+        let prefix = crate::test_support::tmp_dir();
+        let project = crate::test_support::tmp_dir();
+        let my_cnf = "[mysqld]\nbind-address = 127.0.0.1\n";
+        std::fs::write(prefix.join("my.cnf"), my_cnf).unwrap();
+        let config: DevyConfig =
+            yaml::from_str("dependencies:\n  - mysql:\n      port: 3307\n").unwrap();
+        let pm = MockPackageManager {
+            name: "brew",
+            installed: true,
+            config_dir: Some(prefix.to_path_buf()),
+            ..Default::default()
+        };
+        let msgs = crate::output::with_warn_messages(|| {
+            let _ = check_impl(&config, &pm, &MockEnvManager::default(), &project);
+        });
+        assert!(
+            msgs.iter().any(|m| m.starts_with("mysql: ")
+                && m.contains("!includedir")
+                && m.contains("3307")),
+            "{msgs:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(prefix.join("my.cnf")).unwrap(),
+            my_cnf
+        );
+        assert_eq!(
+            std::fs::read_dir(&*prefix).unwrap().count(),
+            1,
+            "check wrote a file"
+        );
+    }
+
+    /// Scenario "Legacy my.cnf at the default port", for `devy check`: an apt
+    /// `conf.d/my.cnf` is reported for `mysql` without a port, and nothing is written.
+    #[test]
+    fn check_impl_reports_apt_legacy_my_cnf_at_the_default_port() {
+        let conf_d = crate::test_support::tmp_dir();
+        let project = crate::test_support::tmp_dir();
+        let config: DevyConfig = yaml::from_str("dependencies:\n  - mysql\n").unwrap();
+        let pm = MockPackageManager {
+            name: "apt",
+            installed: true,
+            config_dir: Some(conf_d.to_path_buf()),
+            ..Default::default()
+        };
+        let run = || {
+            crate::output::with_warn_messages(|| {
+                let _ = check_impl(&config, &pm, &MockEnvManager::default(), &project);
+            })
+        };
+        let legacy = |msgs: &[String]| {
+            msgs.iter()
+                .filter(|m| m.starts_with("mysql: ") && m.contains("my.cnf is read after"))
+                .count()
+        };
+        let msgs = run();
+        assert_eq!(legacy(&msgs), 0, "{msgs:?}");
+        let my_cnf = "[mysqld]\nport = 51000\n";
+        std::fs::write(conf_d.join("my.cnf"), my_cnf).unwrap();
+        let msgs = run();
+        assert_eq!(legacy(&msgs), 1, "{msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m.contains("the default port 3306")),
+            "{msgs:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(conf_d.join("my.cnf")).unwrap(),
+            my_cnf
+        );
+        assert_eq!(
+            std::fs::read_dir(&*conf_d).unwrap().count(),
+            1,
+            "check wrote a file"
         );
     }
 
@@ -906,6 +991,81 @@ mod tests {
             &MockEnvManager::default(),
             &dir,
         )
+    }
+
+    #[test]
+    fn check_matches_the_brew_formula_bin_dirs_up_writes() {
+        let tmp = crate::test_support::tmp_dir();
+        let bin = tmp.join("opt/jq/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bin = bin.to_string_lossy().into_owned();
+        let pm = MockPackageManager {
+            name: "brew",
+            installed: true,
+            package_bin_dir: Some(Box::new(move |pkg: &Dependency| {
+                let dir = tmp.join("opt").join(&pkg.name).join("bin");
+                dir.is_dir().then_some(dir)
+            })),
+            ..Default::default()
+        };
+        let config = make_config(&["jq"], HashMap::new());
+        let dir = crate::test_support::tmp_dir();
+        let check = |env_mgr: &MockEnvManager| {
+            collect_findings(
+                &config,
+                &pm,
+                ContainerRuntime::system(config.container_cli),
+                env_mgr,
+                &dir,
+            )
+            .issues()
+        };
+
+        // Before `devy up`, the entry is reported missing.
+        let env_mgr = MockEnvManager::default();
+        assert_eq!(
+            check(&env_mgr),
+            vec![format!(
+                "PATH entry {bin} is missing from the environment file"
+            )]
+        );
+
+        let lock = crate::test_support::tmp_path(".lock");
+        crate::commands::up::up_impl(
+            &config,
+            &pm,
+            &env_mgr,
+            crate::commands::up::UpOptions {
+                update: false,
+                bootstrap: false,
+            },
+            &dir,
+            &lock,
+        )
+        .unwrap();
+        assert_eq!(*env_mgr.last_path_prepends.borrow(), vec![bin]);
+        let issues = check(&env_mgr);
+        assert!(issues.is_empty(), "{issues:?}");
+    }
+
+    #[test]
+    fn check_ignores_the_nix_profile_before_the_first_up() {
+        // Under nix the profile bin is the backend's entry and every package's bin dir;
+        // neither is compared, so a project passes before `devy up`.
+        let pm = MockPackageManager {
+            name: "nix",
+            installed: true,
+            path_prepends_result: vec!["/p/.devy/nix-profile/bin".into()],
+            package_bin_dir: Some(Box::new(|_: &Dependency| {
+                Some("/p/.devy/nix-profile/bin".into())
+            })),
+            ..Default::default()
+        };
+        for deps in [&[][..], &["jq"][..]] {
+            let findings = collect(&make_config(deps, HashMap::new()), &pm);
+            assert!(findings.issues().is_empty(), "{:?}", findings.issues());
+            assert!(findings.env.is_none(), "{:?}", findings.env);
+        }
     }
 
     // ── check --json ─────────────────────────────────────────────────────────

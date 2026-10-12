@@ -12,8 +12,22 @@ use crate::package_manager::PackageManager;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectEnv {
     pub vars: HashMap<String, String>,
-    /// PATH entries in order, the package manager's own entries first.
+    /// PATH entries in order, without duplicates: the package manager's own entries,
+    /// then module entries, then each dependency's package bin dir (brew's
+    /// `opt/<formula>/bin`).
     pub path_prepends: Vec<String>,
+    /// How many leading `path_prepends` are the package manager's own entries
+    /// (`.devy/nix-profile/bin`).
+    pub backend_path_count: usize,
+}
+
+impl ProjectEnv {
+    /// The PATH entries `devy check` and `devy status` compare with the written file:
+    /// all but the package manager's own entries, which exist (or not) whatever the
+    /// dependencies, so a project before its first `devy up` isn't reported stale.
+    pub(crate) fn compared_path_prepends(&self) -> &[String] {
+        &self.path_prepends[self.backend_path_count..]
+    }
 }
 
 /// Computes the project environment for `deps`, which must already have lock pins
@@ -32,12 +46,36 @@ pub(crate) fn resolve(
     // PM-level prepends (e.g. .devy/nix-profile/bin) go first so project-local
     // binaries shadow any system copies of the same tools.
     let mut path_prepends: Vec<String> = pm.path_prepends(project_root);
+    let backend_len = path_prepends.len();
     for dep in deps {
         let m = modules::get(&dep.name);
         module_env.extend(m.env_vars(dep, project_root));
         module_env.extend(m.backend_env_vars(dep, pm, project_root, mode));
         path_prepends.extend(m.path_prepends(dep, project_root));
+        path_prepends.extend(m.backend_path_prepends(dep, pm, project_root));
     }
+    // Then the directory of each package the backend installed, so keg-only and pinned
+    // Homebrew formulae are found. They come after module entries, so a virtualenv's
+    // `bin` wins over `opt/python/bin`. Docker-managed services aren't installed by it.
+    for dep in deps.iter().filter(|dep| !dep.docker) {
+        if let Some(dir) = modules::get(&dep.name)
+            .backend_package(pm, dep)
+            .and_then(|pkg| pm.package_bin_dir(&pkg))
+        {
+            path_prepends.push(dir.to_string_lossy().into_owned());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut backend_path_count = 0;
+    let mut index = 0;
+    path_prepends.retain(|entry| {
+        let keep = seen.insert(entry.clone());
+        if keep && index < backend_len {
+            backend_path_count += 1;
+        }
+        index += 1;
+        keep
+    });
 
     // Emit <SERVICE>_HOST and <SERVICE>_PORT for every service dep.
     // These run after module env_vars so service-specific vars (REDIS_URL, etc.) are
@@ -71,6 +109,7 @@ pub(crate) fn resolve(
     ProjectEnv {
         vars: merge_env(module_env, &config.environment),
         path_prepends,
+        backend_path_count,
     }
 }
 
@@ -128,6 +167,130 @@ mod tests {
             Some("127.0.0.1")
         );
         assert_eq!(env.vars.get("REDIS_PORT").map(String::as_str), Some("6379"));
+    }
+
+    #[test]
+    fn resolve_adds_the_brew_formula_bin_dir_of_a_pinned_dependency() {
+        let tmp = crate::test_support::tmp_dir();
+        let bin = tmp.join("opt/postgresql@16/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let prefix = tmp.to_path_buf();
+        let pm = MockPackageManager {
+            name: "brew",
+            package_bin_dir: Some(Box::new(move |pkg: &Dependency| {
+                let formula = crate::package_manager::brew_formula_name(pkg);
+                let dir = prefix.join("opt").join(formula).join("bin");
+                dir.is_dir().then_some(dir)
+            })),
+            ..Default::default()
+        };
+        let config: DevyConfig =
+            yaml::from_str("dependencies:\n  - postgres:\n      version: \"16\"\n").unwrap();
+        let deps = config.normalized_dependencies().unwrap();
+        let env = resolve(&config, &deps, &pm, Path::new("/p"), PortMode::ReadOnly);
+        assert!(
+            env.path_prepends
+                .contains(&bin.to_string_lossy().into_owned()),
+            "{:?}",
+            env.path_prepends
+        );
+    }
+
+    #[test]
+    fn resolve_keeps_the_first_of_duplicate_path_entries() {
+        // Under nix the profile bin is both the backend's entry and every package's bin
+        // dir; it appears once, first.
+        let config: DevyConfig = yaml::from_str("dependencies:\n  - jq\n  - python\n").unwrap();
+        let deps = config.normalized_dependencies().unwrap();
+        let pm = MockPackageManager {
+            name: "nix",
+            path_prepends_result: vec!["/p/.devy/nix-profile/bin".into()],
+            package_bin_dir: Some(Box::new(|_: &Dependency| {
+                Some("/p/.devy/nix-profile/bin".into())
+            })),
+            ..Default::default()
+        };
+        let env = resolve(&config, &deps, &pm, Path::new("/p"), PortMode::ReadOnly);
+        assert_eq!(env.path_prepends[0], "/p/.devy/nix-profile/bin");
+        assert_eq!(
+            env.path_prepends
+                .iter()
+                .filter(|e| *e == "/p/.devy/nix-profile/bin")
+                .count(),
+            1,
+            "{:?}",
+            env.path_prepends
+        );
+        assert_eq!(env.path_prepends.len(), 2, "{:?}", env.path_prepends);
+        // The profile bin, a backend entry, is not compared by check and status.
+        assert_eq!(env.backend_path_count, 1);
+        assert_eq!(env.compared_path_prepends(), &env.path_prepends[1..]);
+    }
+
+    #[test]
+    fn resolve_puts_package_bin_dirs_after_module_entries() {
+        let config: DevyConfig =
+            yaml::from_str("dependencies:\n  - python\n  - jq\n  - rust\n").unwrap();
+        let deps = config.normalized_dependencies().unwrap();
+        let pm = MockPackageManager {
+            name: "brew",
+            path_prepends_result: vec!["/backend/bin".into()],
+            package_bin_dir: Some(Box::new(|pkg: &Dependency| {
+                Some(format!("/opt/{}/bin", pkg.name).into())
+            })),
+            ..Default::default()
+        };
+        let env = resolve(&config, &deps, &pm, Path::new("/p"), PortMode::ReadOnly);
+        // rust installs through rustup, so it has no package bin dir.
+        let venv = modules::get("python").path_prepends(&deps[0], Path::new("/p"));
+        assert_eq!(
+            env.path_prepends,
+            [
+                "/backend/bin",
+                venv[0].as_str(),
+                "/opt/python/bin",
+                "/opt/jq/bin"
+            ],
+            "{:?}",
+            env.path_prepends
+        );
+        assert!(
+            !env.path_prepends.iter().any(|e| e.contains("/opt/rust")),
+            "{:?}",
+            env.path_prepends
+        );
+        assert_eq!(env.path_prepends.len(), 4, "{:?}", env.path_prepends);
+        assert_eq!(env.compared_path_prepends(), &env.path_prepends[1..]);
+    }
+
+    #[test]
+    fn resolve_puts_the_virtualenv_ahead_of_brew_python() {
+        // `pip install` must use the virtualenv, not Homebrew's externally managed Python.
+        let tmp = crate::test_support::tmp_dir();
+        std::fs::create_dir_all(tmp.join("opt/python/bin")).unwrap();
+        let prefix = tmp.to_path_buf();
+        let pm = MockPackageManager {
+            name: "brew",
+            package_bin_dir: Some(Box::new(move |pkg: &Dependency| {
+                let dir = prefix
+                    .join("opt")
+                    .join(crate::package_manager::brew_formula_name(pkg))
+                    .join("bin");
+                dir.is_dir().then_some(dir)
+            })),
+            ..Default::default()
+        };
+        let config: DevyConfig = yaml::from_str("dependencies:\n  - python\n").unwrap();
+        let deps = config.normalized_dependencies().unwrap();
+        let env = resolve(&config, &deps, &pm, Path::new("/p"), PortMode::ReadOnly);
+        let venv = modules::get("python").path_prepends(&deps[0], Path::new("/p"));
+        assert_eq!(
+            env.path_prepends,
+            [
+                venv[0].clone(),
+                tmp.join("opt/python/bin").to_string_lossy().into_owned()
+            ]
+        );
     }
 
     #[test]

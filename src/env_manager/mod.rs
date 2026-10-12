@@ -80,7 +80,10 @@ impl EnvManager for MockEnvManager {
             None
         }
     }
+    /// The entries of the last `setup`, as the written file would hold them.
     fn read_path_prepends(&self, _project_root: &Path) -> Option<Vec<String>> {
-        None
+        self.setup_called
+            .get()
+            .then(|| self.last_path_prepends.borrow().clone())
     }
 }

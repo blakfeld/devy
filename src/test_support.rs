@@ -73,6 +73,44 @@ pub fn private_tmp_dir() -> TempDir {
     dir
 }
 
+/// A [`tmp_dir`] the current user can't write to (mode 0555); its mode is restored on
+/// drop so it can be removed.
+#[cfg(unix)]
+pub struct ReadOnlyDir(TempDir);
+
+#[cfg(unix)]
+impl std::ops::Deref for ReadOnlyDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&*self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A [`ReadOnlyDir`] holding whatever `setup` puts in it first. `None` when the directory
+/// is still writable after the mode change, as it is for root: callers skip the test.
+#[cfg(unix)]
+pub fn read_only_dir(setup: impl FnOnce(&std::path::Path)) -> Option<ReadOnlyDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir();
+    setup(&dir);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let dir = ReadOnlyDir(dir);
+    let probe = dir.join(".devy-write-probe");
+    if std::fs::write(&probe, "").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        return None;
+    }
+    Some(dir)
+}
+
 /// A temporary file path that is deleted automatically when dropped.
 /// The file is not created by `tmp_path`; creation happens when the test writes to it.
 pub struct TempFile {

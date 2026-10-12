@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::config::Dependency;
 use crate::package_manager::PackageManager;
 
-use super::{Module, pm_dep};
+use super::Module;
 
 pub struct MongodbModule;
 
@@ -76,12 +76,16 @@ impl Module for MongodbModule {
         Some(&["port"])
     }
 
+    fn backend_package(&self, pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(super::pkg_dep(self, pm, dep, package_name(pm)))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
-        pm.is_package_installed(&pm_dep(dep, package_name(pm)))
+        super::backend_installed(self, pm, dep)
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(&super::pkg_dep(self, pm, dep, package_name(pm)))
+        super::install_backend(self, pm, dep)
     }
 
     fn resolved_version(
