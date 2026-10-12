@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn check_matches_the_brew_formula_bin_dirs_up_writes() {
         let tmp = crate::test_support::tmp_dir();
-        let bin = tmp.join("opt/jq/bin");
+        let bin = tmp.join("opt").join("jq").join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let bin = bin.to_string_lossy().into_owned();
         let pm = MockPackageManager {
