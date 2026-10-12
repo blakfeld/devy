@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn resolve_adds_the_brew_formula_bin_dir_of_a_pinned_dependency() {
         let tmp = crate::test_support::tmp_dir();
-        let bin = tmp.join("opt/postgresql@16/bin");
+        let bin = tmp.join("opt").join("postgresql@16").join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let prefix = tmp.to_path_buf();
         let pm = MockPackageManager {
@@ -267,7 +267,8 @@ mod tests {
     fn resolve_puts_the_virtualenv_ahead_of_brew_python() {
         // `pip install` must use the virtualenv, not Homebrew's externally managed Python.
         let tmp = crate::test_support::tmp_dir();
-        std::fs::create_dir_all(tmp.join("opt/python/bin")).unwrap();
+        let bin = tmp.join("opt").join("python").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
         let prefix = tmp.to_path_buf();
         let pm = MockPackageManager {
             name: "brew",
@@ -286,10 +287,7 @@ mod tests {
         let venv = modules::get("python").path_prepends(&deps[0], Path::new("/p"));
         assert_eq!(
             env.path_prepends,
-            [
-                venv[0].clone(),
-                tmp.join("opt/python/bin").to_string_lossy().into_owned()
-            ]
+            [venv[0].clone(), bin.to_string_lossy().into_owned()]
         );
     }
 

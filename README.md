@@ -936,6 +936,7 @@ Both requests also include a short note on how devy's backends work. Neither eve
 
 - the value of any `KEY=value` or `key: value` entry whose key contains `KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `CREDENTIAL` or `PRIVATE` (case-insensitive)
 - passwords in URLs (`postgres://app:hunter2@localhost/app` → `postgres://app:<redacted>@localhost/app`)
+- secret arguments in exec-form commands, such as compose `command`, `entrypoint` and `healthcheck.test` or a Dockerfile `CMD`, written as `["…", "…"]` (nested lists included) or as `- item` lines. devy redacts the argument after a secret-named flag (`--requirepass`, `--password`, `--token`, `--api-key`), after `redis-cli -a`/`--pass`, after `sqlcmd -P`, and after `-p` for `<tool> login`, `sshpass` and the MongoDB tools. It also redacts the password in `curl -u user:password` and a glued value (`--password=x`, `mysql -px`). Quotes and commas are kept, so `command: ["redis-server", "--requirepass", "hunter2"]` is sent as `command: ["redis-server", "--requirepass", "<redacted>"]`
 - PEM blocks (`-----BEGIN … -----END …-----`)
 - tokens starting with `sk-`, `ghp_`, `github_pat_`, `xox` (Slack) or `AKIA` (AWS)
 
