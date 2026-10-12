@@ -22,6 +22,7 @@ mod state_dir;
 #[cfg(test)]
 mod test_support;
 mod validate;
+mod worktree;
 mod yaml_safe;
 
 use clap::Parser;

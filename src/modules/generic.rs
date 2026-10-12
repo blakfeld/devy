@@ -3,7 +3,7 @@ use anyhow::Result;
 use crate::config::Dependency;
 use crate::package_manager::PackageManager;
 
-use super::Module;
+use super::{Module, pm_dep};
 
 pub struct GenericModule;
 
@@ -12,12 +12,16 @@ impl Module for GenericModule {
         None
     }
 
+    fn backend_package(&self, _pm: &dyn PackageManager, dep: &Dependency) -> Option<Dependency> {
+        Some(pm_dep(dep, &dep.name))
+    }
+
     fn is_installed(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<bool> {
-        pm.is_package_installed(dep)
+        super::backend_installed(self, pm, dep)
     }
 
     fn install(&self, pm: &dyn PackageManager, dep: &Dependency) -> Result<()> {
-        pm.install_package(dep)
+        super::install_backend(self, pm, dep)
     }
 }
 

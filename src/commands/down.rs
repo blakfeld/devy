@@ -62,7 +62,10 @@ pub(crate) fn down_impl(config: &DevyConfig, runners: &Runners, volumes: bool) -
     let mut stopped_any = false;
     for dep in services {
         let runner = runners.runner_for(dep);
-        if runner.is_running(dep)? {
+        // Read before migrating: a running legacy unit counts, and migration stops it.
+        let running = runner.is_running(dep)?;
+        runner.migrate(dep)?;
+        if running {
             output::step(&format!("Stopping {}", dep.name));
             runner
                 .stop(dep)
@@ -126,6 +129,14 @@ mod tests {
     }
 
     #[test]
+    fn down_impl_migrates_every_service_even_when_stopped() {
+        let config = make_config(&["mysql", "redis"]);
+        let pm = MockPackageManager::default();
+        down(&config, &pm).unwrap();
+        assert_eq!(*pm.migrated_services.borrow(), ["mysql", "redis"]);
+    }
+
+    #[test]
     fn down_impl_propagates_stop_error() {
         let config = make_config(&["mysql"]);
         let pm = MockPackageManager {
@@ -169,8 +180,17 @@ mod tests {
         assert_eq!(*pm.stopped_services.borrow(), vec!["mysql".to_string()]);
     }
 
-    /// Runs `down` on a docker-managed postgres whose container is running.
+    /// Runs `down` on a docker-managed postgres whose container is running, created by
+    /// an older devy (no `sh.devy.host` label).
     fn docker_down(volumes: bool) -> (Vec<String>, String) {
+        docker_down_on(volumes, None)
+    }
+
+    /// `docker_down`, with the container's `sh.devy.host` label (or none) given.
+    fn docker_down_on(volumes: bool, host: Option<&str>) -> (Vec<String>, String) {
+        let host_label = host
+            .map(|h| format!(r#","sh.devy.host":"{h}""#))
+            .unwrap_or_default();
         let config: DevyConfig =
             yaml::from_str("name: app\nservice_manager: docker\ndependencies:\n  - postgres\n")
                 .unwrap();
@@ -184,13 +204,13 @@ mod tests {
                 ok("")
             }
             "container" => ok(&format!(
-                r#"{{"State":{{"Running":{}}},"Config":{{"Labels":{{"sh.devy.project":"/src/app"}}}}}}"#,
+                r#"{{"State":{{"Running":{}}},"Config":{{"Labels":{{"sh.devy.project":"/src/app"{host_label}}}}}}}"#,
                 !seen.get()
             )),
             _ => ok(""),
         });
         let root = Path::new("/src/app");
-        let runners = Runners::new(
+        let mut runners = Runners::new(
             &pm,
             ContainerRuntime::new(config.container_cli, &fake),
             &config,
@@ -198,6 +218,7 @@ mod tests {
             None,
             false,
         );
+        runners.docker.set_host(Some(THIS_HOST));
         down_impl(&config, &runners, volumes).unwrap();
         let name = runners
             .docker
@@ -230,6 +251,40 @@ mod tests {
             .position(|l| *l == format!("docker volume rm {name}"))
             .expect("volume removed");
         assert!(rm < volume_rm);
+    }
+
+    /// The host id `docker_down_on` runs as.
+    const THIS_HOST: &str = "0123456789abcdef";
+
+    #[test]
+    fn down_acts_on_this_hosts_container() {
+        let (lines, name) = docker_down_on(true, Some(THIS_HOST));
+        assert!(lines.contains(&format!("docker stop {name}")), "{lines:?}");
+        assert!(lines.contains(&format!("docker rm -f {name}")), "{lines:?}");
+        assert!(
+            lines.contains(&format!("docker volume rm {name}")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn down_leaves_another_hosts_container_alone() {
+        let mut lines = Vec::new();
+        let warnings = crate::output::with_warn_messages(|| {
+            lines = docker_down_on(true, Some("ffffffffffffffff")).0;
+        });
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains(" stop ") || l.contains(" rm ")),
+            "{lines:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("belongs to another machine or user")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

@@ -246,7 +246,36 @@ pub fn env_key(s: &str) -> bool {
 /// modes) or `WORDCHARS`. Names are compared case-sensitively and reserved only in
 /// the case a shell uses them (`histchars` and `HISTCHARS` both, but not `ps1` or
 /// `pwd`). `None` for any key that is not reserved.
+///
+/// The variables devy reads this machine's identity from for the `sh.devy.host`
+/// container label are reserved too, where devy reads them: `WSL_DISTRO_NAME` (Linux
+/// under WSL) everywhere, and on Windows `SystemRoot`, `windir`, `COMPUTERNAME`,
+/// `USERNAME` and `USERDOMAIN` in any case, since Windows matches environment names
+/// case-insensitively. A project could otherwise make `devy prune` run its own
+/// `reg.exe` or take another machine's containers for this one's.
 pub fn reserved_env_key(key: &str) -> Option<&'static str> {
+    reserved_env_key_on(key, cfg!(windows))
+}
+
+/// `reserved_env_key`, with whether this is Windows injected.
+fn reserved_env_key_on(key: &str, windows: bool) -> Option<&'static str> {
+    const IDENTITY: &str =
+        "devy reads this machine's identity from it, to tell its containers from other machines'";
+    const WINDOWS_REASON: &str = "on Windows, devy reads this machine's identity from it, \
+         to tell its containers from other machines'";
+    const WINDOWS_IDENTITY: &[&str] = &[
+        "SystemRoot",
+        "windir",
+        "COMPUTERNAME",
+        "USERNAME",
+        "USERDOMAIN",
+    ];
+    if key == "WSL_DISTRO_NAME" {
+        return Some(IDENTITY);
+    }
+    if windows && WINDOWS_IDENTITY.iter().any(|n| n.eq_ignore_ascii_case(key)) {
+        return Some(WINDOWS_REASON);
+    }
     const NAMES: &[(&str, &[&str])] = &[
         (
             "the shell keeps it for the working directory",
@@ -859,6 +888,7 @@ mod tests {
                 &["__fish_config_dir", "__fish_webconfig_theme_notification"],
             ),
             ("shell functions", &["BASH_FUNC_x"]),
+            ("this machine's identity", &["WSL_DISTRO_NAME"]),
         ] {
             for k in keys {
                 let reason = reserved_env_key(k).unwrap_or_else(|| panic!("{k} must be reserved"));
@@ -910,8 +940,39 @@ mod tests {
             "__fish",
             "fish_greeting",
             "BASH_FUNCTION",
+            "USERNAME_X",
+            "DB_USERNAME",
+            "MY_SYSTEMROOT",
+            "wsl_distro_name",
         ] {
             assert_eq!(reserved_env_key(k), None, "{k} must be allowed");
+        }
+    }
+
+    #[test]
+    fn windows_identity_keys_are_reserved_only_on_windows() {
+        for k in [
+            "SystemRoot",
+            "SYSTEMROOT",
+            "windir",
+            "WINDIR",
+            "COMPUTERNAME",
+            "USERNAME",
+            "username",
+            "USERDOMAIN",
+        ] {
+            let reason = reserved_env_key_on(k, true).unwrap_or_else(|| panic!("{k}"));
+            assert!(
+                reason.starts_with("on Windows, devy reads this machine's identity"),
+                "{k}: {reason}"
+            );
+            // macOS and Linux never read them: an app's own USERNAME stays allowed.
+            assert_eq!(reserved_env_key_on(k, false), None, "{k}");
+        }
+        for windows in [true, false] {
+            let reason = reserved_env_key_on("WSL_DISTRO_NAME", windows).unwrap();
+            assert!(!reason.contains("Windows"), "{reason}");
+            assert_eq!(reserved_env_key_on("DB_USERNAME", windows), None);
         }
     }
 

@@ -78,26 +78,11 @@ fn read_small(path: &Path) -> Option<String> {
     Some(text)
 }
 
-/// The permission bits of an existing regular file at `path` (so a rewrite never widens a
-/// `0600` file that holds secrets), else `0o644`.
-fn mode_for(path: &Path) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::symlink_metadata(path)
-            && meta.is_file()
-        {
-            return meta.permissions().mode() & 0o7777;
-        }
-    }
-    let _ = path;
-    0o644
-}
-
-/// Writes `content` to `path` when it differs, creating the parent directory and keeping
-/// an existing file's mode. Returns whether the file changed. A failure is a warning
-/// (shown once per `hint`) naming only `hint` — the lines to add — never the whole file,
-/// which may be the user's own config with credentials in it.
+/// Writes `content` to `path` when it differs (see `helpers::write_owned_config`): a
+/// rewrite keeps the file's mode minus setuid/setgid/sticky and group/world write, and
+/// its owner and group (or fails, leaving the file as it was), and a symlink to a regular
+/// file with the same content is left alone. Returns whether the file changed. A failure
+/// is a warning naming `hint` (the lines to add), shown once per distinct message.
 fn write_owned(
     path: &Path,
     content: &str,
@@ -105,25 +90,17 @@ fn write_owned(
     what: &str,
     state_dir: Option<&Path>,
 ) -> bool {
-    if std::fs::read_to_string(path).is_ok_and(|old| old == content) {
-        return false;
-    }
-    let mode = mode_for(path);
-    let result = path
-        .parent()
-        .map_or(Ok(()), |dir| {
-            std::fs::create_dir_all(dir).map_err(anyhow::Error::from)
-        })
-        .and_then(|()| crate::fs_safe::write_atomic(path, content.as_bytes(), mode));
-    match result {
-        Ok(()) => {
-            crate::output::info(&format!(
-                "{what}: wrote {} — restart the service if it is already running",
-                path.display()
-            ));
-            true
-        }
-        Err(e) => {
+    use super::helpers::OwnedWrite;
+    match super::helpers::write_owned_config(
+        path,
+        content,
+        &format!("add:\n{hint}"),
+        what,
+        "the service may listen on every interface",
+    ) {
+        OwnedWrite::Changed => true,
+        OwnedWrite::Unchanged => false,
+        OwnedWrite::Failed(message) => {
             warn_once(
                 state_dir,
                 &format!(
@@ -131,10 +108,7 @@ fn write_owned(
                     path.file_name().unwrap_or_default().to_string_lossy()
                 ),
                 &path.to_string_lossy(),
-                &format!(
-                    "{what}: could not write {} ({e:#}), so the service may listen on every interface — add:\n{hint}",
-                    path.display()
-                ),
+                &message,
             );
             false
         }
@@ -1426,6 +1400,55 @@ mod tests {
         );
         let mode = std::fs::metadata(&conf).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// A symlink (a dotfile manager's, say) to a regular file that already holds devy's
+    /// content is left alone without a warning; one with other content is refused, its
+    /// target untouched, and the warning still names the lines to add.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_owned_file_is_compared_through_but_never_written_through() {
+        let state = crate::test_support::tmp_dir();
+        let dir = crate::test_support::tmp_dir();
+        let elsewhere = crate::test_support::tmp_dir();
+        let target = elsewhere.join("90-devy.conf");
+        let link = dir.join("90-devy.conf");
+        let content = format!("{DEVY_MARKER}\nlisteners.tcp.1 = 127.0.0.1:5672\n");
+        std::fs::write(&target, &content).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let msgs = crate::output::with_warn_messages(|| {
+            assert!(!write_owned(
+                &link,
+                &content,
+                &content,
+                "rabbitmq",
+                Some(&state)
+            ));
+        });
+        assert!(msgs.is_empty(), "{msgs:?}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let msgs = crate::output::with_warn_messages(|| {
+            assert!(!write_owned(
+                &link,
+                "other\n",
+                "other",
+                "rabbitmq",
+                Some(&state)
+            ));
+        });
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), content);
+        assert!(
+            msgs.iter().any(|m| m.contains("refusing to write")
+                && m.contains("so the service may listen on every interface — add:\nother")),
+            "{msgs:?}"
+        );
     }
 
     #[cfg(unix)]

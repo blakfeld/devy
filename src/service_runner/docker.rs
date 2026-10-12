@@ -5,6 +5,8 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::{Child, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::config::ContainerCli;
 
@@ -20,6 +22,16 @@ pub trait CommandRunner {
     /// Runs `program` with `args`, capturing its output. Errors only when the program
     /// can't be started (e.g. it isn't on PATH).
     fn output(&self, program: &str, args: &[String]) -> Result<CmdOutput>;
+    /// `output`, but the program is killed and an error returned when it hasn't finished
+    /// within `timeout` (e.g. a wedged daemon). Fakes that answer at once keep this default.
+    fn output_within(
+        &self,
+        program: &str,
+        args: &[String],
+        _timeout: Duration,
+    ) -> Result<CmdOutput> {
+        self.output(program, args)
+    }
     /// Runs `program` with `args`, its output going to the terminal (e.g. pull progress).
     /// Returns whether it succeeded.
     fn status(&self, program: &str, args: &[String]) -> Result<bool>;
@@ -44,6 +56,21 @@ impl CommandRunner for SystemRunner {
     }
 
     #[cfg_attr(test, mutants::skip)] // spawns real processes
+    fn output_within(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<CmdOutput> {
+        output_within_path(
+            &crate::package_manager::require_system_tool(program)?,
+            program,
+            args,
+            timeout,
+        )
+    }
+
+    #[cfg_attr(test, mutants::skip)] // spawns real processes
     fn status(&self, program: &str, args: &[String]) -> Result<bool> {
         let status =
             std::process::Command::new(crate::package_manager::require_system_tool(program)?)
@@ -54,13 +81,134 @@ impl CommandRunner for SystemRunner {
     }
 }
 
+/// Runs the executable at `path` (shown as `program`) with `args`, capturing its output,
+/// and kills it when it hasn't finished within `timeout`.
+fn output_within_path(
+    path: &Path,
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<CmdOutput> {
+    let mut child = std::process::Command::new(path)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to run `{program}`"))?;
+    let deadline = Instant::now() + timeout;
+    // The results are awaited only until `deadline` (plus a grace): a process the CLI
+    // started that keeps the pipes open after the CLI exits must not hold devy past it.
+    let stdout = read_pipe(Box::new(child.stdout.take().expect("stdout is piped")));
+    let stderr = read_pipe(Box::new(child.stderr.take().expect("stderr is piped")));
+    let timed_out = || {
+        anyhow::anyhow!(
+            "`{program}` did not answer within {}",
+            format_timeout(timeout)
+        )
+    };
+    let Some(status) = wait_within(&mut child, Some(timeout))
+        .with_context(|| format!("Failed to wait for `{program}`"))?
+    else {
+        return Err(timed_out());
+    };
+    Ok(CmdOutput {
+        success: status.success(),
+        stdout: recv_pipe(&stdout, Some(deadline)).ok_or_else(timed_out)?,
+        stderr: recv_pipe(&stderr, Some(deadline)).ok_or_else(timed_out)?,
+    })
+}
+
+/// How long a pipe read may run past its deadline. A child that exits just before the
+/// deadline leaves its readers almost no time to drain the pipes; without this a
+/// finished run would be reported as timed out.
+const PIPE_GRACE: Duration = Duration::from_millis(100);
+
+/// Reads all of `pipe` on its own (detached) thread, which sends what it read.
+pub(crate) fn read_pipe(
+    mut pipe: Box<dyn std::io::Read + Send>,
+) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+    });
+    rx
+}
+
+/// What a [`read_pipe`] thread read, waiting until `deadline` (at least [`PIPE_GRACE`]
+/// from now), or without limit when there is none. `None` when it timed out; a reader
+/// that panicked counts as having read nothing.
+pub(crate) fn recv_pipe(
+    rx: &std::sync::mpsc::Receiver<String>,
+    deadline: Option<Instant>,
+) -> Option<String> {
+    let received = match deadline {
+        Some(deadline) => rx.recv_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(PIPE_GRACE),
+        ),
+        None => rx
+            .recv()
+            .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+    };
+    match received {
+        Ok(text) => Some(text),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(String::new()),
+    }
+}
+
+/// `timeout` for messages: whole seconds as `5 s`, anything else in milliseconds
+/// (`300 ms`, `1500 ms`), so a sub-second timeout never reads as `0 s`.
+pub(crate) fn format_timeout(timeout: Duration) -> String {
+    if timeout.subsec_nanos() == 0 {
+        format!("{} s", timeout.as_secs())
+    } else {
+        format!("{} ms", timeout.as_millis())
+    }
+}
+
+/// Waits for `child` to exit. With a `timeout`, a child still running when it passes is
+/// killed and reaped, and `None` is returned.
+pub(crate) fn wait_within(
+    child: &mut Child,
+    timeout: Option<Duration>,
+) -> std::io::Result<Option<ExitStatus>> {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => {}
+            Err(e) => {
+                // Don't leave it running (or unreaped) behind the error.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 static SYSTEM_RUNNER: SystemRunner = SystemRunner;
 
 /// A container's state, from `<cli> container inspect`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerState {
+    /// The container's full ID (empty if the CLI didn't report one).
+    pub id: String,
     pub running: bool,
     pub labels: HashMap<String, String>,
+    /// The names of the named volumes it mounts.
+    pub volumes: Vec<String>,
 }
 
 /// Everything `<cli> run` needs to create a service container.
@@ -114,6 +262,10 @@ impl<'a> ContainerRuntime<'a> {
 
     pub fn cli_name(&self) -> &'static str {
         self.cli.binary()
+    }
+
+    pub fn cli(&self) -> ContainerCli {
+        self.cli
     }
 
     fn output(&self, args: &[&str]) -> Result<CmdOutput> {
@@ -178,7 +330,24 @@ impl<'a> ContainerRuntime<'a> {
 
     /// The state of container `name`, or `None` when it doesn't exist.
     pub fn inspect_container(&self, name: &str) -> Result<Option<ContainerState>> {
-        let out = self.output(&["container", "inspect", "--format", "{{json .}}", name])?;
+        self.inspect_container_within(name, None)
+    }
+
+    /// [`Self::inspect_container`], failing when the CLI hasn't answered within `timeout`
+    /// (when one is given).
+    pub fn inspect_container_within(
+        &self,
+        name: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Option<ContainerState>> {
+        let args = ["container", "inspect", "--format", "{{json .}}", name];
+        let out = match timeout {
+            Some(t) => {
+                let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                self.runner.output_within(self.cli_name(), &args, t)?
+            }
+            None => self.output(&args)?,
+        };
         if !out.success {
             if is_missing(&out) {
                 return Ok(None);
@@ -205,7 +374,68 @@ impl<'a> ContainerRuntime<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(Some(ContainerState { running, labels }))
+        let id = value["Id"].as_str().unwrap_or_default().to_string();
+        let volumes = value["Mounts"]
+            .as_array()
+            .map(|mounts| {
+                mounts
+                    .iter()
+                    .filter(|m| m["Type"] == "volume")
+                    .filter_map(|m| m["Name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(ContainerState {
+            id,
+            running,
+            labels,
+            volumes,
+        }))
+    }
+
+    /// The daemon endpoint of docker's current context (honoring `DOCKER_CONTEXT`), e.g.
+    /// `unix:///var/run/docker.sock` or `ssh://host`.
+    pub fn context_endpoint(&self) -> Result<String> {
+        let out = self.output(&[
+            "context",
+            "inspect",
+            "--format",
+            "{{.Endpoints.docker.Host}}",
+        ])?;
+        if !out.success {
+            anyhow::bail!(
+                "{} context inspect failed: {}",
+                self.cli_name(),
+                out.stderr.trim()
+            );
+        }
+        Ok(out.stdout.trim().to_string())
+    }
+
+    /// What podman reports as `.Host.ServiceIsRemote`: `true` when it is podman-remote or
+    /// set up (`containers.conf`, a default system connection) to use another host.
+    pub fn podman_service_is_remote(&self) -> Result<String> {
+        let out = self.output(&["info", "--format", "{{.Host.ServiceIsRemote}}"])?;
+        if !out.success {
+            anyhow::bail!("{} info failed: {}", self.cli_name(), out.stderr.trim());
+        }
+        Ok(out.stdout.trim().to_string())
+    }
+
+    /// The names of all containers, running or not, that carry label `key`.
+    pub fn containers_with_label(&self, key: &str) -> Result<Vec<String>> {
+        let filter = format!("label={key}");
+        let out = self.output(&["ps", "-a", "--filter", &filter, "--format", "{{.Names}}"])?;
+        if !out.success {
+            anyhow::bail!("{} ps failed: {}", self.cli_name(), out.stderr.trim());
+        }
+        Ok(out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect())
     }
 
     /// The argv (after the CLI name) that creates and starts `spec`'s container, reading
@@ -332,6 +562,26 @@ fn write_env_file(pairs: &[(String, String)]) -> Result<tempfile::NamedTempFile>
         .and_then(|()| file.flush())
         .context("Failed to write the temporary env file")?;
     Ok(file)
+}
+
+/// A container CLI whose daemon is wedged: every call runs a real process that never
+/// answers, through the same timeout machinery as [`SystemRunner`].
+#[cfg(all(test, unix))]
+pub(crate) struct HangingRunner;
+
+#[cfg(all(test, unix))]
+impl CommandRunner for HangingRunner {
+    fn output(&self, program: &str, args: &[String]) -> Result<CmdOutput> {
+        // Untimed calls must not happen in the tests that use this; bound them anyway.
+        self.output_within(program, args, Duration::from_secs(60))
+    }
+    fn output_within(&self, program: &str, _: &[String], timeout: Duration) -> Result<CmdOutput> {
+        let args = ["-c".to_string(), "exec sleep 60".to_string()];
+        output_within_path(Path::new("/bin/sh"), program, &args, timeout)
+    }
+    fn status(&self, program: &str, args: &[String]) -> Result<bool> {
+        Ok(self.output(program, args)?.success)
+    }
 }
 
 /// Answers one recorded call (program first) with its output.
@@ -582,6 +832,23 @@ mod tests {
             .unwrap();
         assert!(!state.running);
         assert!(state.labels.is_empty());
+        assert_eq!(state.id, "");
+        assert!(state.volumes.is_empty());
+    }
+
+    #[test]
+    fn inspect_container_reads_id_and_named_volumes() {
+        let json = r#"{"Id":"4f1c9e","State":{"Running":true},"Config":{"Labels":{}},
+            "Mounts":[{"Type":"volume","Name":"devy-app-1234abcd-redis","Destination":"/data"},
+                      {"Type":"bind","Source":"/src","Destination":"/src"},
+                      {"Type":"volume","Destination":"/anon"}]}"#;
+        let fake = FakeRunner::new(move |_| ok(json));
+        let state = runtime(ContainerCli::Docker, &fake)
+            .inspect_container("c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.id, "4f1c9e");
+        assert_eq!(state.volumes, ["devy-app-1234abcd-redis"]);
     }
 
     #[test]
@@ -781,5 +1048,65 @@ mod tests {
         rt.remove_container("c").unwrap();
         rt.remove_volume("c").unwrap();
         assert!(rt.stop("c").is_err(), "stop must not hide failures");
+    }
+
+    #[cfg(unix)]
+    fn sh(script: &str, timeout: Duration) -> Result<CmdOutput> {
+        let args = ["-c".to_string(), script.to_string()];
+        output_within_path(Path::new("/bin/sh"), "docker", &args, timeout)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_within_captures_both_streams() {
+        let out = sh("echo out; echo err >&2; exit 3", Duration::from_secs(20)).unwrap();
+        assert!(!out.success);
+        assert_eq!(out.stdout, "out\n");
+        assert_eq!(out.stderr, "err\n");
+    }
+
+    /// A process the CLI leaves behind holding its pipes open can't keep devy waiting
+    /// past the timeout once the CLI itself has exited.
+    #[cfg(unix)]
+    #[test]
+    fn output_within_does_not_wait_on_pipes_held_past_the_timeout() {
+        let start = Instant::now();
+        let err = sh("sleep 5 & echo started", Duration::from_millis(300)).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(err.to_string(), "`docker` did not answer within 300 ms");
+    }
+
+    #[test]
+    fn timeouts_are_formatted_without_rounding_to_zero() {
+        assert_eq!(format_timeout(Duration::from_secs(5)), "5 s");
+        assert_eq!(format_timeout(Duration::from_millis(300)), "300 ms");
+        assert_eq!(format_timeout(Duration::from_millis(1500)), "1500 ms");
+        assert_eq!(format_timeout(Duration::ZERO), "0 s");
+    }
+
+    /// A deadline that has (just) passed still leaves the readers a grace to deliver
+    /// what the exited child wrote; a reader that never finishes still times out.
+    #[test]
+    fn pipe_reads_get_a_grace_past_the_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = tx.send("done".to_string());
+        });
+        assert_eq!(
+            recv_pipe(&rx, Some(Instant::now())).as_deref(),
+            Some("done")
+        );
+
+        let (_held, rx) = std::sync::mpsc::channel::<String>();
+        assert_eq!(recv_pipe(&rx, Some(Instant::now())), None);
+
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        drop(tx);
+        assert_eq!(recv_pipe(&rx, None).as_deref(), Some(""));
     }
 }

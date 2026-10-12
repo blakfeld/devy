@@ -36,7 +36,7 @@ Each snippet SHALL define a `devy` shell function that wraps the real binary. Af
 
 ### Requirement: Tab completion
 Each snippet SHALL register completion for:
-- the built-in subcommands `up`, `down`, `services`, `start`, `stop`, `restart`, `status`, `check`, `doctor`, `logs`, `ask`, `init`, `hook`, `pr`, and `export`
+- the built-in subcommands `up`, `down`, `services`, `start`, `stop`, `restart`, `status`, `check`, `doctor`, `logs`, `ask`, `init`, `hook`, `pr`, `export`, `exec`, `agent-setup` and `prune`
 - project command names taken from `devy _commands`, with errors suppressed
 
 It MUST complete:
@@ -48,10 +48,14 @@ It MUST complete:
 - `zsh bash fish` after `hook`
 - `--follow`, `--lines`, `--explain`, and `--show-context` after `logs`, and service names taken from `devy _services`, with errors suppressed
 - `--show-context` after `ask`
+- `--json` after `status`, `services` and `check`
+- `--force`, `--agents-md`, `--print`, `--agent` and `--all` after `agent-setup`, and `claude codex gemini cursor copilot windsurf opencode amp` after `agent-setup --agent`
+- command names from the shell's own command completion after `exec`
+- `--yes` and `--volumes` after `prune`
 
 #### Scenario: Project commands appear in completion
 - **WHEN** `devy.yml` defines a command `dev` and the user tab-completes `devy <TAB>`
-- **THEN** the candidates include the built-ins, including `doctor`, `pr`, `export`, `logs` and `ask`, and `dev`
+- **THEN** the candidates include the built-ins, including `doctor`, `pr`, `export`, `logs`, `ask`, `exec`, `agent-setup` and `prune`, and `dev`
 
 #### Scenario: Hook argument completion
 - **WHEN** the user tab-completes `devy hook <TAB>`
@@ -81,9 +85,25 @@ It MUST complete:
 - **WHEN** `devy.yml` declares `redis` and `node`, and the user tab-completes `devy logs <TAB>`
 - **THEN** the candidates include `redis` and not `node`
 
+#### Scenario: JSON flag
+- **WHEN** the user tab-completes `devy status --<TAB>`
+- **THEN** the candidates include `--json`
+
+#### Scenario: Agent setup flags
+- **WHEN** the user tab-completes `devy agent-setup --<TAB>`
+- **THEN** the candidates are `--force`, `--agents-md`, `--print`, `--agent` and `--all`
+
+#### Scenario: Agent setup agent names
+- **WHEN** the user tab-completes `devy agent-setup --agent <TAB>`
+- **THEN** the candidates are `claude`, `codex`, `gemini`, `cursor`, `copilot`, `windsurf`, `opencode` and `amp`
+
 #### Scenario: Allow flags
 - **WHEN** the user tab-completes `devy <TAB>` or `devy allow --<TAB>`
 - **THEN** `allow` is not a candidate and `--revoke` is not offered
+
+#### Scenario: Prune flags
+- **WHEN** the user tab-completes `devy prune --<TAB>`
+- **THEN** the candidates are `--yes` and `--volumes`
 
 ### Requirement: Completion treats project data literally
 Shell snippets SHALL treat names from `devy _commands` and `devy _services` as literal strings. They SHALL never be subject to parameter expansion, command substitution, arithmetic expansion or globbing. The bash snippet SHALL NOT pass them through `compgen -W` or any other construct that re-evaluates words. It SHALL build `COMPREPLY` by a literal prefix match over the lines read from those commands with a `while IFS= read -r` loop fed by a here-string, which works in bash 3.2 (the macOS `/bin/bash`) and in posix mode, rather than `mapfile`/`readarray`. Because bash inserts candidates unquoted, the bash snippet SHALL skip any name containing a character outside `[[:alnum:]._:+@-]` (whitespace, control characters, `$`, backticks, quotes and glob characters among them). File and program candidates for `devy exec` SHALL likewise be read from `compgen` line by line, never assigned from an unquoted `$(compgen ...)`, and `compopt -o filenames` SHALL be applied when the `compopt` builtin is available so bash quotes them on insertion; where it is not (bash 3.2), candidates containing characters outside `[[:alnum:]._/:+@,=-]` SHALL be skipped. The zsh snippet SHALL escape `:` in project command names before passing them to `_describe`, which otherwise reads text after the first `:` as a description.

@@ -12,7 +12,6 @@ use std::path::Path;
 use crate::ai::{self, Request, init_prompt, redact};
 use crate::config::DevyConfig;
 use crate::env_manager::{EnvManager, Shadowenv};
-use crate::lock::LockFile;
 use crate::modules;
 use crate::output;
 use crate::package_manager::{self, PackageManager};
@@ -633,7 +632,7 @@ pub(crate) fn render_diagnosis(d: &Diagnosis) -> String {
 pub(crate) fn validate_proposed_config(
     text: &str,
     pm: &dyn PackageManager,
-    lock: Option<&LockFile>,
+    source: ports::PortSource<'_>,
 ) -> Result<DevyConfig> {
     let config: DevyConfig = crate::yaml_safe::from_str_strict(text, "the proposed devy.yml")
         .context("it does not parse")?;
@@ -646,7 +645,7 @@ pub(crate) fn validate_proposed_config(
         pm.validate_config(dep)
             .with_context(|| format!("{}: config validation failed", dep.name))?;
     }
-    ports::resolve_and_check(&mut deps, lock, pm, PortMode::ReadOnly)?;
+    ports::resolve_and_check(&mut deps, source, pm, PortMode::ReadOnly)?;
     Ok(config)
 }
 
@@ -659,15 +658,18 @@ fn validate_with_backend(
     project_root: &Path,
     deps: &Deps<'_>,
 ) -> Result<()> {
-    let lock = ports::load_lock(project_root).ok().flatten();
+    let recorded = ports::RecordedPorts::with_lock(
+        project_root,
+        ports::load_lock(project_root).ok().flatten(),
+    );
     let proposed: DevyConfig = crate::yaml_safe::from_str_strict(text, "the proposed devy.yml")
         .context("it does not parse")?;
     let same_backend = current.is_some_and(|c| c.package_manager == proposed.package_manager);
     match pm {
-        Some(pm) if same_backend => validate_proposed_config(text, pm, lock.as_ref()).map(drop),
+        Some(pm) if same_backend => validate_proposed_config(text, pm, recorded.source()).map(drop),
         _ => {
             let pm = (deps.detect)(&proposed, project_root)?;
-            validate_proposed_config(text, pm.as_ref(), lock.as_ref()).map(drop)
+            validate_proposed_config(text, pm.as_ref(), recorded.source()).map(drop)
         }
     }
 }
@@ -1444,7 +1446,7 @@ mod tests {
                 name: "brew",
                 ..Default::default()
             },
-            None,
+            ports::PortSource::Lock(None),
         )
     }
 

@@ -52,16 +52,21 @@ const LOCK_FIX_HINT: &str = "remove that entry, or devy.lock, and run `devy up` 
 impl LockFile {
     /// Loads the lock at `path`. A symlinked or non-regular devy.lock is refused before
     /// it is read, so none of its target's text can reach an error message (failure
-    /// records and `doctor` send those to claude).
+    /// records and `doctor` send those to claude). It is opened without following a link
+    /// (`O_NOFOLLOW`, or the reparse point itself on Windows), so a swap after the check
+    /// can't redirect the read either; a main checkout's lock read from a worktree comes
+    /// from a directory the checkout chose.
     pub fn load(path: &Path) -> Result<Option<Self>> {
         if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
             anyhow::bail!("devy.lock is not a regular file (symlinks are refused)");
         }
-        let content = match crate::yaml_safe::read_capped(path) {
-            Ok(s) => s,
+        let cap = crate::yaml_safe::MAX_YAML_BYTES as u64;
+        let bytes = match crate::fs_safe::read_regular_capped(path, cap) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).context("Failed to read devy.lock"),
         };
+        let content = String::from_utf8(bytes).context("devy.lock is not valid UTF-8")?;
         Self::parse(&content).map(Some)
     }
 

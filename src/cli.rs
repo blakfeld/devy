@@ -126,6 +126,15 @@ enum Commands {
     },
     /// Open a GitHub pull request for the current branch in the browser
     Pr,
+    /// Remove services and containers left behind by removed checkouts
+    Prune {
+        /// Remove them without asking
+        #[arg(long)]
+        yes: bool,
+        /// Also remove the data volumes of removed containers
+        #[arg(long)]
+        volumes: bool,
+    },
     /// Export the environment as a Nix shell.nix or flake.nix
     Export {
         /// Output format
@@ -143,16 +152,27 @@ enum Commands {
         )]
         argv: Vec<String>,
     },
-    /// Write a Claude Code skill (and an AGENTS.md block) teaching coding agents to use devy
+    /// Write the devy skill for coding agents, and the devy block in AGENTS.md and GEMINI.md
+    ///
+    /// Writes .claude/skills/devy/SKILL.md for Claude Code, and .agents/skills/devy/SKILL.md
+    /// for Codex, Gemini CLI, Cursor, Copilot, Windsurf, OpenCode and Amp. Without --agent
+    /// or --all, the shared .agents skill is written only when the project shows signs of
+    /// one of those agents (for example .cursor/, .gemini/ or AGENTS.md).
     AgentSetup {
-        /// Overwrite .claude/skills/devy/SKILL.md even if devy didn't write it
+        /// Overwrite the skill files even if devy didn't write them
         #[arg(long)]
         force: bool,
         /// Create AGENTS.md with the devy block when it doesn't exist
         #[arg(long)]
         agents_md: bool,
+        /// Write the skill only for this agent (repeatable); turns detection off
+        #[arg(long = "agent", value_enum, value_name = "NAME")]
+        agents: Vec<commands::agent_setup::AgentName>,
+        /// Write the skill for every supported agent
+        #[arg(long, conflicts_with = "agents")]
+        all: bool,
         /// Print the skill to stdout without writing anything
-        #[arg(long, conflicts_with_all = ["force", "agents_md"])]
+        #[arg(long, conflicts_with_all = ["force", "agents_md", "agents", "all"])]
         print: bool,
     },
     /// List commands from devy.yml — used by shell completion, not intended for direct use
@@ -265,17 +285,21 @@ impl Cli {
                 show_context,
             } => commands::doctor::run(*yes, *no_ai, *show_context),
             Commands::Pr => commands::pr::run(),
+            Commands::Prune { yes, volumes } => commands::prune::run(*yes, *volumes),
             Commands::Export { format } => commands::export::run(*format),
             Commands::Hook { shell } => commands::hook::run(shell),
             Commands::Exec { argv } => commands::exec_env::run(argv),
             Commands::AgentSetup {
                 force,
                 agents_md,
+                agents,
+                all,
                 print,
             } => commands::agent_setup::run(
                 commands::agent_setup::Options {
                     force: *force,
                     agents_md: *agents_md,
+                    selection: commands::agent_setup::Selection::from_flags(agents, *all),
                 },
                 *print,
             ),
@@ -389,6 +413,22 @@ mod tests {
     }
 
     #[test]
+    fn prune_is_a_builtin_with_yes_and_volumes_flags() {
+        assert!(builtin_subcommands().contains(&"prune".to_string()));
+        for (args, want) in [
+            (&["devy", "prune"][..], (false, false)),
+            (&["devy", "prune", "--yes"][..], (true, false)),
+            (&["devy", "prune", "--volumes"][..], (false, true)),
+            (&["devy", "prune", "--volumes", "--yes"][..], (true, true)),
+        ] {
+            match Cli::try_parse_from(args).unwrap().command {
+                Commands::Prune { yes, volumes } => assert_eq!((yes, volumes), want, "{args:?}"),
+                _ => panic!("expected prune"),
+            }
+        }
+    }
+
+    #[test]
     fn agent_setup_print_conflicts_with_write_flags() {
         for flag in ["--force", "--agents-md"] {
             let err = Cli::try_parse_from(["devy", "agent-setup", "--print", flag])
@@ -397,6 +437,65 @@ mod tests {
             assert_eq!(err.exit_code(), 2);
         }
         assert!(Cli::try_parse_from(["devy", "agent-setup", "--force", "--agents-md"]).is_ok());
+        for args in [
+            &["--print", "--agent", "codex"][..],
+            &["--print", "--all"][..],
+        ] {
+            let err = Cli::try_parse_from([&["devy", "agent-setup"][..], args].concat())
+                .err()
+                .expect("usage error");
+            assert_eq!(err.exit_code(), 2, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn agent_setup_agent_repeats_and_conflicts_with_all() {
+        use commands::agent_setup::AgentName;
+        let cli = Cli::try_parse_from([
+            "devy",
+            "agent-setup",
+            "--agent",
+            "cursor",
+            "--agent",
+            "claude",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::AgentSetup {
+                agents, all, force, ..
+            } => {
+                assert_eq!(agents, [AgentName::Cursor, AgentName::Claude]);
+                assert!(!all && force);
+            }
+            _ => panic!("expected agent-setup"),
+        }
+        match Cli::try_parse_from(["devy", "agent-setup", "--all", "--agents-md"])
+            .unwrap()
+            .command
+        {
+            Commands::AgentSetup { agents, all, .. } => assert!(all && agents.is_empty()),
+            _ => panic!("expected agent-setup"),
+        }
+
+        let err = Cli::try_parse_from(["devy", "agent-setup", "--agent", "codex", "--all"])
+            .err()
+            .expect("usage error");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn agent_setup_rejects_unknown_agent_listing_accepted_names() {
+        let err = Cli::try_parse_from(["devy", "agent-setup", "--agent", "emacs"])
+            .err()
+            .expect("usage error");
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.to_string();
+        for name in [
+            "claude", "codex", "gemini", "cursor", "copilot", "windsurf", "opencode", "amp",
+        ] {
+            assert!(msg.contains(name), "{msg}");
+        }
     }
 
     #[test]

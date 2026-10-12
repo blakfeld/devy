@@ -61,6 +61,56 @@ pub fn tmp_dir() -> TempDir {
     }
 }
 
+/// A [`tmp_dir`] private to the user (mode 0700 on Unix), as devy requires of the
+/// directory it reads launchd service logs from.
+pub fn private_tmp_dir() -> TempDir {
+    let dir = tmp_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    dir
+}
+
+/// A [`tmp_dir`] the current user can't write to (mode 0555); its mode is restored on
+/// drop so it can be removed.
+#[cfg(unix)]
+pub struct ReadOnlyDir(TempDir);
+
+#[cfg(unix)]
+impl std::ops::Deref for ReadOnlyDir {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&*self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A [`ReadOnlyDir`] holding whatever `setup` puts in it first. `None` when the directory
+/// is still writable after the mode change, as it is for root: callers skip the test.
+#[cfg(unix)]
+pub fn read_only_dir(setup: impl FnOnce(&std::path::Path)) -> Option<ReadOnlyDir> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp_dir();
+    setup(&dir);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let dir = ReadOnlyDir(dir);
+    let probe = dir.join(".devy-write-probe");
+    if std::fs::write(&probe, "").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        return None;
+    }
+    Some(dir)
+}
+
 /// A temporary file path that is deleted automatically when dropped.
 /// The file is not created by `tmp_path`; creation happens when the test writes to it.
 pub struct TempFile {
@@ -140,4 +190,27 @@ pub fn flat_quadratic(top_key: &str, k: usize, m: usize) -> String {
         doc.push_str("  - *a\n");
     }
     doc
+}
+
+/// Lays out a git repository under `root` as `git worktree add` leaves it, without
+/// running git: a main checkout `<root>/app` (a `.git` directory) and a linked worktree
+/// `<root>/app-feat` (a `.git` file pointing at `app/.git/worktrees/app-feat`). Returns
+/// both checkouts, canonicalized as worktree detection reports them.
+pub fn fake_linked_worktree(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::fs;
+    let main = root.join("app");
+    let feat = root.join("app-feat");
+    let admin = main.join(".git/worktrees/app-feat");
+    fs::create_dir_all(&admin).unwrap();
+    fs::create_dir_all(&feat).unwrap();
+    fs::write(main.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(admin.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
+    fs::write(admin.join("commondir"), "../..\n").unwrap();
+    fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", feat.join(".git").display()),
+    )
+    .unwrap();
+    fs::write(feat.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+    (main.canonicalize().unwrap(), feat.canonicalize().unwrap())
 }
