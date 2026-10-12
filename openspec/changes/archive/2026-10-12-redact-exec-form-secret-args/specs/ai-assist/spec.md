@@ -18,12 +18,20 @@ Before any content leaves the machine, devy SHALL replace secrets with `<redacte
   - Docker config `auth` values
   - `mysql -p<password>`
   - Slack webhook URLs
-- **Exec-form command arguments:** in a flow sequence (`["a", "b"]`, with quoted or plain elements, possibly over several lines) or a block sequence (consecutive `- item` lines at one indent), devy SHALL redact:
-  - the element after a flag whose name matches the key rule (`--requirepass`, `--password`, `--token`)
+- **Exec-form command arguments:** this covers:
+  - a flow sequence (`["a", "b"]`, with quoted or plain elements, possibly over several lines or holding comments); each sequence nested in it is a command of its own, and a nested sequence or mapping is one unredacted element of its parent;
+  - a block sequence (consecutive `- item` lines at one indent, including quoted, block-scalar and multi-line items);
+  - YAML anchors or tags before either, and Dockerfile `--flag` options (up to 8) between the instruction (in any case) and its `[`.
+
+  In these, devy SHALL redact:
+  - the element after a flag whose name matches the key rule (`--requirepass`, `--password`, `--token`), even when it starts with `-`, unless it is a long flag (`--port`) or `--`
   - the element after `-a` or `--pass` once a `redis-cli` element has appeared
   - the element after `-P` once a `sqlcmd` element has appeared
   - the element after `-p` once a `<tool> login`, `sshpass` or MongoDB tool element has appeared
-  - a value glued inside one element (`--password=x`, or `-px` after a MySQL/MariaDB client or `sshpass`)
+  - the part after the first `:` of the element after `-u` or `--user` once a `curl` element has appeared
+  - a value glued inside one element (`--password=x`, `-px` after a MySQL/MariaDB client or `sshpass`, `-Px` after `sqlcmd`, or curl's `--user=u:x`/`-uu:x`)
+  - the value after blanks in an element that also holds one of the flags above (`"-a pw"`, `"--requirepass pw"`); after a MySQL/MariaDB client, `sshpass` or `sqlcmd`, an element `-p…`/`-P…` is a glued password, blanks included, and only a bare `-p` element prompts
+  - the element after a flag element followed only by blanks (`"--password "`)
 
   Each element's quotes and the separators between elements SHALL be kept.
 - **Token prefixes:** a token with a well-known prefix: `sk-`, `sk_live_`, `sk_test_`, `rk_live_`, `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_`, `glpat-`, `xox`, `AKIA`, `ASIA`, `AIza`, `npm_`, `hf_`, `xapp-`, `GOCSPX-`, `ya29.`, `whsec_`, `pypi-`, `hvs.`, `shpat_`, `dop_v1_`, `lin_api_`, `AGE-SECRET-KEY-1`; SendGrid keys (`SG.<id>.<secret>`); and Telegram bot tokens (`<digits>:AA<30 or more characters>`). Prefixes that also begin ordinary identifiers SHALL require the token's own length and alphabet, so `hf_hub_download` is kept.
@@ -77,3 +85,31 @@ devy MUST NOT read or send `.env`, `.env.local` or other non-example dotenv file
 #### Scenario: Non-secret flags in exec form kept
 - **WHEN** a sent line is `command: ["redis-server", "--port", "6380", "--appendonly", "yes"]`
 - **THEN** the sent text is unchanged
+
+#### Scenario: Plain flow sequence with a tool's password flag
+- **WHEN** a sent line is `command: [sqlcmd, -S, db, -P, hunter2]`
+- **THEN** the sent text is `command: [sqlcmd, -S, db, -P, <redacted>]`
+
+#### Scenario: Dash-prefixed secret value
+- **WHEN** a sent line is `command: ["redis-server", "--requirepass", "-dashpw"]`
+- **THEN** the sent text is `command: ["redis-server", "--requirepass", "<redacted>"]`
+
+#### Scenario: Nested exec-form sequence
+- **WHEN** a sent line is `commands: [["redis-cli", "-a", "hunter2"]]`
+- **THEN** the sent text is `commands: [["redis-cli", "-a", "<redacted>"]]`
+
+#### Scenario: curl user in exec form
+- **WHEN** a sent line is `["curl", "-u", "admin:hunter2", "https://x"]`
+- **THEN** the sent text is `["curl", "-u", "admin:<redacted>", "https://x"]`
+
+#### Scenario: Block-scalar item after a secret flag
+- **WHEN** a sent compose file has the items `- --password` and `- |` followed by the indented line `hunter2`
+- **THEN** the sent text keeps both item headers and has `<redacted>` in place of the body
+
+#### Scenario: Dockerfile flags before exec form
+- **WHEN** a sent line is `RUN --mount=type=secret,id=x ["x", "--token", "hunter2"]`
+- **THEN** the sent text is `RUN --mount=type=secret,id=x ["x", "--token", "<redacted>"]`
+
+#### Scenario: Outer sequence continues after a nested one
+- **WHEN** a sent line is `command: [x, [y], --password, hunter2]`
+- **THEN** the sent text is `command: [x, [y], --password, <redacted>]`

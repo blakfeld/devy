@@ -605,6 +605,33 @@ fn init_show_context_previews_without_claude() {
     assert!(!proj.file("devy.yml").exists());
 }
 
+/// Spec scenario "Exec-form compose command": secrets passed as exec-form arguments in
+/// `command` and `healthcheck.test` are redacted, keeping the sequence intact.
+#[test]
+fn init_show_context_redacts_exec_form_compose() {
+    let proj = TempProject::new();
+    proj.write(
+        "compose.yaml",
+        "services:\n  cache:\n    image: redis:7\n    command: [\"redis-server\", \"--requirepass\", \"hunter2\"]\n    healthcheck:\n      test: [\"CMD\", \"redis-cli\", \"-a\", \"hunter2\", \"ping\"]\n",
+    );
+    let out = proj.run_without_claude(&["init", "--show-context"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("hunter2"), "{stdout}");
+    assert!(
+        stdout.contains("command: [\"redis-server\", \"--requirepass\", \"<redacted>\"]\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("test: [\"CMD\", \"redis-cli\", \"-a\", \"<redacted>\", \"ping\"]\n"),
+        "{stdout}"
+    );
+}
+
 /// Spec scenario "README symlinked to a credentials file": a symlinked context file is
 /// skipped silently.
 #[cfg(unix)]
