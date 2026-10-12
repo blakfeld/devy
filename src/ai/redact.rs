@@ -1817,13 +1817,10 @@ fn redact_glued_key_values(
     // Set when the last word redacted might have been a key with a long separator: the
     // word after the separator is then redacted too.
     let mut forced = None;
-    loop {
-        let Some(colon) = forced
-            .take()
-            .or_else(|| ends_in_glued_key(assignment, s, word.clone()))
-        else {
-            break;
-        };
+    while let Some(colon) = forced
+        .take()
+        .or_else(|| ends_in_glued_key(assignment, s, word.clone()))
+    {
         let blanks = s[pos..].len() - s[pos..].trim_start_matches([' ', '\t']).len();
         let start = pos + blanks;
         // A comment (`# note`) is not a value.
