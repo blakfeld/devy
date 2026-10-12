@@ -1928,6 +1928,7 @@ fn help_output_lists_key_subcommands() {
 // exec
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
 const LOCK_WITH_REDIS_PORT: &str = "version: 1\ndependencies:\n  redis:\n    resolved_version: null\n    source: nix\n    assigned_port: 52113\n";
 
 #[cfg(unix)]
@@ -2564,6 +2565,7 @@ fn json_doc(out: &Output) -> serde_json::Value {
     doc
 }
 
+#[cfg(unix)]
 fn keys(v: &serde_json::Value) -> Vec<&str> {
     let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();

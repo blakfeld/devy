@@ -97,7 +97,7 @@ fn is_default_base(base: &Path, home: Option<&Path>) -> bool {
 }
 
 impl StateDir {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn env_copy_dir(&self) -> PathBuf {
         self.base.join(crate::env_manager::shadowenv::COPY_SUBDIR)
     }

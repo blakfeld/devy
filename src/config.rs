@@ -206,9 +206,13 @@ pub struct Dependency {
     pub version_from_lock: bool,
     /// True when the nix backend must allow unfree packages for this install. Set by
     /// `pkg_dep` from `Module::nix_unfree`; never read from or written to any file.
+    /// Only the nix backend (macOS and Linux) reads it.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub allow_unfree: bool,
     /// True when the nix backend must allow insecure packages for this install. Set by
     /// `pkg_dep` from `Module::nix_insecure`; never read from or written to any file.
+    /// Only the nix backend (macOS and Linux) reads it.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     pub allow_insecure: bool,
     /// True when this service runs as a container rather than through the package
     /// manager. Set by `normalized_dependencies`; never read from or written to any file.
@@ -470,6 +474,8 @@ impl DevyConfig {
 
     /// Whether there are dependencies and every one is a docker-managed service, so
     /// nothing is installed through the package manager. False for an invalid config.
+    /// Only consulted where nix is the default package manager (macOS and Linux).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn docker_only(&self) -> bool {
         self.normalized_dependencies()
             .is_ok_and(|deps| !deps.is_empty() && deps.iter().all(|d| d.docker))

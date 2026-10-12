@@ -1298,23 +1298,20 @@ mod tests {
         // The default conf.d (with or without a trailing slash, or through a symlink to
         // it) is what devy reads.
         std::fs::create_dir(dir.join("conf.d")).unwrap();
-        let mut defaults = vec![
+        #[cfg(unix)]
+        let alias = crate::test_support::tmp_dir();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&*dir, alias.join("r")).unwrap();
+        let defaults = [
             format!("CONFIG_FILES={}\n", dir.join("conf.d").display()),
             format!("CONFIG_FILES={}/\n", dir.join("conf.d").display()),
             format!(
                 "ENABLED_PLUGINS_FILE={}/\n",
                 dir.join("enabled_plugins").display()
             ),
+            #[cfg(unix)]
+            format!("CONFIG_FILES={}\n", alias.join("r/conf.d").display()),
         ];
-        let alias = crate::test_support::tmp_dir();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(&*dir, alias.join("r")).unwrap();
-            defaults.push(format!(
-                "CONFIG_FILES={}\n",
-                alias.join("r/conf.d").display()
-            ));
-        }
         for text in defaults {
             warn_custom_rabbitmq_paths(&rabbitmq_env_vars(&text), &dir, &env, Some(&state));
             assert!(
