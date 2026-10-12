@@ -247,6 +247,9 @@ pub fn detect(
     config: &DevyConfig,
     project_root: &std::path::Path,
 ) -> Result<Box<dyn PackageManager>> {
+    // Only the Nix backend (macOS and Linux) is scoped to the project root.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = project_root;
     match config.package_manager {
         PackageManagerChoice::Nix => {
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -499,6 +502,7 @@ impl PackageManager for MockPackageManager {
 mod tests {
     use super::*;
     use crate::config::Dependency;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use serde_norway as yaml;
 
     struct AvailablePm;

@@ -55,6 +55,8 @@ const SCRIPT_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const ARCHIVE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Determinate Systems nix-installer v3.23.0.
+/// Only the nix backend (macOS and Linux) bootstraps Nix.
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 pub const NIX: Installer = Installer {
     name: "Nix installer",
     url: "https://install.determinate.systems/nix/tag/v3.23.0",
@@ -544,6 +546,7 @@ pub mod test_hooks {
     }
 
     /// Serves `body` for `inst` on this thread until `clear` is called.
+    #[cfg(unix)]
     pub fn serve(inst: &Installer, body: &[u8]) {
         BODIES.with(|b| b.borrow_mut().insert(inst.url, body.to_vec()));
     }
@@ -561,6 +564,7 @@ pub mod test_hooks {
     }
 
     /// The extra environment variables passed to the last `run_script` on this thread.
+    #[cfg(unix)]
     pub fn envs() -> Vec<(String, String)> {
         ENVS.with(|e| e.borrow().clone())
     }
