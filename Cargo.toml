@@ -32,7 +32,7 @@ regex = "1"
 libc = "0.2"
 
 [dev-dependencies]
-mutants = "0.0.3"
+mutants = "0.0.4"
 
 [package.metadata.mutants]
 exclude_globs = ["src/package_manager/**"]
