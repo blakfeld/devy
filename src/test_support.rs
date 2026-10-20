@@ -196,6 +196,10 @@ pub fn flat_quadratic(top_key: &str, k: usize, m: usize) -> String {
 /// running git: a main checkout `<root>/app` (a `.git` directory) and a linked worktree
 /// `<root>/app-feat` (a `.git` file pointing at `app/.git/worktrees/app-feat`). Returns
 /// both checkouts, canonicalized as worktree detection reports them.
+///
+/// The main `.git` carries the `objects/`, `refs/` and `config` that `git init` creates,
+/// so git accepts it as a repository and `git ls-files` lists a real (empty) index;
+/// without `objects/` and `refs/` git sees no repository at all.
 pub fn fake_linked_worktree(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     use std::fs;
     let main = root.join("app");
@@ -203,6 +207,14 @@ pub fn fake_linked_worktree(root: &std::path::Path) -> (std::path::PathBuf, std:
     let admin = main.join(".git/worktrees/app-feat");
     fs::create_dir_all(&admin).unwrap();
     fs::create_dir_all(&feat).unwrap();
+    fs::create_dir_all(main.join(".git/objects")).unwrap();
+    fs::create_dir_all(main.join(".git/refs/heads")).unwrap();
+    fs::create_dir_all(main.join(".git/refs/tags")).unwrap();
+    fs::write(
+        main.join(".git/config"),
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+    )
+    .unwrap();
     fs::write(main.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     fs::write(admin.join("HEAD"), "ref: refs/heads/feat\n").unwrap();
     fs::write(admin.join("commondir"), "../..\n").unwrap();

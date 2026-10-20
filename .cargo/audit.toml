@@ -1,0 +1,11 @@
+# cargo-audit configuration, read by `cargo audit` in CI and release workflows.
+
+[advisories]
+ignore = [
+    # webpki-roots: distrusted emSign intermediates. ureq 2.12.1 (the last 2.x) depends
+    # on webpki-roots 0.26.11, which only re-exports webpki-roots 1.x; Cargo.lock pins
+    # that at the fixed 1.0.10, but cargo-audit matches 0.26.11 by version. devy also
+    # enables ureq's `native-certs`, so the bundled roots are never used at runtime.
+    # Remove this once devy moves to ureq 3, which depends on webpki-roots 1.x directly.
+    "RUSTSEC-2026-0381",
+]
