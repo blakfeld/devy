@@ -872,11 +872,21 @@ pub(crate) fn git_tracked(root: &Path, rels: &[PathBuf]) -> Result<Option<PathBu
     Ok(git_ls_files(root, root, rels)?.flatten())
 }
 
+/// Whether git's `fatal:` line (untranslated) says it sees no repository: a `.git` it
+/// does not recognise (an empty directory, a `.git` file pointing nowhere) is no
+/// repository, and git tracks nothing there, as when there is no `.git` at all. git 2.56
+/// reports a `.git` file pointing nowhere as "gitfile does not point to a valid
+/// repository", where older versions said "not a git repository".
+fn is_no_repository(fatal: &str) -> bool {
+    fatal.starts_with("fatal: not a git repository")
+        || fatal.starts_with("fatal: gitfile does not point to a valid repository")
+}
+
 /// [`git_tracked`] for `rels` relative to `repo` (the project root, or a nested
 /// repository inside `project`), with `None` when git was not asked or does not see a
-/// repository there (no `.git`, git unavailable, or `fatal: not a git repository`) and
-/// `Some(None)` when it listed nothing. git is always found outside `project`, never
-/// just outside `repo`.
+/// repository there (no `.git`, a `.git` file pointing nowhere, git unavailable, or
+/// `fatal: not a git repository`) and `Some(None)` when it listed nothing. git is always
+/// found outside `project`, never just outside `repo`.
 fn git_ls_files(project: &Path, repo: &Path, rels: &[PathBuf]) -> Result<Option<Option<PathBuf>>> {
     let root = repo;
     if !root.ancestors().any(|dir| dir.join(".git").exists()) {
@@ -951,9 +961,7 @@ fn git_ls_files(project: &Path, repo: &Path, rels: &[PathBuf]) -> Result<Option<
             .find(|l| l.starts_with("fatal:"))
             .unwrap_or_else(|| stderr.lines().next().unwrap_or(""))
             .trim();
-        // A `.git` git does not recognise (an empty directory, a stray file) is no
-        // repository: git tracks nothing there, as when there is no `.git` at all.
-        if fatal.starts_with("fatal: not a git repository") {
+        if is_no_repository(fatal) {
             return Ok(None);
         }
         // git names the repository it refused; safe.directory must match that path, which
@@ -1874,6 +1882,36 @@ mod tests {
             err.contains("could not check which files git tracks"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn no_repository_messages_cover_old_and_new_git() {
+        assert!(is_no_repository(
+            "fatal: not a git repository (or any of the parent directories): .git"
+        ));
+        assert!(is_no_repository(
+            "fatal: not a git repository: /tmp/x/missing/.git"
+        ));
+        assert!(is_no_repository(
+            "fatal: gitfile does not point to a valid repository: /tmp/x/.git"
+        ));
+        assert!(!is_no_repository(
+            "fatal: invalid gitfile format: /tmp/x/.git"
+        ));
+        assert!(!is_no_repository("fatal: index file corrupt"));
+    }
+
+    /// A `.git` file pointing at a missing git directory (a pruned worktree, a moved
+    /// main checkout) is like no repository, whichever way the git version words it.
+    #[test]
+    fn git_tracked_treats_a_dangling_gitfile_as_no_repository() {
+        let root = tmp_dir();
+        fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", root.join("missing/.git").display()),
+        )
+        .unwrap();
+        assert_eq!(git_tracked(&root, &[PathBuf::from(".devy")]).unwrap(), None);
     }
 
     #[test]
